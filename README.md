@@ -148,7 +148,7 @@ Not grilled. `tasks.md` is written as the **entry point of every implementation 
 
 The file has five fixed sections:
 
-1. **Session protocol** — one card per session; what to read and in what order; finding code by symbol, not line number; preconditions; staying in scope; the context budget; which steps need the owner's yes; how to finish (verify, commit, hand-off note, tick, stop).
+1. **Session protocol** — one card per session, renamed to the card it completes; what to read and in what order; finding code by symbol, not line number; preconditions; staying in scope; the context budget; which steps need the owner's yes; how to finish (verify, commit, hand-off note, tick, stop).
 2. **Templates** — the hand-off note each card leaves behind and the `RESUME.md` state file (status table, decisions waiting on the owner, locks, blockers).
 3. **Traceability** — every requirement to its cards, every success criterion to the card that measures it, every invariant to the test that pins it. Gaps get flagged.
 4. **Cards** — grouped into stages, each stage closed by a checkpoint card that merges, runs the checks and reviews the stage's diff. Every card carries *fulfills · after · size · effort*, a paste-ready **Start with** line, **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** and **Never**. Cards marked `[P]` may run side by side in their own worktree.
