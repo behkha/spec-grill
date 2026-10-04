@@ -210,7 +210,7 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
 ## 1. Session protocol (every card follows it)
 
 1. **One card per session.** Open a fresh session for each card. Never continue into the next card in
-   the same session, even if there is room left.
+   the same session, even if there is room left. First action: rename the session to `<NNN> T0nn <card title>` (desktop: `set_session_title`; CLI: `/rename`).
 2. **Where things live.** State: `specs/NNN-slug/state/RESUME.md` and `state/handoff/T0nn.md`
    <git-ignored folders are read and written by absolute path from worktrees>. Code work happens in
    <the integration worktree `<path>`, branch `<branch>`, created by T001>; a `[P]` card works in
