@@ -121,7 +121,17 @@ Present the complete draft for holistic approval, revise as needed, then write `
 
 ## Phase 5 — Handoff
 
-Once `tasks.md` is approved, stop. Spec-grill's job is done — implementation is a separate concern. Tell the user how to run it: one card per fresh session, starting by pasting T001's **Start with** line. Offer to run T001 if the user asks, but don't start unprompted.
+Once `tasks.md` is approved, make sure the project registers the **card-rename hook**, then stop.
+
+**The card-rename hook.** Rule 1 of the session protocol (rename the session to its card) is easy to forget, so a hook enforces it. `hooks/card-rename.py` (next to this file; standard library only) runs on every prompt; when the prompt is a card's **Start with** line, it finds that `tasks.md` (absolute path, or a `…/` path resolved from the session's directory and from the main checkout of a git worktree), reads the name pattern from §1 and the card's title from the checklist, and tells Claude to rename the session before anything else. Every other prompt passes through. Check the project's `.claude/settings.local.json` (git-ignored; `.claude/settings.json` if the team shares the hook) for a `UserPromptSubmit` entry whose command runs `card-rename.py`. If none is there, ask the user, and after a yes merge this entry into the existing hooks (never replace the file):
+
+```json
+{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 ~/.claude/skills/spec-grill/hooks/card-rename.py", "timeout": 10}]}]}}
+```
+
+Test it before saying it works: pipe `{"cwd": "<project>", "prompt": "<T001's Start with line>"}` into the command and check the name it prints.
+
+Then Spec-grill's job is done — implementation is a separate concern. Tell the user how to run it: one card per fresh session, starting by pasting T001's **Start with** line. Offer to run T001 if the user asks, but don't start unprompted.
 
 ## Templates
 

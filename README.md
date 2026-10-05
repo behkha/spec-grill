@@ -62,7 +62,7 @@ git clone https://github.com/behkha/spec-grill.git ~/.claude/skills/spec-grill
 git clone https://github.com/behkha/spec-grill.git .claude/skills/spec-grill
 ```
 
-Copying `SKILL.md` by hand works too. That single file is the whole skill.
+Copying `SKILL.md` by hand works too; copy `hooks/card-rename.py` beside it if you want the card-rename hook.
 
 ### Verify
 
@@ -156,7 +156,9 @@ The file has five fixed sections:
 
 ### Phase 5 — Handoff
 
-Stop. Spec-Grill's job ends at approved artifacts; implementation is a separate concern. It tells you how to run the cards (one per fresh session, starting with T001's **Start with** line) and offers to run T001, but won't start unprompted.
+Spec-Grill checks that the project registers its **card-rename hook** (`hooks/card-rename.py`) and, with your yes, adds it to `.claude/settings.local.json`. The hook turns rule 1 of the session protocol into something Claude can't forget: when you paste a card's **Start with** line, it reads the name pattern and the card's title from `tasks.md` and makes renaming the session the first action (for example `004 T003 Backoff schedule`). Other prompts pass through untouched.
+
+Then it stops. Spec-Grill's job ends at approved artifacts; implementation is a separate concern. It tells you how to run the cards (one per fresh session, starting with T001's **Start with** line) and offers to run T001, but won't start unprompted.
 
 ---
 
