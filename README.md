@@ -62,7 +62,7 @@ git clone https://github.com/behkha/spec-grill.git ~/.claude/skills/spec-grill
 git clone https://github.com/behkha/spec-grill.git .claude/skills/spec-grill
 ```
 
-Copying `SKILL.md` by hand works too; copy `hooks/card-rename.py` beside it if you want the card-rename hook.
+Copying `SKILL.md` by hand works too; copy the `hooks/` folder beside it if you want the card-rename hook and the supervisor.
 
 ### Verify
 
@@ -99,6 +99,12 @@ amend the constitution — we're dropping the no-dependencies rule
 ```
 
 Then answer questions until you have artifacts.
+
+Once the cards are running, the same skill tracks them for you:
+
+```
+supervise the webhook retries feature — what's done and what's next?
+```
 
 ---
 
@@ -146,19 +152,83 @@ Presented complete. Revised and re-presented until you approve.
 
 Not grilled. `tasks.md` is written as the **entry point of every implementation session**: a list of self-contained cards, each sized for one fresh session that reads only the file's shared sections and its own card.
 
-The file has five fixed sections:
+The file has six fixed sections:
 
 1. **Session protocol** — one card per session, renamed to the card it completes; what to read and in what order; finding code by symbol, not line number; preconditions; staying in scope; the context budget; which steps need the owner's yes; how to finish (verify, commit, hand-off note, tick, stop).
 2. **Templates** — the hand-off note each card leaves behind and the `RESUME.md` state file (status table, decisions waiting on the owner, locks, blockers).
 3. **Traceability** — every requirement to its cards, every success criterion to the card that measures it, every invariant to the test that pins it. Gaps get flagged.
 4. **Cards** — grouped into stages, each stage closed by a checkpoint card that merges, runs the checks and reviews the stage's diff. Every card carries *fulfills · after · size · effort*, a paste-ready **Start with** line, **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** and **Never**. Cards marked `[P]` may run side by side in their own worktree.
 5. **Backlog** — cards added during execution (review findings, work split off when a session ran out of room).
+6. **Supervisor** — the brief for the one long-lived session that tracks the feature for you (see below).
 
 ### Phase 5 — Handoff
 
 Spec-Grill checks that the project registers its **card-rename hook** (`hooks/card-rename.py`) and, with your yes, adds it to `.claude/settings.local.json`. The hook turns rule 1 of the session protocol into something Claude can't forget: when you paste a card's **Start with** line, it reads the name pattern and the card's title from `tasks.md` and makes renaming the session the first action (for example `004 T003 Backoff schedule`). Other prompts pass through untouched.
 
-Then it stops. Spec-Grill's job ends at approved artifacts; implementation is a separate concern. It tells you how to run the cards (one per fresh session, starting with T001's **Start with** line) and offers to run T001, but won't start unprompted.
+Then it stops. Spec-Grill's job ends at approved artifacts; implementation is a separate concern. It tells you how to run the cards (one per fresh session, starting with T001's **Start with** line) and how to start the supervisor, and offers to do either, but won't start unprompted.
+
+---
+
+## The supervisor
+
+Twenty cards across five sessions is a lot to hold in your head. The supervisor holds it for you: one extra session, started once per feature, that tells you what finished, who is waiting for whom, and what to paste next.
+
+Start it by pasting §6's line into a new session:
+
+```
+Webhook retries · SUP. Follow /abs/path/specs/004-webhook-retries/tasks.md §6.
+```
+
+The session renames itself `004 Supervisor`, reports, and arms a watcher. From then on every change in the feature's files (a card ticked, a hand-off written, a decision answered, a new blocker) wakes it, and it tells you what changed and what is now ready, with the **Start with** lines to paste. Ask it anything in between: *what's next?*, *what is T007 waiting for?*, *what did T004 decide?*
+
+It never edits code or the state files and never starts a card unless you ask. It answers from the files every time, not from memory, so if you close it, a new one picks up exactly where the old one was.
+
+The bookkeeping is a plain script, `hooks/supervisor.py` (standard library only), which you can also run yourself:
+
+```bash
+python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retries
+```
+
+```
+Webhook retries · 2026-10-06 13:18Z
+[█████░░░░░░░░░░░░░░░] 25% · 2/8 cards finished
+Done: T001, CP0
+
+Running now:
+  T002 `webhook_deliveries` migration (feat/x, since 2026-10-06)
+
+Ready to run next:
+  T003 [P] Backoff schedule · S · effort medium
+    Start with: Webhook retries · T003. Follow /abs/path/…/tasks.md §1, then card T003.
+
+Waiting:
+  T004 Worker wiring waits for T002 (doing); T003 (todo)
+  T005 Rollout waits for CPA (todo); you: decision 2: Alert channel?
+
+Needs you:
+  decision 2: Alert channel? (needed before T005)
+```
+
+### The dashboard
+
+To see it all at a glance, serve the dashboard:
+
+```bash
+python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retries --serve --open
+```
+
+It opens `http://127.0.0.1:8765` (local only, no dependencies) and refreshes every 3 seconds:
+
+- **Progress** — one bar split by status, with counts.
+- **Run next** — every ready card with its effort tier and a copy button for its **Start with** line, plus which ones may run side by side.
+- **Needs you** — open decisions, blockers, stalled cards, a held deploy lock.
+- **Board** — running, ready, waiting, blocked and done columns.
+- **Who waits for whom** — the dependency map; click a card to trace what it waits for and what waits for it, and open its details (RESUME row, hand-off note).
+- **Activity** and **Drift** — what changed since you opened the page, and where the files disagree.
+
+A picker switches between every feature in `specs/`. The supervisor session offers to start it for you; just say "show the dashboard."
+
+Add `--watch` instead for a live view in a terminal that redraws whenever the state changes; leave it open in a terminal tab and it costs nothing. `--wait` blocks until something changes and prints what did (that's what wakes the supervisor session); `--json` is for your own scripts. It also flags stalled cards (doing, but no commit or hand-off for 4 hours) and drift (a card ticked in `tasks.md` but not done in `RESUME.md`, done with no hand-off, and so on).
 
 ---
 
@@ -171,7 +241,8 @@ specs/
     ├── spec.md
     ├── plan.md
     ├── tasks.md
-    └── state/                   # RESUME.md + handoff/ notes, written during implementation
+    └── state/                   # RESUME.md + handoff/ notes, written during implementation;
+                                 # .supervisor.json, the supervisor's last-seen snapshot
 ```
 
 Feature folders are numbered and slugged automatically (`002-payment-retries`, `003-sso-login`). The skill checks `specs/` for the next available number. That's a derivation, not a decision — you won't be asked about it.

@@ -8,8 +8,9 @@ A card session starts with a line like
 The hook finds that tasks.md (an absolute path, or a "…/" path resolved from the
 session's directory upwards), reads the name pattern from its §1 ("rename the
 session to `<NNN> T0nn <card title>`") and the card's title from the checklist,
-and tells Claude that renaming the session is its first action. Any other prompt
-passes through untouched. Standard library only.
+and tells Claude that renaming the session is its first action. The supervisor's
+line (card "SUP", tasks.md §6) renames the session to "<NNN> Supervisor". Any other
+prompt passes through untouched. Standard library only.
 """
 
 import json
@@ -86,13 +87,16 @@ def main() -> None:
         )
     else:
         name = f"{match.group('label').strip()} · {card} {title}"
+    if card == "SUP":  # the supervisor session (tasks.md §6), not a card
+        number = re.match(r"(\d+)-", os.path.basename(os.path.dirname(tasks or "")))
+        name = f"{number.group(1)} Supervisor" if number else f"{match.group('label').strip()} · Supervisor"
     name = re.sub(r"\s+", " ", name).strip()
     context = (
         f'MANDATORY FIRST ACTION, before reading any file: rename this session to "{name}". '
         'Desktop: mcp__ccd_session_mgmt__set_session_title with session_id "self" (load it with '
         'ToolSearch "select:mcp__ccd_session_mgmt__set_session_title" if it is deferred). '
-        "CLI: /rename. This is rule 1 of the tasks.md session protocol; do not skip it and do "
-        "not choose another title."
+        f"CLI: /rename. This is {'§6' if card == 'SUP' else 'rule 1 of the session protocol'} "
+        "of tasks.md; do not skip it and do not choose another title."
     )
     print(
         json.dumps(
