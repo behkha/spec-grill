@@ -30,8 +30,10 @@ import time
 ID = r"(?:T\d+[A-Z]*|CP[A-Z0-9]+)"
 ID_RE = re.compile(rf"\b{ID}\b")
 RANGE_RE = re.compile(rf"\b({ID})\s*[–-]\s*({ID})\b")
-CHECK_RE = re.compile(rf"^- \[([ xX])\] ({ID})((?: \[P\])?) (.+?)(?: — fulfills .*)?$", re.M)
+CHECK_RE = re.compile(rf"^- \[([ xX])\] ({ID})((?: \[P\])?)(?: (.+?))?(?: — fulfills .*)?\s*$", re.M)
 SECTION_RE = re.compile(r"^#{2,3} (.+?)\s*$", re.M)
+COND_RE = re.compile(r"\(([^)]*\bif\b[^)]*)\)")  # "(T036 if German)": a dependency under a condition
+BEFORE_RE = re.compile(rf"\bbefore:?\s+({ID})")
 HEAD_RE = re.compile(rf"^#{{3,4}} ({ID})((?: \[P\])?) — (.+?)\s*$", re.M)
 FINISHED = {"done", "waived"}
 STATUSES = {"todo", "doing", "done", "blocked", "waived"}
@@ -83,7 +85,7 @@ def parse_tasks(text: str) -> tuple[dict, list]:
         c = card(m.group(2))
         c["ticked"] |= m.group(1).lower() == "x"
         c["parallel"] |= bool(m.group(3))
-        c["title"] = c["title"] or m.group(4).strip()
+        c["title"] = c["title"] or (m.group(4) or "").strip()  # a bare "- [x] T010B" under a card's heading
 
     heads = list(HEAD_RE.finditer(text))
     stages = [(m.start(), m.group(1)) for m in SECTION_RE.finditer(text)]
@@ -110,6 +112,9 @@ def parse_tasks(text: str) -> tuple[dict, list]:
 
     for c in cards.values():
         c["after"] = ids_in(c["after_text"], order)
+        c["conditional"] = [x for x in ids_in(" ".join(COND_RE.findall(c["after_text"])), order)
+                            if x not in c["after"]]
+        c["after"] += c["conditional"]  # the condition cannot be read here; waiting is the safe side
     for c in cards.values():  # "blocks: T009" on a backlog card makes T009 wait for it
         for target in ids_in(c["blocks_text"], order):
             if target in cards and c["id"] not in cards[target]["after"]:
@@ -203,9 +208,23 @@ def parse_resume(text: str) -> dict:
         item = item[2:].strip()
         if item.lower().strip("().") in ("", "none") or item.startswith("<"):
             continue
-        blockers.append({"text": item, "cards": ID_RE.findall(item)})
+        if item.lower().startswith("(resolved"):  # kept in RESUME as history, no longer blocks anyone
+            continue
+        blockers.append({"text": item, "cards": blocker_subjects(item)})
     lock = next((line.strip() for line in section(secs, "deploy lock") if line.strip()), "")
     return {"status": status, "decisions": decisions, "blockers": blockers, "lock": lock}
+
+
+def blocker_subjects(item: str) -> list:
+    """The cards a blocker holds up: the card it opens with ("T037 (date): …", "T016C: …"), else the
+    cards after "before" ("<precondition> before T005"), else the card it opens with, else none."""
+    lead = re.match(rf"\s*({ID})\b(\s*[(:])?", item)
+    if lead and lead.group(2):
+        return [lead.group(1)]
+    before = BEFORE_RE.findall(item)
+    if before:
+        return list(dict.fromkeys(before))
+    return [lead.group(1)] if lead else []
 
 
 # --- the picture ----------------------------------------------------------------------
@@ -255,6 +274,9 @@ def build(tasks: str, stale_hours: float) -> dict:
             status[cid] = "done" if cards[cid]["ticked"] else "todo"
 
     open_decisions = [d for d in resume["decisions"] if d["open"]]
+    # a blocker about finished cards only is history: it stays in RESUME, not in "Needs you"
+    active_blockers = [b for b in resume["blockers"]
+                       if not b["cards"] or any(status.get(c) not in FINISHED for c in b["cards"])]
     waits: dict = {}
     for cid in order:
         if status[cid] in FINISHED:
@@ -262,11 +284,12 @@ def build(tasks: str, stale_hours: float) -> dict:
         reasons = []
         for dep in cards[cid]["after"]:
             if status.get(dep) not in FINISHED:
-                reasons.append({"kind": "card", "on": dep, "status": status.get(dep, "unknown")})
+                reasons.append({"kind": "card", "on": dep, "status": status.get(dep, "unknown"),
+                                "conditional": dep in cards[cid]["conditional"]})
         for d in open_decisions:
             if cid in d["before"]:
                 reasons.append({"kind": "owner", "on": f"decision {d['n']}: {d['question']}"})
-        for b in resume["blockers"]:
+        for b in active_blockers:
             if cid in b["cards"]:
                 reasons.append({"kind": "blocker", "on": b["text"]})
         if status[cid] == "blocked" and not reasons:
@@ -343,7 +366,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         "waiting": {c: w for c, w in waits.items() if w},
         "unblocks": unblocks,
         "open_decisions": open_decisions,
-        "blockers": resume["blockers"],
+        "blockers": active_blockers,
         "lock": lock,
         "stalled": stalled,
         "drift": drift,
@@ -421,7 +444,7 @@ def render(s: dict) -> str:
         parts = []
         for r in reasons:
             if r["kind"] == "card":
-                parts.append(f"{r['on']} ({r['status']})")
+                parts.append(f"{r['on']} ({r['status']}{', conditional' if r.get('conditional') else ''})")
             elif r["kind"] == "worktree":
                 parts.append(f"the integration worktree ({r['on']} is doing)")
             elif r["kind"] == "owner":
