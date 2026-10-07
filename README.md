@@ -251,7 +251,8 @@ It needs the `claude` CLI logged in and the project folder trusted (run `claude`
 - **holds each stage for your review**: after a checkpoint, the next stage waits until you have looked at the findings and the screenshots and pressed "Approve stage";
 - **recovers on its own**: a session that stopped early is resumed once; a card that still isn't done, a silent session or one over its cap lands under "Needs you" with Retry and "I'll take it";
 - **pauses itself** when the login expires or a usage limit hits, and when a total budget you set is spent;
-- **notifies you** on the desktop whenever something needs you.
+- **notifies you** on the desktop whenever something needs you;
+- **can give sessions Chrome**, so cards that walk through the app or take screenshots can do it unattended. It's off by default; switching it on in Settings hands sessions your real, signed-in Chrome, so they then run one at a time and are told to stay in their own tab and the app under test.
 
 Commands listed on §6's **Never unattended** line (`git push`, deploys) are denied to these sessions outright. Running sessions keep going if you stop the dashboard; restart it and it picks them up. The supervisor session, if you run one, keeps answering questions but leaves starting sessions to the autopilot.
 

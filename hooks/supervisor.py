@@ -58,6 +58,7 @@ SETTINGS = {  # state/autopilot.json; the dashboard changes them, autopilot.py a
     "quiet_minutes": 45,         # stop a session whose output stays silent this long
     "max_run_hours": 6,
     "notify": True,              # desktop notification when something needs the owner
+    "chrome": False,             # give sessions Claude in Chrome (the owner's real browser); one at a time
     "claude": "claude",
     "paused_reason": "",
 }

@@ -444,6 +444,24 @@ class Feature(unittest.TestCase):
         self.assertLessEqual(len(brief["recent"]), 8)
         os.environ.pop("FAKE_STEP")
 
+    def test_chrome_is_opt_in_and_one_session_at_a_time(self):
+        self.script_for({"T001": ["done"], "T002": ["sleep"], "T003": ["sleep"], "T004": ["sleep"]})
+        autopilot.step(self.tasks)
+        self.assertNotIn("--chrome", self.wait_calls(1)[0]["args"], "off by default")
+        autopilot.act(self.tasks, "settings", {"chrome": True})
+        for _ in range(40):
+            autopilot.step(self.tasks)
+            if self.state()["status"]["T001"] == "done" and autopilot.live(autopilot.registry(self.tasks)):
+                break
+            time.sleep(0.15)
+        for _ in range(5):
+            autopilot.step(self.tasks)
+            time.sleep(0.1)
+        self.assertEqual(len(autopilot.live(autopilot.registry(self.tasks))), 1, "one browser session at a time")
+        later = [c for c in self.launched() if c["card"] != "T001"]
+        self.assertTrue(later and all("--chrome" in c["args"] for c in later))
+        self.assertIn("Claude in Chrome", later[0]["args"][later[0]["args"].index("--append-system-prompt") + 1])
+
     def test_report_without_autopilot_has_no_gates(self):
         os.remove(os.path.join(os.path.dirname(self.tasks), "state", "autopilot.json"))
         s = self.state()

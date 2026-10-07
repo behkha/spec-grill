@@ -184,7 +184,8 @@ When the user asks only to see the dashboard, start `--serve` in the background,
 - **picks up after interruptions**: a session that ended before its card was done is resumed once more (`max_attempts`, 2 by default); after that the card shows under "Needs you" as stuck, with Retry and "I'll take it" (then the dashboard gives the `claude --resume <id>` command to continue the session by hand);
 - **stops runaway sessions**: silent for 45 minutes or running over 6 hours (both settings), or over the dollar cap — each becomes a stuck card for the owner;
 - **pauses itself** on an API error (an expired login, a usage limit) without counting it against the card, and when the sessions together reach the total budget, if one is set; the reason shows on the dashboard, and Resume continues;
-- **notifies the owner** (a desktop notification) once for each new thing that needs them.
+- **notifies the owner** (a desktop notification) once for each new thing that needs them;
+- **gives sessions a browser when the owner allows it**: "Give sessions Chrome" in the dashboard's settings (off by default, confirmed once) starts every session with `--chrome`, so cards whose Verify walks the app or takes screenshots can do it unattended. It is the owner's real, signed-in Chrome, so sessions then run one at a time and are told to work in their own tab, use only the app under test and the pages their card names, and never sign in, change settings or submit forms elsewhere.
 
 The unattended rules the dispatcher appends tell each session: follow §1 and the card exactly; never run a step that needs the owner's yes, but ask through the Approvals table and stop; record blockers and splits as §1 says; end with `AUTOPILOT: DONE`, `WAITING FOR APPROVAL A<n>`, `BLOCKED` or `SPLIT`; never start another card. The files stay the only channel: the dispatcher decides from RESUME, not from what a session says.
 

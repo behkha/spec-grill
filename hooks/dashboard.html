@@ -520,6 +520,9 @@ function renderAuto(s) {
       ${!a.dispatcher ? `<p class="note">To start sessions, run <code>supervisor.py … --serve --autopilot</code>.</p>` : ""}
       <label>Sessions at the same time <select id="set-par">${[1, 2, 3, 4, 5, 6].map((n) => `<option${n === a.settings.max_parallel ? " selected" : ""}>${n}</option>`).join("")}</select></label>
       <label>Hold each stage for my review <input type="checkbox" id="set-gate"${a.settings.gate_checkpoints ? " checked" : ""}></label>
+      <label>Give sessions Chrome <input type="checkbox" id="set-chrome"${a.settings.chrome ? " checked" : ""}></label>
+      ${confirming === "chrome-on" ? `<div class="confirm"><span>Sessions will drive your real Chrome, signed in to your accounts, one session at a time. They are told to use their own tab and only the app under test.</span><div class="actions" style="margin:0"><button type="button" class="primary" data-act="chrome-on">Give them Chrome</button><button type="button" data-cancel>Not now</button></div></div>` : ""}
+      ${a.settings.chrome ? `<p class="note">Sessions use Claude in Chrome, one at a time.</p>` : ""}
       ${confirming === "gate-off" ? `<div class="confirm"><span>Turn off stage reviews? The autopilot will start each next stage as soon as its checkpoint finishes.</span><div class="actions" style="margin:0"><button type="button" class="danger" data-act="gate-off">Turn off</button><button type="button" data-cancel>Keep reviews</button></div></div>` : ""}
       <div><div class="note" style="margin:0 0 4px">Never run unattended (tasks.md §6)</div><div class="deny">${a.deny.length ? a.deny.map((d) => `<code>${esc(d)}</code>`).join("") : '<span class="warn">None listed: the autopilot will not start.</span>'}</div></div>
     </div></details>
@@ -1054,6 +1057,7 @@ function runAction(el) {
   }
   if (d.act === "owner-done") return schedule(d.key, "owner-done", { card: d.card }, `Marking ${d.card} done`);
   if (d.act === "gate-off") { confirming = null; return act("settings", { gate_checkpoints: false }, el); }
+  if (d.act === "chrome-on") { confirming = null; return act("settings", { chrome: true }, el); }
   const data = {};
   if (d.card) data.card = d.card;
   if (d.auto) data.auto = d.auto === "1";
@@ -1144,6 +1148,10 @@ document.addEventListener("click", (e) => {
 
 document.addEventListener("change", (e) => {
   if (e.target.id === "set-par") act("settings", { max_parallel: Number(e.target.value) });
+  if (e.target.id === "set-chrome") {
+    if (!e.target.checked) { confirming = null; act("settings", { chrome: false }); }
+    else { e.target.checked = false; confirming = "chrome-on"; renderAuto(state); }
+  }
   if (e.target.id === "set-gate") {
     if (e.target.checked) { confirming = null; act("settings", { gate_checkpoints: true }); }
     else { e.target.checked = true; confirming = "gate-off"; renderAuto(state); }
