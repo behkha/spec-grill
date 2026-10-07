@@ -59,6 +59,8 @@ def main() -> None:
         payload = json.load(sys.stdin)
     except Exception:
         return
+    if os.environ.get("SPEC_GRILL_AUTOPILOT"):
+        return  # the autopilot names its sessions itself (claude -n)
     match = START.match(payload.get("prompt", ""))
     if not match:
         return

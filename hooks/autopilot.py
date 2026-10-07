@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""Spec-Grill autopilot: runs a feature's cards in headless Claude Code sessions on its own.
+
+    supervisor.py TASKS --serve --autopilot   the dashboard plus this dispatcher (the usual way)
+    supervisor.py TASKS --autopilot           the dispatcher alone, printing what it does
+
+Every few seconds the dispatcher reads the supervisor's picture of each feature that uses it
+(supervisor.build) and, while the feature's autopilot is on:
+
+- starts each ready card in its own `claude -p` session: the card's Start with line as the prompt,
+  its effort and model, the session named after the card, a dollar cap, the rules for running
+  unattended, and §6's "Never unattended" tool patterns denied; at most `max_parallel` sessions,
+  and at most one of them a card without [P] (those share the integration worktree). A card with no
+  `kind`, or `kind owner`, is never started on its own;
+- resumes a session when the owner answers the approval it asked for in RESUME's Approvals table;
+- resumes a session that stopped before its card was done, up to `max_attempts` sessions per card,
+  and then hands the card to the owner ("needs you");
+- stops a session that stays silent for `quiet_minutes` or runs longer than `max_run_hours`;
+- pauses on an API error (an expired login, a usage limit), when the next session could take the
+  sessions together past `budget_total_usd`, and when tasks.md has no "Never unattended" list.
+
+The owner's buttons on the dashboard (start, stop, retry, approve, answer, approve a stage) call act()
+and work whether the autopilot is on or paused; starting a session needs the process that dispatches.
+
+One process dispatches a feature: it holds an exclusive lock on state/.autopilot.lock for as long as
+it runs. Every read-modify-write of the state files happens under guard(), a lock across threads and
+processes. It writes state/autopilot.json (settings), state/runs.json (one entry per session it
+started) and state/runs/*.jsonl (each session's stream-json output); the owner's answers go into
+RESUME's Approvals and Decisions tables, and an owner's card the owner marks done is ticked in
+tasks.md. Standard library only; macOS and Linux.
+"""
+
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import supervisor as sv  # noqa: E402
+
+EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+LOCK = threading.RLock()  # the dispatcher thread and the dashboard's requests write the same files
+LOCAL = threading.local()
+PROCS: dict = {}  # session id -> Popen, for the sessions this process started
+HELD: dict = {}  # tasks -> the open dispatcher lock file this process holds
+API_ERROR = re.compile(r"authenticat|oauth|log ?in|rate.?limit|usage limit|overloaded|credit balance|quota", re.I)
+BUDGET = re.compile(r"budget", re.I)
+
+RULES = """You are running unattended: the Spec-Grill autopilot started this session for card {card} of
+{tasks}. Nobody reads this conversation while it runs, so never wait for a reply; the files are your
+only channel to the owner.
+
+- Follow that file's §1 and your card exactly as an attended session would.
+- A step that needs the owner's yes (§1 item 7) is never run on your own. Add a row to RESUME's
+  "## Approvals" table (create the section above "## Status" with the header
+  `| # | card | step | why | status | answer |` if it is missing): the next free number A1, A2, …;
+  your card; the exact step or commands; why, and what happens if the owner says no; status
+  `pending`; answer empty. Write a `|` inside a cell as `\\|`. Leave your status row `doing`, then end
+  your turn with the line `AUTOPILOT: WAITING FOR APPROVAL A<n>`. This session is resumed with the
+  owner's answer.
+- A choice only the owner can make (a design pick, an open question the card asks them): don't wait
+  for it in this chat and don't mark the card blocked. Add a row to RESUME's Decisions table (the next
+  number; the question in plain words with the options; your recommendation in the `recommended`
+  column if there is one; your card under "needed before"; answer empty), put anything the owner
+  needs to look at (an artifact, a page) in that row or in your hand-off draft, leave your status row
+  `doing`, and end with `AUTOPILOT: WAITING FOR DECISION <n>`. This session is resumed once the owner
+  has answered.
+- Blocked (§1 item 4): record the blocker as §1 says, then end with `AUTOPILOT: BLOCKED`.
+- Context running out (§1 item 6): hand off and add the remainder card as §1 says, then end with
+  `AUTOPILOT: SPLIT`.
+- Finished (§1 item 9): end with `AUTOPILOT: DONE`. Never start another card.
+"""
+
+CONTINUE = """The autopilot resumed this session: card {card} is not finished (RESUME says {status}).
+Re-read RESUME (the owner may have answered a decision you were waiting for) and your card, then carry
+on from where the work stopped, following tasks.md §1. If something prevents finishing, record it as a
+blocker and stop."""
+WAITED = re.compile(r"AUTOPILOT: WAITING FOR (?:DECISION|APPROVAL)")
+
+ANSWER = """The owner answered approval {n} of card {card} ({step}): {verdict}.{note}
+{then}"""
+APPROVED = ("Run that step now, set the approval's status in RESUME to `done`, then carry on with card "
+            "{card}. If the step is still denied to this session, don't work around it: record the exact "
+            "commands as a blocker for the owner (they run them by hand) and stop.")
+REJECTED = ("Do not run that step. Leave the approval `rejected`, follow the owner's note if there is one, "
+            "and carry on with card {card} without it, or record a blocker and stop if the card cannot finish.")
+
+
+def stamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+
+
+def state_dir(tasks: str) -> str:
+    return os.path.join(os.path.dirname(tasks), "state")
+
+
+@contextlib.contextmanager
+def guard(tasks: str):
+    """One writer at a time for a feature's state files, across threads (LOCK) and processes (flock)."""
+    with LOCK:
+        depth = getattr(LOCAL, "depth", 0)
+        if depth == 0:
+            os.makedirs(state_dir(tasks), exist_ok=True)
+            LOCAL.handle = open(os.path.join(state_dir(tasks), ".autopilot.guard"), "a")
+            fcntl.flock(LOCAL.handle, fcntl.LOCK_EX)
+        LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            LOCAL.depth -= 1
+            if LOCAL.depth == 0:
+                fcntl.flock(LOCAL.handle, fcntl.LOCK_UN)
+                LOCAL.handle.close()
+
+
+def save_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def write_text(path: str, text: str) -> None:
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def registry(tasks: str) -> dict:
+    found = sv.read_json(os.path.join(state_dir(tasks), "runs.json"), {})
+    found = found if isinstance(found, dict) else {}
+    for key, empty in (("runs", []), ("attention", {}), ("handled", []), ("manual", []), ("notified", [])):
+        found.setdefault(key, empty)
+    return found
+
+
+def save_registry(tasks: str, reg: dict) -> None:
+    save_json(os.path.join(state_dir(tasks), "runs.json"), reg)
+
+
+def settings(tasks: str) -> dict:
+    return sv.load_settings(state_dir(tasks))
+
+
+def change_settings(tasks: str, **changes) -> dict:
+    with guard(tasks):
+        current = settings(tasks)
+        current.pop("exists", None)
+        for key, value in changes.items():
+            if key in sv.SETTINGS:
+                current[key] = value
+        save_json(os.path.join(state_dir(tasks), "autopilot.json"), current)
+        return current
+
+
+def approval_key(a: dict) -> str:
+    return f"{a['card']} {a['n']}"
+
+
+# --- the dispatcher's lock: one process dispatches a feature ----------------------------
+
+
+def acquire(tasks: str) -> bool:
+    """Take the feature's dispatcher lock for the life of this process (or until release)."""
+    if tasks in HELD:
+        return True
+    os.makedirs(state_dir(tasks), exist_ok=True)
+    handle = open(os.path.join(state_dir(tasks), ".autopilot.lock"), "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"pid": os.getpid(), "since": stamp()}))
+    handle.flush()
+    HELD[tasks] = handle
+    return True
+
+
+def holds(tasks: str) -> bool:
+    return tasks in HELD
+
+
+def release(tasks: str) -> None:
+    handle = HELD.pop(tasks, None)
+    if handle:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+# --- sessions --------------------------------------------------------------------------
+
+
+def repo_root(tasks: str) -> str:
+    folder = os.path.dirname(tasks)
+    try:
+        out = subprocess.run(["git", "-C", folder, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return out or folder
+    except Exception:
+        return folder
+
+
+def session_name(s: dict, cid: str) -> str:
+    """The name §1 gives a card's session ("rename the session to `P12 T0nn <card title>`"), so a
+    session the autopilot starts is named like one started by hand; else "<NNN> T0nn <title>"."""
+    number = re.match(r"(\d+)-", os.path.basename(os.path.dirname(s["tasks"])))
+    number = number.group(1) if number else ""
+    title = re.sub(r"`", "", s["cards"][cid]["title"])
+    flat = re.sub(r"\s+", " ", sv.read(s["tasks"]))
+    pattern = next((p for p in re.findall(r"rename the session to `([^`]+)`", flat) if "T0nn" in p), "")
+    if pattern:
+        name = pattern.replace("<NNN>", number).replace("<card title>", title).replace("T0nn", cid)
+    else:
+        name = " ".join(x for x in (number, cid, title) if x)
+    return re.sub(r"\s+", " ", name).strip()[:120]
+
+
+def start_line(s: dict, cid: str) -> str:
+    return s["cards"][cid]["start_with"] or f"{s['feature']} · {cid}. Follow {s['tasks']} §1, then card {cid}."
+
+
+def permitted(deny: list, step: str) -> list:
+    """The deny list for a session resumed to run an approved step: without the patterns that step
+    needs (`Bash(git push:*)` when the step says `git push …`), so the owner's yes can take effect."""
+    out = []
+    for pattern in deny:
+        found = re.fullmatch(r"Bash\((.+?)(?::\*)?\)", pattern.strip())
+        if found and found.group(1).strip() and found.group(1).strip() in step:
+            continue
+        out.append(pattern)
+    return out
+
+
+def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: bool, deny: list) -> list:
+    card = s["cards"][cid]
+    cmd = [cfg["claude"], "-p", "--output-format", "stream-json", "--verbose",
+           "--permission-mode", str(cfg["permission_mode"]),
+           "--max-budget-usd", str(cfg["budget_per_card_usd"])]
+    cmd += ["--resume", session] if resume else ["--session-id", session, "-n", session_name(s, cid)]
+    if card["effort"] in EFFORTS:
+        cmd += ["--effort", card["effort"]]
+    if card["model"]:
+        cmd += ["--model", card["model"]]
+    if deny:
+        cmd += ["--settings", json.dumps({"permissions": {"deny": deny}})]
+    cmd += ["--append-system-prompt", RULES.format(card=cid, tasks=s["tasks"])]
+    return cmd + [prompt]
+
+
+def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, session: str = "",
+          approval: str = "", deny: list | None = None) -> dict:
+    """Start (no session) or resume (session) a card's session; record it in the registry."""
+    cfg = settings(tasks)
+    resume = bool(session)
+    session = session or str(uuid.uuid4())
+    attempt = sum(1 for r in reg["runs"] if r["card"] == cid) + 1
+    logs = os.path.join(state_dir(tasks), "runs")
+    os.makedirs(logs, exist_ok=True)
+    log = os.path.join(logs, f"{cid}-{attempt}.jsonl")
+    run = {"card": cid, "session": session, "attempt": attempt, "reason": reason, "approval": approval,
+           "pid": None, "started": stamp(), "ended": "", "exit": None, "cost": 0, "result": "", "error": "",
+           "worked": False, "log": os.path.relpath(log, state_dir(tasks))}
+    env = {**os.environ, "SPEC_GRILL_AUTOPILOT": "1", "SPEC_GRILL_CARD": cid}
+    deny = s["autopilot"]["deny"] if deny is None else deny
+    try:
+        with open(log, "w", encoding="utf-8") as out:
+            proc = subprocess.Popen(command(cfg, s, cid, session, prompt, resume, deny), cwd=repo_root(tasks),
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                    env=env, start_new_session=True)
+        run["pid"] = proc.pid
+        PROCS[session] = proc
+    except OSError as error:
+        run.update(ended=stamp(), error=f"could not start {cfg['claude']}: {error}")
+    reg["runs"].append(run)
+    reg["attention"].pop(cid, None)
+    if approval and not run["error"]:
+        reg["handled"].append(approval)
+    return run
+
+
+def result_of(path: str) -> dict:
+    """The final "result" event of a stream-json log, and whether the session did any work."""
+    out = {"result": None, "worked": False}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                flat = line.replace(" ", "")
+                if '"type":"assistant"' in flat and "is_api_error_message" not in flat:
+                    out["worked"] = True
+                if '"type":"result"' in flat:
+                    try:
+                        out["result"] = json.loads(line)
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+def reap(tasks: str, reg: dict) -> list:
+    """Close the registry entries of sessions that ended; return them."""
+    ended = []
+    for run in reg["runs"]:
+        if run["ended"]:
+            continue
+        proc = PROCS.get(run["session"])
+        if proc and proc.pid == run["pid"]:
+            code = proc.poll()
+        else:
+            code = None if sv.run_alive(run) else -1
+        if code is None:
+            continue
+        PROCS.pop(run["session"], None)
+        found = result_of(os.path.join(state_dir(tasks), run["log"]))
+        result = found["result"] or {}
+        text = str(result.get("result") or "")
+        run.update(ended=stamp(), exit=code, cost=float(result.get("total_cost_usd") or 0),
+                   result=text[-600:], worked=found["worked"])
+        if not result:
+            run["error"] = run["error"] or f"the session exited ({code}) without a result"
+        elif result.get("is_error"):
+            reason = result.get("terminal_reason") or result.get("subtype") or "error"
+            run["error"] = f"{reason}: {text[:300]}"
+        if is_api_error(run):
+            run["api_error"] = True
+        if run.get("approval") and (run.get("api_error") or not run["worked"]):
+            # the answer never reached a working session: deliver it again on the next resume
+            if run["approval"] in reg["handled"]:
+                reg["handled"].remove(run["approval"])
+        ended.append(run)
+    return ended
+
+
+def is_api_error(run: dict) -> bool:
+    error = run.get("error") or ""
+    return bool(error) and (error.startswith("api_error") or bool(API_ERROR.search(error)))
+
+
+def kill(run: dict) -> bool:
+    """Stop a session's process group, only after checking the pid still is that session."""
+    if not sv.run_alive(run):
+        return False
+    try:
+        os.killpg(int(run["pid"]), signal.SIGTERM)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def notify(title: str, text: str) -> None:
+    try:
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            quote = lambda v: v.replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
+            subprocess.run(["osascript", "-e", f'display notification "{quote(text)}" with title "{quote(title)}"'],
+                           capture_output=True, timeout=5)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, text], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+# --- one pass of the dispatcher --------------------------------------------------------
+
+
+def latest(reg: dict, cid: str) -> dict | None:
+    return next((r for r in reversed(reg["runs"]) if r["card"] == cid), None)
+
+
+def latest_worked(reg: dict, cid: str) -> dict | None:
+    """The newest session of a card that did any work: the conversation to resume."""
+    return next((r for r in reversed(reg["runs"]) if r["card"] == cid and r.get("worked")), None)
+
+
+def live(reg: dict) -> list:
+    return [r for r in reg["runs"] if not r["ended"]]
+
+
+def spent(reg: dict) -> float:
+    return sum(float(r.get("cost") or 0) for r in reg["runs"])
+
+
+def step(tasks: str) -> list:
+    """One pass for one feature; returns what it did, one line per event."""
+    events = []
+    if not settings(tasks)["exists"] or not acquire(tasks):
+        return events
+    with guard(tasks):
+        cfg = settings(tasks)
+        reg = registry(tasks)
+        for run in reap(tasks, reg):
+            cid = run["card"]
+            events.append(f"{cid}: session ended" + (f" with {run['error'][:160]}" if run["error"]
+                                                       else f" (${run['cost']:.2f})"))
+            if run.get("api_error") and cfg["auto"]:
+                cfg = change_settings(tasks, auto=False, paused_reason=f"API error in {cid}: {run['error'][:200]}")
+                events.append("autopilot paused: API error")
+
+        # silent or overlong sessions
+        now = time.time()
+        for run in live(reg):
+            path = os.path.join(state_dir(tasks), run["log"])
+            quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
+            started = dt.datetime.strptime(run["started"], "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc)
+            long = now - started.timestamp() > cfg["max_run_hours"] * 3600
+            if (quiet > cfg["quiet_minutes"] * 60 or long) and run["card"] not in reg["attention"]:
+                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {cfg['max_run_hours']} h"
+                kill(run)
+                reg["attention"][run["card"]] = f"its session was stopped ({why}); see `state/{run['log']}`"
+                events.append(f"{run['card']}: stopped its session ({why})")
+
+        save_registry(tasks, reg)
+        s = sv.build(tasks, 4)
+        if cfg["auto"] and not s["autopilot"]["deny"]:
+            cfg = change_settings(tasks, auto=False, paused_reason=(
+                "tasks.md §6 has no **Never unattended:** line; add one (for example `Bash(git push:*)`) "
+                "so unattended sessions cannot deploy or push"))
+            events.append("autopilot paused: no Never unattended list")
+        if cfg["auto"]:
+            events += dispatch(tasks, s, reg, cfg)
+            save_registry(tasks, reg)
+            s = sv.build(tasks, 4)
+        events += alert(tasks, s, reg, cfg)
+        save_registry(tasks, reg)
+    return events
+
+
+def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
+    """What the autopilot would do next, in order: (card, reason, prompt, session, approval key, deny)."""
+    out = []
+    running = {r["card"] for r in live(reg)}
+    for cid in s["cards"]:
+        if cid in running or cid in reg["manual"] or s["status"][cid] in sv.FINISHED:
+            continue
+        if s["cards"][cid]["kind"] in ("", "owner"):
+            continue  # an owner's card, or one whose kind nobody wrote down: never on its own
+        if cid in reg["attention"]:
+            continue  # stuck or stopped by the owner: only the owner's Retry starts it again
+        worked = latest_worked(reg, cid)
+        answered = [a for a in s["approvals_answered"] if a["card"] == cid and approval_key(a) not in reg["handled"]]
+        if worked and answered:  # the owner answered: resume that conversation with the answer
+            a = answered[0]
+            approved = a["status"] == "approved"
+            prompt = ANSWER.format(n=a["n"], card=cid, step=a["step"], verdict=a["status"],
+                                   note=f" Note: {a['answer']}" if a["answer"] else "",
+                                   then=(APPROVED if approved else REJECTED).format(card=cid))
+            deny = permitted(s["autopilot"]["deny"], a["step"]) if approved else s["autopilot"]["deny"]
+            out.append((cid, f"answer {a['n']}", prompt, worked["session"], approval_key(a), deny))
+            continue
+        if any(a["card"] == cid for a in s["approvals"]):
+            continue  # waiting for the owner's answer
+        kinds = {w["kind"] for w in s["waiting"].get(cid, [])}
+        if kinds - {"worktree"} or (kinds and s["status"][cid] == "todo"):
+            continue  # waits for a card, a decision, a blocker, a stage review or the worktree
+        last = latest(reg, cid)
+        if not last:
+            if cid in s["ready"]:
+                out.append((cid, "start", start_line(s, cid), "", "", None))
+            continue
+        if BUDGET.search(last["error"] or ""):
+            reg["attention"][cid] = f"its session hit the ${cfg['budget_per_card_usd']} cap per session"
+            continue
+        # sessions that stopped to wait for the owner, or never reached the API, are not failed tries
+        tries = sum(1 for r in reg["runs"] if r["card"] == cid and not r.get("api_error")
+                    and not r["reason"].startswith("answer") and not WAITED.search(r.get("result") or ""))
+        if tries >= cfg["max_attempts"]:
+            reg["attention"][cid] = (f"{tries} sessions ended without finishing it"
+                                     + (f"; the last said: {last['result'][-200:]}" if last["result"] else ""))
+            continue
+        if worked:
+            out.append((cid, "continue", CONTINUE.format(card=cid, status=s["status"][cid]), worked["session"], "", None))
+        elif cid in s["ready"]:
+            out.append((cid, "start", start_line(s, cid), "", "", None))
+    return out
+
+
+def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
+    """Why a session for cid can't start now ("" when it can): the parallel limit, the shared
+    worktree, or the total budget (counting each live session at its full cap)."""
+    running = live(reg)
+    if len(running) >= cfg["max_parallel"]:
+        return f"{len(running)} sessions are running (the limit is {cfg['max_parallel']})"
+    if not s["cards"][cid]["parallel"]:
+        serial = {r["card"] for r in running if not s["cards"].get(r["card"], {}).get("parallel")}
+        serial |= {c for c in s["doing"] if not s["cards"][c]["parallel"]}
+        if serial - {cid}:
+            return f"{', '.join(sorted(serial - {cid}))} holds the integration worktree (cards without [P] run one at a time)"
+    total = cfg["budget_total_usd"]
+    if total and spent(reg) + (len(running) + 1) * cfg["budget_per_card_usd"] > total:
+        return f"another session could take the spend past the ${total} budget"
+    return ""
+
+
+def dispatch(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
+    events = []
+    for cid, reason, prompt, session, approval, deny in plan(tasks, s, reg, cfg):
+        why = room(s, reg, cfg, cid)
+        if why.startswith("another session"):
+            if not live(reg):
+                change_settings(tasks, auto=False, paused_reason=f"the sessions have spent ${spent(reg):.2f}; {why}")
+                events.append("autopilot paused: total budget")
+            break
+        if why:
+            if why.startswith(f"{len(live(reg))} sessions"):
+                break
+            continue
+        run = spawn(tasks, s, reg, cid, reason, prompt, session, approval, deny)
+        tier = s["cards"][cid]["effort"] or "default"
+        events.append(f"{cid}: {reason} · effort {tier}" + (f" · failed: {run['error']}" if run["error"] else ""))
+    return events
+
+
+def alert(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
+    """Notify the owner once about each new thing that needs them."""
+    needs = {f"approval {approval_key(a)}": f"{a['card']} asks: {a['step']}" for a in s["approvals"]}
+    needs.update({f"gate {g}": f"stage {g} is done; review and approve it" for g in s["gates"]})
+    needs.update({f"attention {c}": f"{c}: {why}" for c, why in reg["attention"].items()})
+    needs.update({f"decision {d['n']}": d["question"] for d in s["open_decisions"]})
+    needs.update({f"yours {c}": f"{c} is your card" for c in s["yours"]})
+    if cfg["paused_reason"]:
+        needs["paused " + cfg["paused_reason"]] = "autopilot paused: " + cfg["paused_reason"]
+    fresh = [k for k in needs if k not in reg["notified"]]
+    reg["notified"] = [k for k in reg["notified"] if k in needs] + fresh
+    if fresh and cfg["notify"]:
+        text = needs[fresh[0]] + (f" (+{len(fresh) - 1} more)" if len(fresh) > 1 else "")
+        notify(f"{s['feature']} needs you", text[:200])
+    return [f"needs you: {needs[k]}" for k in fresh]
+
+
+def loop(features, interval: float, stop: threading.Event, say=print) -> None:
+    """Run step() for every feature that uses the autopilot until stop is set."""
+    seen = set()
+    try:
+        while not stop.is_set():
+            for tasks in features():
+                seen.add(tasks)
+                try:
+                    for line in step(tasks):
+                        say(f"{time.strftime('%H:%M:%S')} {os.path.basename(os.path.dirname(tasks))} {line}")
+                except Exception as error:  # one broken feature must not stop the others
+                    say(f"{time.strftime('%H:%M:%S')} {tasks}: {error!r}")
+            stop.wait(interval)
+    finally:
+        for tasks in seen:
+            release(tasks)
+
+
+# --- the owner's actions (dashboard buttons) --------------------------------------------
+
+
+class Refused(Exception):
+    pass
+
+
+NEEDS_CARD = {"start", "retry", "stop", "takeover", "owner-done"}
+
+
+def act(tasks: str, action: str, data: dict) -> str:
+    """Carry out one owner action; return a line saying what happened."""
+    with guard(tasks):
+        cfg = settings(tasks)
+        if action in ("settings", "gate", "start", "retry", "stop", "takeover") and not cfg["exists"]:
+            if action != "settings":
+                raise Refused("this feature does not use the autopilot")
+        s = sv.build(tasks, 4)
+        cid = str(data.get("card", ""))
+        if action in NEEDS_CARD and cid not in s["cards"]:
+            raise Refused(f"no card {cid!r}")
+        if action == "settings":
+            changes = {}
+            for key in ("auto", "gate_checkpoints", "notify"):
+                if key in data:
+                    changes[key] = bool(data[key])
+            for key, low in (("max_parallel", 1), ("budget_per_card_usd", 1), ("budget_total_usd", 0)):
+                if key in data:
+                    try:
+                        changes[key] = max(low, int(data[key]))
+                    except (TypeError, ValueError):
+                        raise Refused(f"{key} must be a whole number") from None
+            if changes.get("auto"):
+                changes["paused_reason"] = ""
+            change_settings(tasks, **changes)
+            return "settings saved"
+        reg = registry(tasks)
+        if action in ("start", "retry"):
+            card = s["cards"][cid]
+            if not holds(tasks):
+                raise Refused("this process does not dispatch the feature")
+            if any(r["card"] == cid for r in live(reg)):
+                raise Refused(f"{cid} already has a live session")
+            if s["status"][cid] in sv.FINISHED:
+                raise Refused(f"{cid} is {s['status'][cid]}")
+            if card["kind"] == "owner":
+                raise Refused(f"{cid} is your card: do it, then mark it done")
+            waits = [w for w in s["waiting"].get(cid, []) if w["kind"] != "worktree"]
+            if waits:
+                raise Refused(f"{cid} still waits for {', '.join(w['on'] for w in waits)}")
+            if any(a["card"] == cid for a in s["approvals"]):
+                raise Refused(f"{cid} waits for your answer to its approval")
+            why = room(s, reg, cfg, cid)
+            if why:
+                raise Refused(f"not now: {why}")
+            reg["attention"].pop(cid, None)
+            if cid in reg["manual"]:
+                reg["manual"].remove(cid)
+            worked = latest_worked(reg, cid)
+            if worked:
+                run = spawn(tasks, s, reg, cid, "continue (owner)", CONTINUE.format(card=cid, status=s["status"][cid]),
+                            worked["session"])
+            else:
+                run = spawn(tasks, s, reg, cid, "start (owner)", start_line(s, cid))
+            save_registry(tasks, reg)
+            if run["error"]:
+                raise Refused(run["error"])
+            return f"{cid} started"
+        if action == "stop":
+            runs = [r for r in live(reg) if r["card"] == cid]
+            if not runs:
+                raise Refused(f"{cid} has no live session")
+            for run in runs:
+                kill(run)
+            reg["attention"][cid] = "you stopped its session"
+            save_registry(tasks, reg)
+            return f"{cid} stopped"
+        if action == "takeover":  # the owner runs the card by hand; the autopilot leaves it alone
+            if any(r["card"] == cid for r in live(reg)):
+                raise Refused(f"stop {cid}'s session first")
+            reg["attention"].pop(cid, None)
+            if cid not in reg["manual"]:
+                reg["manual"].append(cid)
+            save_registry(tasks, reg)
+            worked = latest_worked(reg, cid)
+            return f"{cid} is yours" + (f": claude --resume {worked['session']}" if worked else "")
+        if action == "approval":
+            verdict = data.get("verdict")
+            if verdict not in ("approved", "rejected"):
+                raise Refused("verdict must be approved or rejected")
+            n, card = str(data.get("n", "")), str(data.get("card", ""))
+            if not any(a["n"] == n and a["card"] == card for a in s["approvals"]):
+                raise Refused(f"no pending approval {n} for {card}")
+            note = one_line(data.get("note", ""))
+            set_row(s, "approvals", {"#": n, "card": card},
+                    {"status": verdict, "answer": f"{note + ' — ' if note else ''}owner, {stamp()}"})
+            return f"approval {n} for {card} {verdict}"
+        if action == "decision":
+            answer = one_line(data.get("answer", ""))
+            if not answer:
+                raise Refused("empty answer")
+            set_row(s, "decisions", {"#": str(data.get("n", ""))}, {"answer": answer, "by": f"owner, {stamp()}"})
+            return f"decision {data.get('n')} answered"
+        if action == "gate":
+            gate = str(data.get("gate", ""))
+            if gate not in s["gates"]:
+                raise Refused(f"{gate} is not waiting for a review")
+            change_settings(tasks, approved_gates=cfg["approved_gates"] + [gate])
+            return f"stage {gate} approved"
+        if action == "owner-done":
+            if s["cards"][cid]["kind"] != "owner":
+                raise Refused(f"{cid} is not an owner's card")
+            set_row(s, "status", {"card": cid}, {"status": "done", "date": stamp()})
+            tick(tasks, cid)
+            return f"{cid} done"
+        raise Refused(f"unknown action {action}")
+
+
+def one_line(value) -> str:
+    return re.sub(r"\s+", " ", str(value)).replace("|", "/").strip()[:500]
+
+
+def set_row(s: dict, name: str, match: dict, values: dict) -> None:
+    """Change cells of the one row of a RESUME table whose columns equal match (a card column is
+    compared by the card id in it). Only the named cells change; escaped pipes (\\|) stay intact and
+    the rest of the file stays byte for byte."""
+    path = s["resume"]
+    if not path:
+        raise Refused("there is no state/RESUME.md yet")
+    lines = sv.read(path).split("\n")
+    current, head = None, None
+    for i, line in enumerate(lines):
+        if m := re.match(r"^##\s+(.+?)\s*$", line):
+            current, head = m.group(1).lower(), None
+            continue
+        if current is None or not current.startswith(name) or not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in sv.PIPE_RE.split(line.strip().strip("|"))]
+        if head is None:
+            head = [c.lower() for c in cells]
+            continue
+        if all(set(c) <= set("-: ") for c in cells):
+            continue
+        row = dict(zip(head, cells))
+
+        def same(column: str, want: str) -> bool:
+            value = sv.column(row, column)
+            if column == "card":
+                found = sv.ID_RE.search(value)
+                return bool(found) and found.group(0) == want
+            return value.strip("`* ") == want
+
+        if not all(same(column, want) for column, want in match.items()):
+            continue
+        for column, value in values.items():
+            index = next((j for j, h in enumerate(head) if h.startswith(column)), None)
+            if index is None:
+                raise Refused(f"RESUME's {name} table has no {column} column")
+            while len(cells) <= index:
+                cells.append("")
+            cells[index] = value
+        lines[i] = "| " + " | ".join(cells) + " |"
+        write_text(path, "\n".join(lines))
+        return
+    raise Refused(f"no row {' '.join(match.values())} in RESUME's {name} table")
+
+
+def tick(tasks: str, cid: str) -> None:
+    text = sv.read(tasks)
+    new = re.sub(rf"^- \[ \] {re.escape(cid)}\b", f"- [x] {cid}", text, count=1, flags=re.M)
+    if new != text:
+        write_text(tasks, new)
+
+
+def log_tail(tasks: str, cid: str, lines: int = 60) -> str:
+    """The latest session of a card, as readable lines: what it said, which tools it ran, the result."""
+    run = latest(registry(tasks), cid)
+    if not run:
+        return "No session yet."
+    out = [f"Session {run['session']} · {run['reason']} · started {run['started']}"
+           + (f" · ended {run['ended']}" if run["ended"] else " · running")]
+    try:
+        with open(os.path.join(state_dir(tasks), run["log"]), encoding="utf-8", errors="replace") as handle:
+            raw = handle.readlines()
+    except OSError:
+        raw = []
+    for line in raw[-400:]:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            out.append(line.rstrip()[:300])
+            continue
+        if event.get("type") == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    out.append("» " + block["text"].strip().replace("\n", " ")[:400])
+                elif block.get("type") == "tool_use":
+                    arg = block.get("input", {})
+                    hint = arg.get("command") or arg.get("file_path") or arg.get("pattern") or arg.get("description") or ""
+                    out.append(f"  {block.get('name')}: {str(hint)[:160]}")
+        elif event.get("type") == "result":
+            out.append(f"Result ({event.get('subtype')}, ${float(event.get('total_cost_usd') or 0):.2f}): "
+                       + str(event.get("result") or "")[:600])
+    return "\n".join(out[:1] + out[1:][-lines:])

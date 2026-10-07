@@ -151,6 +151,29 @@ button:focus-visible, select:focus-visible, .tile:focus-visible { outline: 2px s
 .link { color: var(--doing); cursor: pointer; background: none; border: 0; padding: 0; font: inherit; font-family: var(--mono); font-size: 12.5px; }
 .link:hover { text-decoration: underline; }
 pre.handoff { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; font-size: 12px; font-family: var(--mono); margin: 4px 0 0; }
+/* autopilot */
+.autobar { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; margin: 14px 0 0; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); font-size: 13px; color: var(--muted); }
+.autobar b { color: var(--text); }
+.autobar label { display: inline-flex; align-items: center; gap: 6px; }
+.pill { font-weight: 650; font-size: 12px; padding: 3px 10px; border-radius: 999px; color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); }
+.pill-on { --c: var(--done); } .pill-paused { --c: var(--wait); } .pill-off { --c: var(--faint); }
+.auto-reason { flex-basis: 100%; color: var(--block); }
+button.primary { background: var(--doing); border-color: var(--doing); color: #fff; }
+button.primary:hover { filter: brightness(1.08); border-color: var(--doing); }
+button:disabled { opacity: .55; cursor: default; }
+.form { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.form input[type=text] { flex: 1 1 180px; min-width: 0; font: inherit; font-size: 13px; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; padding: 5px 9px; }
+.k-gate { color: var(--ready); background: color-mix(in srgb, var(--ready) 13%, transparent); }
+.livedot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--doing); margin-left: 6px; vertical-align: middle; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.shot { display: block; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface-2); color: var(--muted); text-decoration: none; font-size: 11.5px; }
+.shot img { display: block; width: 100%; height: 130px; object-fit: cover; object-position: top; }
+.shot span { display: block; padding: 4px 8px; overflow-wrap: anywhere; }
+.shots-card { margin-bottom: 14px; } .shots-card:last-child { margin-bottom: 0; }
+.shots-card h3 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+pre.log { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; font-size: 11.5px; font-family: var(--mono); margin: 4px 0 0; max-height: 340px; overflow: auto; }
+.toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 20; background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; max-width: calc(100vw - 32px); }
+.toast.bad { background: var(--block); color: #fff; }
 .banner { display: none; margin: 12px 0 0; padding: 9px 12px; border-radius: 8px; color: var(--block); background: color-mix(in srgb, var(--block) 11%, transparent); font-size: 13px; }
 .banner.show { display: block; }
 </style>
@@ -165,6 +188,7 @@ pre.handoff { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--
       <button id="theme" type="button" aria-label="Toggle theme">◐</button>
     </div>
   </header>
+  <div id="autobar" class="autobar" hidden></div>
   <div id="banner" class="banner">Lost contact with <code>supervisor.py --serve</code>. Showing the last state; retrying every 3 s.</div>
 
   <section class="summary" aria-label="Progress">
@@ -178,7 +202,7 @@ pre.handoff { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--
 
   <div class="grid">
     <section class="panel">
-      <div class="panel-head"><h2>Run next</h2><span class="hint">Paste a line into a fresh session</span></div>
+      <div class="panel-head"><h2>Run next</h2><span class="hint" id="next-hint">Paste a line into a fresh session</span></div>
       <div id="next"></div>
     </section>
     <section class="panel">
@@ -190,6 +214,11 @@ pre.handoff { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--
   <section class="panel full">
     <div class="panel-head"><h2>Board</h2><span class="hint">Click a card for details</span></div>
     <div class="board" id="board"></div>
+  </section>
+
+  <section class="panel full" id="screens-panel" hidden>
+    <div class="panel-head"><h2>Screens</h2><span class="hint">Screenshots the interface cards saved in state/screens/</span></div>
+    <div id="screens"></div>
   </section>
 
   <section class="panel full">
@@ -212,11 +241,14 @@ pre.handoff { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--
 
 <div id="scrim" class="scrim" hidden></div>
 <aside id="drawer" class="drawer" hidden aria-label="Card details"></aside>
+<div id="toast" class="toast" hidden role="status"></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
 const COLORS = { done: "--done", doing: "--doing", ready: "--ready", waiting: "--wait", blocked: "--block", waived: "--waived" };
 const LABELS = { doing: "Running", ready: "Ready", waiting: "Waiting", blocked: "Blocked", done: "Done", waived: "Waived" };
+const TOKEN = document.querySelector('meta[name="supervisor-token"]')?.content || "";
+const DISPATCH = document.querySelector('meta[name="supervisor-dispatch"]')?.content === "1";
 let feature = new URLSearchParams(location.search).get("f") || "";
 let state = null, stateText = "", selected = null, lastOk = 0, showAllDone = false;
 const feed = [];
@@ -232,7 +264,7 @@ function category(s, id) {
   if (st === "done" || st === "waived" || st === "doing") return st;
   if (s.ready.includes(id)) return "ready";
   const w = s.waiting[id] || [];
-  if (st === "blocked" || w.some((r) => r.kind === "owner" || r.kind === "blocker")) return "blocked";
+  if (st === "blocked" || w.some((r) => ["owner", "blocker", "gate"].includes(r.kind))) return "blocked";
   return "waiting";
 }
 
@@ -245,6 +277,7 @@ function why(s, id) {
   return w.map((r) => r.kind === "card" ? r.on
     : r.kind === "worktree" ? `worktree (${r.on})`
     : r.kind === "owner" ? "you: " + r.on.replace(/^decision /, "decision ")
+    : r.kind === "gate" ? `your review of ${r.on}`
     : "blocker").join(", ").replace(/^/, "waits for ");
 }
 
@@ -269,10 +302,13 @@ function render(s) {
   $("#meter").innerHTML = order.filter((k) => counts[k]).map((k) =>
     `<span title="${LABELS[k]}: ${counts[k]}" style="width:${(counts[k] / s.total) * 100}%;background:var(${COLORS[k]})"></span>`).join("");
   $("#chips").innerHTML = ["doing", "ready", "waiting", "blocked", "done", "waived"].filter((k) => k !== "waived" || counts.waived)
-    .map((k) => `<span class="chip"><span class="sw" style="background:var(${COLORS[k]})"></span>${LABELS[k]} <b>${counts[k]}</b></span>`).join("");
+    .map((k) => `<span class="chip"><span class="sw" style="background:var(${COLORS[k]})"></span>${LABELS[k]} <b>${counts[k]}</b></span>`).join("")
+    + Object.entries(s.balance || {}).map(([k, v]) => `<span class="chip">${esc({ backend: "Back end", frontend: "Front end", fullstack: "Full stack" }[k] || k)} <b>${v.done}/${v.total}</b></span>`).join("");
 
+  renderAuto(s);
   renderNext(s);
   renderNeeds(s);
+  renderScreens(s);
   renderBoard(s);
   renderGraph(s);
   renderDrift(s);
@@ -281,6 +317,9 @@ function render(s) {
 
 function renderNext(s) {
   const el = $("#next");
+  const a = s.autopilot;
+  $("#next-hint").textContent = DISPATCH && a.settings.auto ? "The autopilot starts these as room frees up"
+    : DISPATCH ? "Autopilot paused: start cards yourself" : "Paste a line into a fresh session";
   if (!s.ready.length) {
     const running = s.doing.map((id) => `<b>${esc(id)}</b>`).join(", ");
     el.innerHTML = `<div class="empty">Nothing is ready to start.${running ? ` Waiting for ${running} to finish.` : ""}</div>`;
@@ -292,9 +331,11 @@ function renderNext(s) {
     return `<div class="next-item">
       <div class="next-row">
         <span class="next-title" data-card="${esc(id)}"><span class="mono">${esc(id)}</span> ${rich(c.title)}</span>
-        <span class="tags">${c.parallel ? '<span class="tag p">[P] parallel</span>' : ""}${c.size ? `<span class="tag">${esc(c.size)}</span>` : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}</span>
+        <span class="tags">${c.kind ? `<span class="tag">${esc(c.kind)}</span>` : ""}${c.parallel ? '<span class="tag p">[P] parallel</span>' : ""}${c.size ? `<span class="tag">${esc(c.size)}</span>` : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}</span>
       </div>
-      ${c.start_with ? `<div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}">Copy</button></div>` : '<div class="note">This card has no Start with line.</div>'}
+      ${c.kind === "owner" ? '<div class="note">Your card: do it, then mark it done under Needs you.</div>'
+        : DISPATCH ? `<div class="form"><button type="button" class="primary" data-act="start" data-card="${esc(id)}">Start now</button><button type="button" data-copy="${esc(c.start_with)}">Copy line</button></div>`
+        : c.start_with ? `<div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}">Copy</button></div>` : '<div class="note">This card has no Start with line.</div>'}
       ${opens.length ? `<div class="note">Finishing it unblocks ${opens.map(esc).join(", ")}</div>` : ""}
     </div>`;
   }).join("");
@@ -305,14 +346,66 @@ function renderNext(s) {
 }
 
 function renderNeeds(s) {
-  const items = [];
-  s.open_decisions.forEach((d) => items.push(["owner", "Decide", `Decision ${esc(d.n)}: ${rich(d.question)}`, d.before.length ? `Needed before ${d.before.map(esc).join(", ")}` : ""]));
-  s.blockers.forEach((b) => items.push(["block", "Blocker", rich(b.text), ""]));
-  s.stalled.forEach((x) => items.push(["stall", "Stalled", `<b>${esc(x.card)}</b> is doing but quiet for ${esc(x.quiet.replace(/ ago$/, ""))}`, "Check its session"]));
-  if (s.lock && s.lock.toLowerCase() !== "free") items.push(["lock", "Lock", `Deploy lock: ${rich(s.lock)}`, ""]);
+  const a = s.autopilot, items = [];
+  const b = (attrs, label, primary) => `<button type="button"${primary ? ' class="primary"' : ""} ${attrs}>${label}</button>`;
+  s.approvals.forEach((p) => {
+    const key = `data-n="${esc(p.n)}" data-card="${esc(p.card)}"`;
+    items.push(["owner", "Approve", `<b>${esc(p.card)}</b> asks (${esc(p.n)}) to: ${rich(p.step)}`, p.why ? rich(p.why) : "",
+      `<div class="form"><input type="text" id="note-${esc(p.card)}-${esc(p.n)}" data-keep placeholder="Note for the session (optional)" aria-label="Note for ${esc(p.n)}">
+        ${b(`data-act="approval" ${key} data-verdict="approved"`, "Approve", true)}${b(`data-act="approval" ${key} data-verdict="rejected"`, "Reject")}</div>`]);
+  });
+  s.gates.forEach((g) => items.push(["gate", "Review", `Stage checkpoint <b>${esc(g)}</b> is finished`,
+    "Read its hand-off and findings, look at the screens, then let the next stage start.",
+    `<div class="form">${b(`data-card="${esc(g)}"`, `Open ${esc(g)}`)}${b(`data-act="gate" data-gate="${esc(g)}"`, "Approve stage", true)}</div>`]));
+  Object.entries(a.attention || {}).forEach(([c, w]) => items.push(["block", "Stuck", `<b>${esc(c)}</b>: ${rich(w)}`, "",
+    `<div class="form">${b(`data-card="${esc(c)}"`, "Log")}${DISPATCH ? b(`data-act="retry" data-card="${esc(c)}"`, "Retry", true) : ""}${b(`data-act="takeover" data-card="${esc(c)}"`, "I'll take it")}</div>`]));
+  s.yours.forEach((c) => items.push(["owner", "Your card", `<b>${esc(c)}</b> ${rich(s.cards[c].title)}`, "",
+    `<div class="form">${b(`data-card="${esc(c)}"`, "Details")}${s.resume ? b(`data-act="owner-done" data-card="${esc(c)}"`, "Mark done", true) : ""}</div>`]));
+  s.open_decisions.forEach((d) => items.push(["owner", "Decide", `Decision ${esc(d.n)}: ${rich(d.question)}`,
+    (d.before.length ? `Needed before ${d.before.map(esc).join(", ")}` : "") + (d.recommended ? `${d.before.length ? " · " : ""}recommended: ${rich(d.recommended)}` : ""),
+    s.resume ? `<div class="form"><input type="text" id="ans-${esc(d.n)}" data-keep value="${esc(d.recommended || "")}" placeholder="Your answer" aria-label="Answer to decision ${esc(d.n)}">${b(`data-act="decision" data-n="${esc(d.n)}"`, "Answer", true)}</div>` : ""]));
+  s.blockers.forEach((x) => items.push(["block", "Blocker", rich(x.text), "", ""]));
+  s.stalled.forEach((x) => items.push(["stall", "Stalled", `<b>${esc(x.card)}</b> is doing but quiet for ${esc(x.quiet.replace(/ ago$/, ""))}`, "Check its session", ""]));
+  if (a.used && a.unkinded?.length) items.push(["stall", "No kind", `${a.unkinded.map(esc).join(", ")}`, "The autopilot starts only cards whose meta line says <code>kind backend</code>, <code>frontend</code>, <code>fullstack</code> or <code>owner</code>.", ""]);
+  if (s.lopsided) items.push(["stall", "Balance", rich(s.lopsided), "Put the interface cards first in the next stage, or ask why they wait.", ""]);
+  if (s.lock && s.lock.toLowerCase() !== "free") items.push(["lock", "Lock", `Deploy lock: ${rich(s.lock)}`, "", ""]);
+  const kept = {};
+  $("#needs").querySelectorAll("[data-keep]").forEach((x) => (kept[x.id] = x.value));
+  const focus = document.activeElement?.id;
   $("#needs").innerHTML = items.length
-    ? items.map(([k, label, text, sub]) => `<div class="need"><span class="kind k-${k}">${label}</span><div>${text}${sub ? `<div class="note">${sub}</div>` : ""}</div></div>`).join("")
+    ? items.map(([k, label, text, sub, form]) => `<div class="need"><span class="kind k-${k}">${label}</span><div style="flex:1;min-width:0">${text}${sub ? `<div class="note">${sub}</div>` : ""}${form}</div></div>`).join("")
     : `<div class="all-clear">✓ Nothing needs you right now.</div>`;
+  Object.entries(kept).forEach(([id, v]) => { const x = document.getElementById(id); if (x) x.value = v; });
+  if (focus && document.getElementById(focus)) document.getElementById(focus).focus();
+}
+
+function renderAuto(s) {
+  const a = s.autopilot, el = $("#autobar");
+  el.hidden = !a.used && !DISPATCH;
+  if (el.hidden) return;
+  const on = a.dispatcher && a.settings.auto;
+  const [cls, text] = !a.dispatcher ? ["off", "Autopilot not running"] : on ? ["on", "Autopilot on"] : ["paused", "Autopilot paused"];
+  el.innerHTML = `<span class="pill pill-${cls}">${text}</span>
+    ${a.dispatcher ? `<button type="button" data-act="settings" data-auto="${on ? 0 : 1}"${on ? "" : ' class="primary"'}>${on ? "Pause" : "Resume"}</button>`
+      : `<span>Run <code>supervisor.py … --serve --autopilot</code> to dispatch</span>`}
+    <label>Parallel <select id="set-par" aria-label="Sessions at the same time">${[1, 2, 3, 4, 5, 6].map((n) => `<option${n === a.settings.max_parallel ? " selected" : ""}>${n}</option>`).join("")}</select></label>
+    <label><input type="checkbox" id="set-gate"${a.settings.gate_checkpoints ? " checked" : ""}> Hold each stage for my review</label>
+    <span>Live <b>${a.live.map(esc).join(", ") || "none"}</b></span>
+    <span>Spent <b>$${a.spent_usd.toFixed(2)}</b>${a.settings.budget_total_usd ? ` of $${esc(a.settings.budget_total_usd)}` : ""}</span>
+    <span title="Denied to unattended sessions (tasks.md §6)">Never unattended <b>${a.deny.length ? a.deny.map(esc).join(", ") : "none listed"}</b></span>
+    ${a.settings.paused_reason ? `<div class="auto-reason">Paused: ${rich(a.settings.paused_reason)}</div>` : ""}`;
+}
+
+const shotUrl = (card, file) => `/screen?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(card)}&file=${encodeURIComponent(file)}`;
+const shots = (card, files) => files.map((f) => `<a class="shot" href="${shotUrl(card, f)}" target="_blank" rel="noopener"><img loading="lazy" alt="${esc(card)} ${esc(f)}" src="${shotUrl(card, f)}"><span>${esc(f)}</span></a>`).join("");
+
+function renderScreens(s) {
+  const cards = Object.keys(s.screens || {}).reverse();
+  const front = Object.values(s.cards).some((c) => c.kind === "frontend" || c.kind === "fullstack");
+  $("#screens-panel").hidden = !cards.length && !front;
+  $("#screens").innerHTML = cards.length
+    ? cards.map((id) => `<div class="shots-card"><h3><span class="mono">${esc(id)}</span> ${rich(s.cards[id]?.title || "")}</h3><div class="gallery">${shots(id, s.screens[id])}</div></div>`).join("")
+    : `<div class="empty">No screenshots yet. Interface cards save theirs in <code>state/screens/&lt;card&gt;/</code>.</div>`;
 }
 
 function renderBoard(s) {
@@ -328,7 +421,7 @@ function renderBoard(s) {
       const cat = category(s, id);
       const sub = k === "done" ? (s.status[id] === "waived" ? "waived" : (s.rows[id]?.date || "")) : why(s, id);
       return `<button type="button" class="tile" style="--c:var(${COLORS[cat]})" data-card="${esc(id)}">
-        <span class="id">${esc(id)}${c.parallel ? " [P]" : ""}</span><span class="t">${rich(c.title)}</span>${sub ? `<span class="why">${esc(sub)}</span>` : ""}</button>`;
+        <span class="id">${esc(id)}${c.parallel ? " [P]" : ""}${s.autopilot.live.includes(id) ? '<span class="livedot" title="session running"></span>' : ""}</span><span class="t">${rich(c.title)}</span>${sub ? `<span class="why">${esc(sub)}</span>` : ""}</button>`;
     }).join("");
     const more = shown.length < ids.length ? `<button type="button" class="more" data-more>Show all ${ids.length}</button>` : "";
     return `<div class="col"><div class="col-head"><span class="sw" style="background:var(${COLORS[k]})"></span>${LABELS[k]}<span class="n">${ids.length}</span></div>${more}${tiles || '<div class="empty">—</div>'}</div>`;
@@ -436,6 +529,10 @@ async function openDrawer(id, fetchHandoff = true) {
   const needed = neededBy(s, id);
   const reasons = s.waiting[id] || [];
   const old = $("#drawer").querySelector("pre.handoff");
+  const oldLog = $("#drawer").querySelector("pre.log");
+  const run = s.autopilot.runs[id];
+  const manual = (s.autopilot.manual || []).includes(id);
+  const finishedCard = ["done", "waived"].includes(s.status[id]);
   $("#drawer").innerHTML = `
     <button type="button" class="close" id="close-drawer" aria-label="Close">✕</button>
     <span class="badge" style="--c:var(${COLORS[cat]})">${LABELS[cat]}</span>
@@ -443,14 +540,28 @@ async function openDrawer(id, fetchHandoff = true) {
     <div class="tags">${c.stage ? `<span class="tag">${esc(c.stage)}</span>` : ""}${c.parallel ? '<span class="tag p">[P] parallel</span>' : ""}${c.size ? `<span class="tag">size ${esc(c.size)}</span>` : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}</div>
     <dl class="dl">
       ${c.start_with ? `<dt>Start with</dt><dd><div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}">Copy</button></div></dd>` : ""}
-      ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : `${r.kind === "owner" ? "You" : "Blocker"}: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
+      ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : r.kind === "gate" ? `Your review of stage ${link(r.on)}` : `${r.kind === "owner" ? "You" : "Blocker"}: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
       <dt>After</dt><dd>${c.after.length ? c.after.map(link).join("<br>") : `<span class="hint">${esc(c.after_text || "nothing")}</span>`}</dd>
       <dt>Needed by</dt><dd>${needed.length ? needed.map(link).join("<br>") : '<span class="hint">no card waits for it</span>'}</dd>
       ${row.branch || row.commit || row.date ? `<dt>RESUME</dt><dd class="mono">${[row.status, row.branch, row.commit, row.date].filter((x) => x && x !== "-").map(esc).join(" · ")}</dd>` : ""}
+      ${run ? `<dt>Sessions</dt><dd>${run.sessions} · $${run.cost.toFixed(2)} · ${run.live ? "running now" : `last ended ${esc(run.ended)}`}${run.error ? `<div class="note">${rich(run.error)}</div>` : ""}
+        <div class="form">${run.live ? `<button type="button" data-act="stop" data-card="${esc(id)}">Stop</button>`
+          : manual ? `<button type="button" data-copy="claude --resume ${esc(run.session)}">Copy resume command</button>${DISPATCH && !finishedCard ? `<button type="button" data-act="retry" data-card="${esc(id)}">Hand back to autopilot</button>` : ""}`
+          : `${DISPATCH && !finishedCard ? `<button type="button" data-act="retry" data-card="${esc(id)}">Run again</button>` : ""}${finishedCard ? "" : `<button type="button" data-act="takeover" data-card="${esc(id)}">I'll take it</button>`}`}</div>
+        ${manual ? `<div class="note">You took this card over; the autopilot leaves it alone. Continue its session with <code>claude --resume ${esc(run.session)}</code> in a terminal, or hand it back.</div>` : ""}
+        <pre class="log">${oldLog ? oldLog.innerHTML : "Loading…"}</pre></dd>` : ""}
+      ${s.screens?.[id] ? `<dt>Screens</dt><dd><div class="gallery">${shots(id, s.screens[id])}</div></dd>` : ""}
       ${s.handoffs.includes(id) ? `<dt>Hand-off note</dt><dd><pre class="handoff">${old ? old.innerHTML : "Loading…"}</pre></dd>` : ""}
     </dl>`;
   $("#drawer").hidden = false;
   $("#scrim").hidden = false;
+  if (run && (fetchHandoff || !oldLog || run.live)) {
+    fetch(`/api/log?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}`, { cache: "no-store" })
+      .then((r) => r.text()).then((text) => {
+        const pre = $("#drawer").querySelector("pre.log");
+        if (pre && selected === id) { pre.textContent = text; pre.scrollTop = pre.scrollHeight; }
+      }).catch(() => {});
+  }
   if (s.handoffs.includes(id) && (fetchHandoff || !old)) {
     try {
       const r = await fetch(`/api/handoff?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}`, { cache: "no-store" });
@@ -490,6 +601,10 @@ function diff(a, b) {
   bb.filter((x) => !ab.includes(x)).forEach((x) => out.push(`New blocker — ${x}`));
   if (a.lock !== b.lock) out.push(`Deploy lock: ${a.lock || "unset"} → ${b.lock || "unset"}`);
   b.stalled.filter((x) => !a.stalled.some((y) => y.card === x.card)).forEach((x) => out.push(`${x.card} looks stalled`));
+  b.approvals.filter((x) => !a.approvals.some((y) => y.n === x.n)).forEach((x) => out.push(`${x.card} asks for approval ${x.n}`));
+  b.gates.filter((g) => !a.gates.includes(g)).forEach((g) => out.push(`Stage ${g} finished; waiting for your review`));
+  b.autopilot.live.filter((c) => !a.autopilot.live.includes(c)).forEach((c) => out.push(`Session started for ${c}`));
+  Object.keys(b.autopilot.attention).filter((c) => !(c in a.autopilot.attention)).forEach((c) => out.push(`${c} needs you`));
   const t = stamp();
   out.reverse().forEach((text) => feed.unshift({ t, text }));
   feed.length = Math.min(feed.length, 80);
@@ -542,6 +657,35 @@ async function loadFeatures() {
   } catch { /* the state poll reports the outage */ }
 }
 
+/* ---------- actions ---------- */
+
+let toastTimer = 0;
+function toast(text, bad) {
+  const el = $("#toast");
+  el.textContent = text;
+  el.className = "toast" + (bad ? " bad" : "");
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.hidden = true), bad ? 6000 : 2500);
+}
+
+async function act(action, data, button) {
+  if (button) button.disabled = true;
+  try {
+    const r = await fetch("/api/act", {
+      method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Supervisor-Token": TOKEN },
+      body: JSON.stringify({ f: feature, action, ...data }),
+    });
+    toast(await r.text(), !r.ok);
+  } catch {
+    toast("Could not reach supervisor.py", true);
+  }
+  if (button) button.disabled = false;
+  stateText = "";
+  tick();
+}
+
 /* ---------- events ---------- */
 
 document.addEventListener("click", (e) => {
@@ -553,11 +697,31 @@ document.addEventListener("click", (e) => {
     });
     return;
   }
+  const action = e.target.closest("[data-act]");
+  if (action) {
+    const d = action.dataset, data = {};
+    if (d.card) data.card = d.card;
+    if (d.n) data.n = d.n;
+    if (d.verdict) data.verdict = d.verdict;
+    if (d.gate) data.gate = d.gate;
+    if (d.auto) data.auto = d.auto === "1";
+    if (d.act === "approval") data.note = document.getElementById(`note-${d.card}-${d.n}`)?.value || "";
+    if (d.act === "decision") data.answer = document.getElementById(`ans-${d.n}`)?.value || "";
+    if (d.act === "decision" && !data.answer.trim()) return toast("Write an answer first", true);
+    if (d.act === "approval" && d.verdict === "approved" && !confirm(`Approve ${d.n} for ${d.card}? The session will run the step.`)) return;
+    if (d.act === "gate" && !confirm(`Approve stage ${d.gate}? The next stage starts.`)) return;
+    act(d.act, data, action);
+    return;
+  }
   if (e.target.closest("[data-more]")) { showAllDone = true; renderBoard(state); return; }
   if (e.target.closest("#clear-sel")) { selected = null; closeDrawer(); renderGraph(state); return; }
   if (e.target.closest("#close-drawer") || e.target === $("#scrim")) { closeDrawer(); return; }
   const card = e.target.closest("[data-card]");
   if (card && state) select(card.dataset.card);
+});
+document.addEventListener("change", (e) => {
+  if (e.target.id === "set-par") act("settings", { max_parallel: Number(e.target.value) });
+  if (e.target.id === "set-gate") act("settings", { gate_checkpoints: e.target.checked });
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
 $("#picker").addEventListener("change", (e) => {
