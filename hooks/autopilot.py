@@ -272,7 +272,7 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
     os.makedirs(logs, exist_ok=True)
     log = os.path.join(logs, f"{cid}-{attempt}.jsonl")
     run = {"card": cid, "session": session, "attempt": attempt, "reason": reason, "approval": approval,
-           "pid": None, "started": stamp(), "ended": "", "exit": None, "cost": 0, "result": "", "error": "",
+           "pid": None, "started": stamp(), "started_ts": time.time(), "ended": "", "exit": None, "cost": 0, "result": "", "error": "",
            "worked": False, "log": os.path.relpath(log, state_dir(tasks))}
     env = {**os.environ, "SPEC_GRILL_AUTOPILOT": "1", "SPEC_GRILL_CARD": cid}
     deny = s["autopilot"]["deny"] if deny is None else deny
@@ -762,3 +762,142 @@ def log_tail(tasks: str, cid: str, lines: int = 60) -> str:
             out.append(f"Result ({event.get('subtype')}, ${float(event.get('total_cost_usd') or 0):.2f}): "
                        + str(event.get("result") or "")[:600])
     return "\n".join(out[:1] + out[1:][-lines:])
+
+
+# --- following a running session (the dashboard's live view) -----------------------------
+
+LIVE: dict = {}  # log path -> what has been read of it so far
+LIVE_LOCK = threading.Lock()
+
+
+def describe(name: str, arg: dict) -> str:
+    """One line for a tool call: what it does to what."""
+    arg = arg if isinstance(arg, dict) else {}
+    hint = (arg.get("description") or arg.get("command") or arg.get("file_path") or arg.get("path")
+            or arg.get("pattern") or arg.get("url") or arg.get("query") or arg.get("prompt") or arg.get("subject") or "")
+    hint = " ".join(str(hint).split())[:200]
+    return f"{name}: {hint}" if hint else str(name)
+
+
+def result_text(content) -> str:
+    if isinstance(content, list):
+        content = "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+    return str(content or "")
+
+
+def absorb(view: dict, event: dict) -> None:
+    """Fold one stream-json event into a session's live view."""
+    kind = event.get("type")
+    add = lambda item: view["events"].append({**item, "seq": len(view["events"]) + view["dropped"] + 1})  # noqa: E731
+    if kind == "assistant":
+        message = event.get("message", {})
+        usage = message.get("usage") or {}
+        if usage:
+            view["output_tokens"] += int(usage.get("output_tokens") or 0)
+            view["context"] = int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0) \
+                + int(usage.get("cache_creation_input_tokens") or 0)
+        for block in message.get("content", []) or []:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                text = block["text"].strip()
+                view["said"] = text[-300:]
+                add({"kind": "text", "text": text[:4000]})
+            elif block.get("type") == "tool_use":
+                name, arg = block.get("name", "?"), block.get("input") or {}
+                view["tools"] += 1
+                view["pending"][block.get("id", "")] = describe(name, arg)
+                if name == "TodoWrite" and isinstance(arg.get("todos"), list):
+                    view["todos"] = [{"text": str(t.get("content", "")), "doing": str(t.get("activeForm", "")),
+                                      "status": str(t.get("status", "pending"))} for t in arg["todos"]][:50]
+                elif name == "TaskCreate":
+                    view["todos"].append({"text": str(arg.get("subject", "")), "doing": str(arg.get("activeForm", "")),
+                                          "status": "pending", "id": ""})
+                    view["task_ids"].append(block.get("id", ""))
+                elif name == "TaskUpdate":
+                    for todo in view["todos"]:
+                        if todo.get("id") and todo["id"] == str(arg.get("taskId", "")) and arg.get("status"):
+                            todo["status"] = str(arg["status"])
+                add({"kind": "tool", "id": block.get("id", ""), "name": name, "text": describe(name, arg),
+                     "input": json.dumps(arg, ensure_ascii=False)[:3000]})
+    elif kind == "user":
+        for block in (event.get("message", {}) or {}).get("content", []) or []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tool_id = block.get("tool_use_id", "")
+                view["pending"].pop(tool_id, None)
+                text = result_text(block.get("content"))
+                if tool_id in view["task_ids"] and (found := re.search(r"#(\d+)", text)):
+                    view["todos"][view["task_ids"].index(tool_id)]["id"] = found.group(1)
+                add({"kind": "result", "id": tool_id, "error": bool(block.get("is_error")), "text": text[:3000]})
+    elif kind == "result":
+        view["final"] = {"error": bool(event.get("is_error")), "cost": float(event.get("total_cost_usd") or 0),
+                         "text": str(event.get("result") or "")[:2000]}
+        add({"kind": "final", "error": bool(event.get("is_error")), "text": str(event.get("result") or "")[:2000]})
+    overflow = len(view["events"]) - 400
+    if overflow > 0:  # keep the tail; sequence numbers stay continuous
+        del view["events"][:overflow]
+        view["dropped"] += overflow
+
+
+def live_view(tasks: str, cid: str, after: int = 0, events: bool = True) -> dict:
+    """The latest session of a card, read incrementally from its log: where it is now (current step,
+    to-do progress, tools, tokens, last output) and the transcript events after sequence number after."""
+    run = latest(registry(tasks), cid)
+    if not run:
+        return {"card": cid, "run": None}
+    path = os.path.join(state_dir(tasks), run["log"])
+    with LIVE_LOCK:
+        view = LIVE.get(path)
+        if view is None or view["session"] != run["session"] or view["inode"] != _inode(path):
+            view = LIVE[path] = {"session": run["session"], "inode": _inode(path), "offset": 0, "rest": b"",
+                                 "events": [], "dropped": 0, "tools": 0, "output_tokens": 0, "context": 0,
+                                 "pending": {}, "todos": [], "task_ids": [], "said": "", "final": None}
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(view["offset"])
+                chunk = handle.read(4_000_000)
+                view["offset"] = handle.tell()
+        except OSError:
+            chunk = b""
+        lines = (view["rest"] + chunk).split(b"\n")
+        view["rest"] = lines.pop()  # a line still being written
+        for line in lines:
+            try:
+                absorb(view, json.loads(line))
+            except ValueError:
+                continue
+        try:
+            last = os.path.getmtime(path)
+        except OSError:
+            last = None
+        todos = view["todos"]
+        started = run.get("started_ts") or dt.datetime.strptime(run["started"], "%Y-%m-%d %H:%MZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+        out = {
+            "card": cid,
+            "run": {"session": run["session"], "reason": run["reason"], "started_ts": started,
+                    "ended": run["ended"], "live": sv.run_alive(run)},
+            "last_output_ts": last,
+            "now_ts": time.time(),
+            "tools": view["tools"],
+            "output_tokens": view["output_tokens"],
+            "context": view["context"],
+            "current": next(reversed(view["pending"].values()), "") if view["pending"] else "",
+            "said": view["said"],
+            "todos": todos,
+            "todo_done": sum(1 for t in todos if t["status"] in ("completed", "done")),
+            "final": view["final"],
+            "seq": view["dropped"] + len(view["events"]),
+        }
+        if events:
+            out["events"] = [e for e in view["events"] if e["seq"] > after]
+            out["dropped"] = view["dropped"]
+        else:
+            out["recent"] = [{k: e.get(k) for k in ("kind", "name", "text")}
+                             for e in view["events"] if e["kind"] in ("text", "tool")][-8:]
+        return out
+
+
+def _inode(path: str):
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None

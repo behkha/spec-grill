@@ -914,6 +914,17 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
                 text = read(os.path.join(os.path.dirname(path), "state", "handoff", f"{card}.md")) \
                     if re.fullmatch(ID, card) else ""
                 self.send(200 if text else 404, text or "no hand-off", "text/plain; charset=utf-8")
+            elif url.path == "/api/live" and (path := tasks_of(name)):
+                import autopilot
+                card = query.get("card", [""])[0]
+                if not re.fullmatch(ID, card):
+                    return self.send(404, "no such card", "text/plain")
+                try:
+                    after = int(query.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
+                view = autopilot.live_view(path, card, after, events=query.get("events", ["1"])[0] != "0")
+                self.send(200, json.dumps(view, ensure_ascii=False), "application/json; charset=utf-8")
             elif url.path == "/api/log" and (path := tasks_of(name)):
                 import autopilot
                 card = query.get("card", [""])[0]

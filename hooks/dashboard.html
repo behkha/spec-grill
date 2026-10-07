@@ -36,6 +36,7 @@
 }
 @media (pointer: coarse), (max-width: 700px) { :root { --tap: 44px; } }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg); color: var(--text);
@@ -176,8 +177,8 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 @media (max-width: 900px) { .cols { grid-template-columns: minmax(0, 1fr); } }
 .row { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 6px 0; border-top: 1px solid var(--border); flex-wrap: wrap; }
 .row:first-of-type { border-top: 0; }
-.row .what { font-weight: 550; cursor: pointer; background: none; border: 0; padding: 0; min-height: 0; text-align: left; white-space: normal; color: var(--text); display: inline; font-size: 13px; }
-.row .what:hover { text-decoration: underline; text-underline-offset: 2px; }
+.row .what, .live-card .what { font-weight: 550; cursor: pointer; background: none; border: 0; padding: 0; min-height: 0; text-align: left; white-space: normal; color: var(--text); display: inline; font-size: 13px; }
+.row .what:hover, .live-card .what:hover { text-decoration: underline; text-underline-offset: 2px; }
 .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .tag { font-size: 12px; color: var(--muted); background: var(--surface-2); border-radius: 5px; padding: 1px 7px; white-space: nowrap; }
 .tag.p { color: var(--ready-ink); background: color-mix(in srgb, var(--ready) 12%, transparent); }
@@ -185,6 +186,43 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--doing); display: inline-block; margin-right: 8px; animation: beat 2s ease-out infinite; }
 @keyframes beat { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--doing) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
 @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } .toast { transition: none; } }
+
+/* live sessions */
+.cols.solo { grid-template-columns: minmax(0, 1fr); }
+.cols.solo #running { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 0 10px; }
+@media (max-width: 700px) { .cols.solo #running { grid-template-columns: minmax(0, 1fr); } }
+.live-card { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 10px 12px; margin-bottom: 8px; }
+.live-card .top-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.stats { display: flex; gap: 2px 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.stats b { color: var(--text); font-weight: 600; }
+.stats .late b { color: var(--your-ink); }
+.todo { margin-top: 8px; }
+.todo-bar { height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.todo-bar span { display: block; height: 100%; width: 100%; background: var(--doing); transform-origin: left; transition: transform .25s ease-out; }
+.todo-line { font-size: 12.5px; margin-top: 4px; display: flex; gap: 8px; }
+.todo-line b { font-weight: 600; }
+.now-doing { margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--doing-ink); display: flex; gap: 8px; align-items: baseline; overflow-wrap: anywhere; }
+.recent { margin: 6px 0 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+.recent li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.todos-full { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12.5px; }
+.todos-full li { display: flex; gap: 8px; padding: 2px 0; color: var(--muted); }
+.todos-full li.in_progress { color: var(--text); font-weight: 550; }
+.todos-full li.completed { color: var(--faint); text-decoration: line-through; }
+.todos-full i { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--faint); margin-top: 6px; flex: none; }
+.todos-full li.in_progress i { border-color: var(--doing); background: var(--doing); }
+.todos-full li.completed i { border-color: var(--done); background: var(--done); }
+.tx { border: 1px solid var(--border); border-radius: 8px; max-height: 52vh; overflow: auto; padding: 6px 10px; font-size: 12.5px; background: var(--bg); }
+.tx-e { padding: 4px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.tx-e:first-child { border-top: 0; }
+.tx-e.text { white-space: pre-wrap; }
+.tx-e details summary { cursor: pointer; font-family: var(--mono); font-size: 12px; color: var(--doing-ink); list-style: none; }
+.tx-e details summary::-webkit-details-marker { display: none; }
+.tx-e details.err summary { color: var(--block-ink); }
+.tx-e details.wait summary::after { content: " · running"; color: var(--faint); }
+.tx-e pre { margin: 4px 0; padding: 6px 8px; background: var(--surface-2); border-radius: 6px; font-size: 11.5px; white-space: pre-wrap; max-height: 220px; overflow: auto; }
+.tx-e.final { font-weight: 600; color: var(--done-ink); }
+.tx-e.final.err { color: var(--block-ink); }
+.tx-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--faint); }
 
 /* board */
 .board { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
@@ -375,6 +413,7 @@ function show(next, focus) {
   history.replaceState(null, "", `?f=${encodeURIComponent(feature)}#${view}`);
   try { localStorage.setItem("supervisor-view", view); } catch {}
   window.scrollTo({ top: 0 });
+  if (view === "now") setTimeout(pollLive, 0);
   if (focus) document.querySelector(`[data-tab="${view}"]`)?.focus();
 }
 
@@ -616,13 +655,12 @@ function renderSessions(s) {
   const a = s.autopilot;
   const running = Object.keys(s.cards).filter((id) => cardState(s, id) === "running");
   $("#run-n").textContent = running.length || "";
+  $("#running").closest(".cols").classList.toggle("solo", running.length > 1 && !s.ready.length);
   $("#running").innerHTML = running.length ? running.map((id) => {
-    const c = s.cards[id], run = a.runs[id], live = a.live.includes(id);
-    if (live) wantLog(s, id);
-    const last = live && logs[id]?.text ? logs[id].text.split("\n").filter((x) => x.trim()).slice(-1)[0] : "";
-    return `<div class="row"><span>${live ? '<span class="pulse" aria-hidden="true"></span>' : ""}<button type="button" class="what" data-open="${esc(id)}"><span class="mono">${esc(id)}</span> ${rich(c.title)}</button></span>
-      <span class="meta">${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}${live && run ? `<span class="tag">since ${esc(run.started.slice(11))}</span>` : `<span class="tag">by hand</span>`}</span>
-      ${last ? `<span class="lastline">${esc(last)}</span>` : ""}</div>`;
+    const c = s.cards[id], live = a.live.includes(id);
+    return `<div class="live-card" data-live="${esc(id)}"><div class="top-line"><span>${live ? '<span class="pulse" aria-hidden="true"></span>' : ""}<button type="button" class="what" data-open="${esc(id)}"><span class="mono">${esc(id)}</span> ${rich(c.title)}</button></span>
+      <span class="meta">${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}${c.model ? `<span class="tag">${esc(c.model)}</span>` : ""}${live ? "" : `<span class="tag">by hand</span>`}</span></div>
+      <div data-live-body="${esc(id)}">${live ? liveBody(id) : '<div class="note">Started by hand: its progress is in its own session.</div>'}</div></div>`;
   }).join("") : `<div class="empty">No session is running.</div>`;
 
   const auto = a.dispatcher && a.settings.auto;
@@ -641,6 +679,116 @@ function renderSessions(s) {
       <span class="meta">${c.parallel ? '<span class="tag p">[P]</span>' : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}${c.kind ? `<span class="tag">${esc(c.kind)}</span>` : ""}${act}</span>
       ${opens.length ? `<span class="note" style="flex-basis:100%;margin:0">Unblocks ${opens.map(esc).join(", ")}</span>` : ""}</div>`;
   }).join("");
+}
+
+/* ---------- live sessions: polled every 2 s, updated in place ---------- */
+
+const live = {}, tx = { card: null, seq: 0, el: null, follow: true, tools: {} };
+let skew = 0;
+const ago = (sec) => sec < 60 ? `${Math.round(sec)}s` : sec < 3600 ? `${Math.floor(sec / 60)}m ${String(Math.round(sec % 60)).padStart(2, "0")}s` : `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+const short = (text) => String(text || "").replace(/(?:\/[^\s/]+){3,}\/([^\s/]+\/[^\s/]+)/g, "…/$1");
+const kTokens = (n) => n >= 1000 ? `${Math.round(n / 1000)}k` : String(n || 0);
+
+function liveBody(id) {
+  const v = live[id];
+  if (!v || !v.run) return '<div class="note">Connecting to the session…</div>';
+  const now = Date.now() / 1000 + skew, quiet = v.last_output_ts ? now - v.last_output_ts : 0;
+  const todos = v.todos || [], doing = todos.find((t) => t.status === "in_progress");
+  const pct = todos.length ? Math.round((v.todo_done / todos.length) * 100) : 0;
+  const recent = (v.recent || []).filter((e) => !(e.kind === "tool" && (e.name === "TodoWrite" || e.text === v.current))).slice(-3);
+  return `<div class="stats"><span><b data-tick-elapsed="${esc(id)}">${ago(now - v.run.started_ts)}</b> running</span>
+      <span class="${quiet > 300 ? "late" : ""}">last output <b data-tick-quiet="${esc(id)}">${ago(quiet)}</b> ago</span>
+      <span><b>${v.tools}</b> tool calls</span><span>context <b>${kTokens(v.context)}</b></span></div>
+    ${todos.length ? `<div class="todo"><div class="todo-bar" role="progressbar" aria-label="${esc(id)} to-do progress" aria-valuemin="0" aria-valuemax="${todos.length}" aria-valuenow="${v.todo_done}"><span style="transform:scaleX(${pct / 100})"></span></div>
+      <div class="todo-line"><b>${v.todo_done}/${todos.length}</b><span>${esc(doing ? (doing.doing || doing.text) : v.todo_done === todos.length ? "All steps done" : "")}</span></div></div>` : ""}
+    ${v.current ? `<div class="now-doing"><span class="pulse" aria-hidden="true"></span><span>${esc(short(v.current))}</span></div>` : v.said ? `<div class="note">${esc(v.said.slice(-200))}</div>` : ""}
+    ${recent.length ? `<ul class="recent">${recent.map((e) => `<li>${esc(e.kind === "tool" ? short(e.text) : "» " + e.text.replace(/\s+/g, " "))}</li>`).join("")}</ul>` : ""}`;
+}
+
+async function pollLive() {
+  if (!state) return;
+  const ids = state.autopilot.live.filter(() => view === "now");
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const r = await fetch(`/api/live?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}&events=0`, { cache: "no-store" });
+      if (!r.ok) return;
+      const v = await r.json();
+      skew = v.now_ts - Date.now() / 1000;
+      live[id] = v;
+      const body = document.querySelector(`[data-live-body="${CSS.escape(id)}"]`);
+      if (body) body.innerHTML = liveBody(id);
+    } catch { /* the state poll reports the outage */ }
+  }));
+  if (tx.card && !$("#drawer").hidden && (state.autopilot.runs[tx.card]?.live || tx.seq === 0)) await pullTranscript();
+}
+
+function tickClocks() {
+  const now = Date.now() / 1000 + skew;
+  document.querySelectorAll("[data-tick-elapsed]").forEach((el) => { const v = live[el.dataset.tickElapsed]; if (v?.run) el.textContent = ago(now - v.run.started_ts); });
+  document.querySelectorAll("[data-tick-quiet]").forEach((el) => { const v = live[el.dataset.tickQuiet]; if (v?.last_output_ts) el.textContent = ago(now - v.last_output_ts); });
+}
+
+function mountTranscript(id) {
+  if (tx.card !== id || !tx.el) {
+    tx.card = id; tx.seq = 0; tx.follow = true; tx.tools = {};
+    tx.el = document.createElement("div");
+    tx.el.innerHTML = `<div class="todos-holder"></div><div class="tx" tabindex="0" aria-label="Session transcript" aria-live="off"><div class="empty">Loading…</div></div>
+      <div class="tx-foot"><span class="tx-status"></span><button type="button" class="quiet" data-tx-latest hidden>Jump to latest</button></div>`;
+    const box = tx.el.querySelector(".tx");
+    box.addEventListener("scroll", () => {
+      tx.follow = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+      tx.el.querySelector("[data-tx-latest]").hidden = tx.follow;
+    });
+    pullTranscript();
+  }
+  const slot = $("#tx-slot");
+  if (slot) slot.replaceWith(tx.el);
+}
+
+function txEvent(e) {
+  if (e.kind === "tool" && ["TodoWrite", "TaskCreate", "TaskUpdate"].includes(e.name)) { tx.tools[e.id] = null; return null; }
+  if (e.kind === "result" && tx.tools[e.id] === null) return null;
+  if (e.kind === "result") {
+    const d = tx.tools[e.id];
+    if (d) {
+      d.classList.remove("wait");
+      if (e.error) d.classList.add("err");
+      d.insertAdjacentHTML("beforeend", `<pre>${esc(e.text || "(no output)")}</pre>`);
+      return null;
+    }
+  }
+  const el = document.createElement("div");
+  el.className = `tx-e ${e.kind}${e.error ? " err" : ""}`;
+  if (e.kind === "tool") {
+    el.innerHTML = `<details class="wait"><summary>${esc(short(e.text))}</summary><pre>${esc(e.input)}</pre></details>`;
+    tx.tools[e.id] = el.querySelector("details");
+  } else if (e.kind === "result") {
+    el.innerHTML = `<details${e.error ? ' class="err"' : ""}><summary>result</summary><pre>${esc(e.text)}</pre></details>`;
+  } else if (e.kind === "final") {
+    el.textContent = (e.error ? "Session ended with an error: " : "Session finished: ") + e.text;
+  } else {
+    el.textContent = e.text;
+  }
+  return el;
+}
+
+async function pullTranscript() {
+  const id = tx.card;
+  if (!id || !tx.el) return;
+  try {
+    const r = await fetch(`/api/live?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}&after=${tx.seq}`, { cache: "no-store" });
+    if (!r.ok || tx.card !== id) return;
+    const v = await r.json();
+    const box = tx.el.querySelector(".tx");
+    if (tx.seq === 0) box.innerHTML = v.dropped ? `<div class="tx-e note">${v.dropped} earlier events not shown.</div>` : "";
+    v.events.forEach((e) => { const el = txEvent(e); if (el) box.appendChild(el); });
+    if (!box.children.length) box.innerHTML = '<div class="empty">Nothing yet.</div>';
+    if (v.events.length) tx.seq = v.events[v.events.length - 1].seq;
+    if (tx.follow) box.scrollTop = box.scrollHeight;
+    const todos = v.todos || [];
+    tx.el.querySelector(".todos-holder").innerHTML = todos.length ? `<ul class="todos-full" aria-label="The session's to-do list">${todos.map((t) => `<li class="${esc(t.status)}"><i></i><span>${esc(t.status === "in_progress" && t.doing ? t.doing : t.text)}</span></li>`).join("")}</ul>` : "";
+    tx.el.querySelector(".tx-status").textContent = v.run?.live ? `${v.tools} tool calls · context ${kTokens(v.context)} · following live` : v.final ? `Ended · $${v.final.cost.toFixed(2)}` : "";
+  } catch { /* retried on the next poll */ }
 }
 
 /* ---------- board, map, screens, drift, feed ---------- */
@@ -792,7 +940,7 @@ async function openDrawer(id, fresh = true) {
       ${done ? handoffBlock : ""}
       ${run ? `<dt>Sessions</dt><dd>${run.sessions} · $${run.cost.toFixed(2)} · ${run.live ? "running now" : `last ended ${esc(run.ended)}`}${run.error ? `<div class="note">${rich(run.error)}</div>` : ""}
         ${manual ? `<div class="note">You took this card over; the autopilot leaves it alone.</div>` : ""}
-        ${sessionActions ? `<div class="actions">${sessionActions}</div>` : ""}${logs[id]?.text ? `<pre class="lines" style="margin-top:8px">${esc(logs[id].text)}</pre>` : ""}</dd>` : ""}
+        ${sessionActions ? `<div class="actions">${sessionActions}</div>` : ""}</dd><dt>${run.live ? "Live transcript" : "Transcript"}</dt><dd><div id="tx-slot"></div></dd>` : ""}
       ${!done && c.start_with ? `<dt>Start with</dt><dd><div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}" data-label="Copy">Copy</button></div></dd>` : ""}
       ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : r.kind === "gate" ? `your review of stage ${link(r.on)}` : r.kind === "owner" ? `your answer: ${rich(r.on)}` : `blocker: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
       <dt>After</dt><dd>${c.after.length ? c.after.map(link).join("<br>") : `<span class="hint">${esc(c.after_text || "nothing")}</span>`}</dd>
@@ -802,6 +950,7 @@ async function openDrawer(id, fresh = true) {
       ${done ? "" : handoffBlock}
     </dl>`;
   drawer.querySelectorAll("button, a[href], input, select").forEach((el, i) => { if (!el.id && !el.dataset.fkey) el.dataset.fkey = `d${i}-${(el.textContent || "").trim().slice(0, 12)}`; });
+  if (run) mountTranscript(id);
   if (focusKey && !drawer.hidden) (document.getElementById(focusKey) || drawer.querySelector(`[data-fkey="${CSS.escape(focusKey)}"]`) || $("#drawer-title")).focus();
   if ($("#drawer").hidden) {
     opener = document.activeElement;
@@ -822,7 +971,7 @@ function select(id) { selected = id; renderGraph(state); openDrawer(id); }
 function closeDrawer() {
   if ($("#drawer").hidden) return;
   $("#drawer").hidden = true; $("#scrim").hidden = true; document.body.classList.remove("locked");
-  selected = null;
+  selected = null; tx.card = null; tx.el = null;
   if (state) renderGraph(state);
   if (opener && document.contains(opener)) opener.focus();
 }
@@ -978,6 +1127,7 @@ document.addEventListener("click", (e) => {
     navigator.clipboard.writeText(copy.dataset.copy).then(() => { copy.textContent = "Copied"; setTimeout(() => (copy.textContent = label), 1400); });
     return;
   }
+  if (e.target.closest("[data-tx-latest]")) { const box = tx.el?.querySelector(".tx"); if (box) { box.scrollTop = box.scrollHeight; tx.follow = true; } return; }
   const tab = e.target.closest("[data-tab]");
   if (tab) return show(tab.dataset.tab);
   const u = e.target.closest("[data-undo]");
@@ -1069,6 +1219,8 @@ setThemeIcon();
 show(view);
 loadFeatures().then(() => { loadFeed(); renderFeed(); tick(); });
 setInterval(tick, 3000);
+setInterval(pollLive, 2000);
+setInterval(tickClocks, 1000);
 setInterval(loadFeatures, 30000);
 </script>
 </body>

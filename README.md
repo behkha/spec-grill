@@ -227,6 +227,7 @@ It opens `http://127.0.0.1:8765` (local only, no dependencies) and refreshes eve
 - **Run next** — every ready card with its effort tier and a copy button for its **Start with** line (or a Start button, with the autopilot), plus which ones may run side by side.
 - **Needs you** — approvals to give, stages to review, stuck cards, your own cards, open decisions (answer them right there), blockers, stalled cards, a held deploy lock, and a warning when the interface falls behind the back end.
 - **Screens** — the screenshots every interface card saved, card by card.
+- **Live sessions** — with the autopilot, each running session shows its elapsed time, time since its last output, its to-do progress, the step it is on and its latest lines, refreshed every 2 seconds; its drawer follows the whole transcript as it grows.
 - **Board** — running, ready, waiting, blocked and done columns.
 - **Who waits for whom** — the dependency map; click a card to trace what it waits for and what waits for it, and open its details (RESUME row, hand-off note, the log of its session).
 - **Activity** and **Drift** — what changed since you opened the page, and where the files disagree.

@@ -3,7 +3,7 @@
 
 FAKE_SCRIPT (a JSON file) maps a card to the behaviour of each of its sessions, in order:
 "done" finishes the card the way §1 item 9 says (RESUME row done, ticked, hand-off written),
-"doing" marks it doing and stops, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
+"doing" marks it doing and stops, "work" acts out a realistic session (to-dos, tools, pauses) and finishes, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
 records a blocker, "apierror" fails the way an expired login does, "budget" hits the dollar
 cap, "sleep" stays alive until killed. Every call is appended to FAKE_CALLS as one JSON line.
 """
@@ -49,6 +49,27 @@ if behaviour == "apierror":
     emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
           "result": "Failed to authenticate: OAuth session expired", "total_cost_usd": 0})
     sys.exit(1)
+
+if behaviour == "work":  # a realistic session: a to-do list, tool calls with results, usage, pauses
+    pause = float(os.environ.get("FAKE_STEP", "1.5"))
+    steps = [("Read the card and RESUME", "Reading the card and RESUME", "Read", {"file_path": tasks}),
+             ("Write the failing test", "Writing the failing test", "Edit", {"file_path": "tests/test_login.py"}),
+             ("Make the test pass", "Making the test pass", "Bash", {"command": "pytest tests/test_login.py -q", "description": "Run the login tests"}),
+             ("Save screenshots", "Saving screenshots", "Bash", {"command": "pnpm shots login", "description": "Screenshot the login screen"})]
+    tokens = 0
+    for i, (todo, doing, tool, arg) in enumerate(steps):
+        todos = [{"content": t, "activeForm": a, "status": "completed" if j < i else "in_progress" if j == i else "pending"}
+                 for j, (t, a, _, _) in enumerate(steps)]
+        tokens += 1800
+        emit({"type": "assistant", "message": {"usage": {"input_tokens": 1200 + tokens, "cache_read_input_tokens": 18000 + 4 * tokens, "output_tokens": 420},
+              "content": [{"type": "text", "text": f"Next: {doing.lower()}."},
+                          {"type": "tool_use", "id": f"todo{i}", "name": "TodoWrite", "input": {"todos": todos}}]}})
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"todo{i}", "content": "Todos updated"}]}})
+        emit({"type": "assistant", "message": {"usage": {"input_tokens": 1300 + tokens, "cache_read_input_tokens": 18500 + 4 * tokens, "output_tokens": 260},
+              "content": [{"type": "tool_use", "id": f"t{i}", "name": tool, "input": arg}]}})
+        time.sleep(pause)
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": f"ok: {tool} finished ({i + 1}/{len(steps)})"}]}})
+    behaviour = "done"
 
 emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})
 if behaviour == "sleep":

@@ -421,6 +421,29 @@ class Feature(unittest.TestCase):
         self.assertEqual((card["effort"], card["kind"], card["after"]), ("high", "frontend", ["T001"]))
         self.assertTrue(card["start_with"].startswith("Demo · T002B"))
 
+    def test_live_view_follows_a_running_session(self):
+        os.environ["FAKE_STEP"] = "0.6"
+        self.script_for({"T001": ["work"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        time.sleep(1.0)
+        first = autopilot.live_view(self.tasks, "T001")
+        self.assertTrue(first["run"]["live"])
+        self.assertEqual(len(first["todos"]), 4)
+        self.assertGreater(first["tools"], 0)
+        self.assertTrue(first["current"], "a tool call is in flight")
+        seen = first["seq"]
+        self.settle()
+        rest = autopilot.live_view(self.tasks, "T001", after=seen)
+        self.assertTrue(all(e["seq"] > seen for e in rest["events"]), "only events after the given sequence")
+        self.assertEqual(rest["todo_done"], 3)
+        self.assertEqual(rest["final"]["error"], False)
+        self.assertEqual(rest["events"][-1]["kind"], "final")
+        brief = autopilot.live_view(self.tasks, "T001", events=False)
+        self.assertNotIn("events", brief)
+        self.assertLessEqual(len(brief["recent"]), 8)
+        os.environ.pop("FAKE_STEP")
+
     def test_report_without_autopilot_has_no_gates(self):
         os.remove(os.path.join(os.path.dirname(self.tasks), "state", "autopilot.json"))
         s = self.state()
