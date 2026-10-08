@@ -573,7 +573,7 @@ function humanStuck(text) {
 }
 
 function inboxCount(s) {
-  return s.approvals.length + s.gates.length + s.open_decisions.length + Object.keys(s.autopilot.attention).length + s.yours.length;
+  return s.blockers.filter((b) => b.cards.length).length + s.approvals.length + s.gates.length + s.open_decisions.length + Object.keys(s.autopilot.attention).length + s.yours.length;
 }
 
 /* ---------- render ---------- */
@@ -725,6 +725,21 @@ function inboxItems(s) {
       ${logs[c]?.text ? `<div class="evidence"><h3>The session's last lines</h3>${lastLines(c)}</div>` : ""}
       <div class="actions">${DISPATCH ? btn(`data-act="retry" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-retry"`, "Retry", "primary") : ""}${btn(`data-act="takeover" data-card="${esc(c)}" data-fkey="${esc(key)}-take"`, "Take over")}${btn(`data-open="${esc(c)}"`, "Details", "quiet")}</div>` });
   });
+  s.blockers.filter((b) => b.cards.length).forEach((b, i) => {
+    const key = `blocker:${i}:${b.cards.join(",")}`;
+    items.push({ key, card: b.cards[0], kind: "Blocked", c: "--block", body: `
+      <div class="what">${b.cards.map((c) => `<span class="mono">${esc(c)}</span> ${rich(s.cards[c]?.title || "")}`).join(", ")}</div>
+      <div class="note">${rich(b.text)}</div>
+      <div class="note">${a.used ? "Fix the cause, then mark it resolved: the card carries on by itself." : "Fix the cause, then mark it resolved."}</div>
+      <div class="actions">${btn(`data-act="resolve-blocker" data-text="${esc(b.text)}" data-primary data-fkey="${esc(key)}-ok"`, "Resolved", "primary")}${btn(`data-open="${esc(b.cards[0])}"`, "Details", "quiet")}</div>` });
+  });
+  Object.entries(a.blocked_on || {}).filter(([c]) => !s.blockers.some((b) => b.cards.includes(c)) && !(a.queued || []).includes(c) && !a.live.includes(c) && !a.attention[c]).forEach(([c]) => {
+    const key = `unblock:${c}`;
+    items.push({ key, card: c, kind: "Blocked", c: "--block", body: `
+      <div class="what"><span class="mono">${esc(c)}</span> ${rich(s.cards[c]?.title || "")}</div>
+      <div class="note">Its session stopped on a blocker that names no card. When the cause is fixed, let it carry on.</div>
+      <div class="actions">${btn(`data-act="unblock" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-go"`, "Unblock and continue", "primary")}${btn(`data-open="${esc(c)}"`, "Details", "quiet")}</div>` });
+  });
   s.yours.forEach((c) => {
     const key = `yours:${c}`;
     items.push({ key, card: c, kind: "Your card", c: "--your", body: `
@@ -737,7 +752,7 @@ function inboxItems(s) {
 
 function headsUp(s) {
   const a = s.autopilot, out = [];
-  s.blockers.forEach((b) => out.push(`Blocker: ${rich(b.text)}`));
+  s.blockers.filter((b) => !b.cards.length).forEach((b) => out.push(`Blocker: ${rich(b.text)} <button type="button" class="link" data-act="resolve-blocker" data-text="${esc(b.text)}">Resolved</button>`));
   s.stalled.forEach((x) => out.push(`<b>${esc(x.card)}</b> is doing but quiet for ${esc(x.quiet.replace(/ ago$/, ""))}: check its session.`));
   if (s.lopsided) out.push(`Balance: ${rich(s.lopsided.replace(/^./, (c) => c.toUpperCase()))}.`);
   if (a.used && a.unkinded?.length) out.push(`No kind on ${a.unkinded.map(esc).join(", ")}: the autopilot starts only cards whose meta line says <code>kind backend</code>, <code>frontend</code>, <code>fullstack</code> or <code>owner</code>.`);
@@ -1099,7 +1114,7 @@ async function openDrawer(id, fresh = true) {
   const gate = s.gates.includes(id), pairs = gate ? stageShots(s, id) : (s.screens?.[id] ? [[id, s.screens[id]]] : []);
   const sessionActions = run ? (run.live ? `<button type="button" class="danger" data-act="stop" data-card="${esc(id)}">Stop session</button>`
     : manual ? `<button type="button" data-copy="claude --resume ${esc(run.session)}" data-label="Copy resume command">Copy resume command</button>${DISPATCH && !done ? `<button type="button" data-act="retry" data-card="${esc(id)}">Hand back to autopilot</button>` : ""}`
-    : done ? "" : `${DISPATCH ? `<button type="button" data-act="retry" data-card="${esc(id)}">Retry</button>` : ""}<button type="button" data-act="takeover" data-card="${esc(id)}">Take over</button>`) : "";
+    : done ? "" : `${DISPATCH && (cat === "blocked" || (a.blocked_on || {})[id]) ? `<button type="button" data-act="unblock" data-card="${esc(id)}">Unblock and continue</button>` : ""}${DISPATCH ? `<button type="button" data-act="retry" data-card="${esc(id)}">Retry</button>` : ""}<button type="button" data-act="takeover" data-card="${esc(id)}">Take over</button>`) : "";
   const note = cat !== "done" && cat !== "waived" ? why(s, id) : "";
   const drawer = $("#drawer"), focused = drawer.contains(document.activeElement) ? document.activeElement : null;
   const focusKey = focused ? (focused.id || focused.dataset.fkey || "") : "";
@@ -1240,6 +1255,7 @@ function runAction(el) {
     return schedule(d.key, "decision", { n: d.n, answer }, `Answering decision ${d.n}: ${answer}`);
   }
   if (d.act === "owner-done") return schedule(d.key, "owner-done", { card: d.card }, `Marking ${d.card} done`);
+  if (d.act === "resolve-blocker") return act("resolve-blocker", { text: d.text }, el);
   if (d.act === "gate-off") { confirming = null; return act("settings", { gate_checkpoints: false }, el); }
   if (d.act === "chrome-on") { confirming = null; return act("settings", { chrome: true }, el); }
   const data = {};

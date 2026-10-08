@@ -250,6 +250,7 @@ It needs the `claude` CLI logged in and the project folder trusted (run `claude`
 - **starts every ready card** in its own headless session (`claude -p`): the card's **Start with** line, its effort tier and model, the session named after the card, a dollar cap, and up to 3 sessions at once (at most one card without `[P]`, since those share the integration worktree);
 - **asks you through the dashboard**, never in a chat: a step that needs your yes (a deploy, a paid run) becomes an Approve / Reject button, and the session resumes with your answer; open questions get an answer box with the recommended default filled in;
 - **holds each stage for your review**: after a checkpoint, the next stage waits until you have looked at the findings and the screenshots and pressed "Approve stage";
+- **waits out blockers**: a session that records a blocker doesn't count as a failed try; mark the blocker resolved on the dashboard (or clear it in RESUME) and the card carries on by itself;
 - **recovers on its own**: a session that stopped early is resumed once; a card that still isn't done, a silent session or one over its cap lands under "Needs you" with Retry and "I'll take it";
 - **pauses itself** when the login expires or a usage limit hits, and when a total budget you set is spent;
 - **notifies you** on the desktop whenever something needs you;

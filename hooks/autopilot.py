@@ -62,7 +62,7 @@ only channel to the owner.
 - Follow that file's §1 and your card exactly as an attended session would.
 - A step that needs the owner's yes (§1 item 7) is never run on your own. Add a row to RESUME's
   "## Approvals" table (create the section above "## Status" with the header
-  `| # | card | step | why | status | answer |` if it is missing): the next free number A1, A2, …;
+  `| # | card | step | why | status | answer |` if it is missing): a number of your card's own, `<card>.<n>` (T012.1, T012.2, …, so two sessions never collide);
   your card; the exact step or commands; why, and what happens if the owner says no; status
   `pending`; answer empty. Write a `|` inside a cell as `\\|`. Leave your status row `doing`, then end
   your turn with the line `AUTOPILOT: WAITING FOR APPROVAL A<n>`. This session is resumed with the
@@ -91,7 +91,11 @@ CONTINUE = """The autopilot resumed this session: card {card} is not finished (R
 Re-read RESUME (the owner may have answered a decision you were waiting for) and your card, then carry
 on from where the work stopped, following tasks.md §1. If something prevents finishing, record it as a
 blocker and stop."""
-WAITED = re.compile(r"AUTOPILOT: WAITING FOR (?:DECISION|APPROVAL)")
+WAITED = re.compile(r"AUTOPILOT: (?:WAITING FOR (?:DECISION|APPROVAL)|BLOCKED)")
+BLOCKED = re.compile(r"AUTOPILOT: BLOCKED")
+UNBLOCKED = """The autopilot resumed this session: the blocker you recorded for card {card} has been cleared
+({how}). Re-read RESUME, set your status row back to `doing`, and carry on with card {card} from where it
+stopped, following tasks.md §1. If it is still blocked, record that and stop again."""
 
 ANSWER = """The owner answered approval {n} of card {card} ({step}): {verdict}.{note}
 {then}"""
@@ -148,7 +152,7 @@ def registry(tasks: str) -> dict:
     found = sv.read_json(os.path.join(state_dir(tasks), "runs.json"), {})
     found = found if isinstance(found, dict) else {}
     for key, empty in (("runs", []), ("attention", {}), ("handled", []), ("manual", []), ("notified", []),
-                       ("queued", []), ("granted", {})):
+                       ("queued", []), ("granted", {}), ("blocked_on", {})):
         found.setdefault(key, empty)
     return found
 
@@ -413,7 +417,8 @@ def step(tasks: str) -> list:
     with guard(tasks):
         cfg = settings(tasks)
         reg = registry(tasks)
-        for run in reap(tasks, reg):
+        ended = reap(tasks, reg)
+        for run in ended:
             cid = run["card"]
             events.append(f"{cid}: session ended" + (f" with {run['error'][:160]}" if run["error"]
                                                        else f" (${run['cost']:.2f})"))
@@ -437,6 +442,20 @@ def step(tasks: str) -> list:
         save_registry(tasks, reg)
         s = sv.build(tasks, 4)
         reg["queued"] = [c for c in reg["queued"] if c in s["cards"] and s["status"][c] not in sv.FINISHED]
+        naming = blockers_naming(s)
+        for run in ended:  # a session that stopped on a blocker it recorded waits for the blocker to clear
+            cid = run["card"]
+            if cid in s["cards"] and (BLOCKED.search(run.get("result") or "") or s["status"][cid] == "blocked"):
+                reg["blocked_on"][cid] = naming.get(cid, [])
+        for cid, why in list(reg["attention"].items()):  # stuck only because its sessions kept blocking
+            last = latest(reg, cid)
+            if last and "without finishing" in why and BLOCKED.search(last.get("result") or ""):
+                del reg["attention"][cid]
+                reg["blocked_on"][cid] = naming.get(cid, [])
+                if not naming.get(cid) and cid not in reg["queued"]:
+                    reg["queued"].append(cid)  # its blockers are already gone: carry on
+        for cid in [c for c in reg["blocked_on"] if c not in s["cards"] or s["status"][c] in sv.FINISHED]:
+            del reg["blocked_on"][cid]
         if cfg["auto"] and not s["autopilot"]["deny"]:
             cfg = change_settings(tasks, auto=False, paused_reason=(
                 "tasks.md §6 has no **Never unattended:** line; add one (for example `Bash(git push:*)`) "
@@ -463,6 +482,21 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         if cid in reg["attention"]:
             continue  # stuck or stopped by the owner: only the owner's Retry starts it again
         worked = latest_worked(reg, cid)
+        if cid in reg["blocked_on"]:
+            still = blockers_naming(s).get(cid, [])
+            recorded = reg["blocked_on"][cid]
+            if still:
+                continue  # a blocker still names it
+            if not recorded and cid not in reg["queued"]:
+                continue  # it named no blocker we can watch: the owner unblocks it on the dashboard
+            if any(w["kind"] not in ("blocker", "worktree") for w in s["waiting"].get(cid, [])):
+                continue
+            how = "the owner unblocked it" if cid in reg["queued"] and not recorded else "its blocker is gone from RESUME"
+            if worked:
+                out.append((cid, "unblocked", UNBLOCKED.format(card=cid, how=how), worked["session"], "", None))
+            else:
+                out.append((cid, "start", start_line(s, cid), "", "", None))
+            continue
         answered = [a for a in s["approvals_answered"] if a["card"] == cid and approval_key(a) not in reg["handled"]]
         if worked and answered:  # the owner answered: resume that conversation with the answer
             a = answered[0]
@@ -537,6 +571,8 @@ def dispatch(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         run = spawn(tasks, s, reg, cid, reason, prompt, session, approval, deny)
         if cid in reg["queued"] and not run["error"]:
             reg["queued"].remove(cid)
+        if not run["error"]:
+            reg["blocked_on"].pop(cid, None)
         tier = s["cards"][cid]["effort"] or "default"
         events.append(f"{cid}: {reason} · effort {tier}" + (f" · failed: {run['error']}" if run["error"] else ""))
     return events
@@ -693,6 +729,23 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(f"{gate} is not waiting for a review")
             change_settings(tasks, approved_gates=cfg["approved_gates"] + [gate])
             return f"stage {gate} approved"
+        if action == "resolve-blocker":
+            text = str(data.get("text", "")).strip()
+            if not any(b["text"] == text for b in s["blockers"]):
+                raise Refused("that blocker is not in RESUME any more")
+            resolve_blocker(s, text)
+            return "blocker marked resolved"
+        if action == "unblock":
+            if s["status"][cid] in sv.FINISHED:
+                raise Refused(f"{cid} is {s['status'][cid]}")
+            for b in [b for b in s["blockers"] if cid in b["cards"]]:
+                resolve_blocker(s, b["text"])
+            reg["attention"].pop(cid, None)
+            reg["blocked_on"].setdefault(cid, [])
+            if cid not in reg["queued"]:
+                reg["queued"].append(cid)
+            save_registry(tasks, reg)
+            return f"{cid} unblocked: it continues when a session slot frees up"
         if action == "owner-done":
             if s["cards"][cid]["kind"] != "owner":
                 raise Refused(f"{cid} is not an owner's card")
@@ -700,6 +753,28 @@ def act(tasks: str, action: str, data: dict) -> str:
             tick(tasks, cid)
             return f"{cid} done"
         raise Refused(f"unknown action {action}")
+
+
+def blockers_naming(s: dict) -> dict:
+    """Card -> the active RESUME blockers that name it."""
+    out: dict = {}
+    for b in s["blockers"]:
+        for cid in b["cards"]:
+            out.setdefault(cid, []).append(b["text"])
+    return out
+
+
+def resolve_blocker(s: dict, text: str) -> None:
+    """Mark a RESUME blocker resolved where it stands, so it stays as history and stops blocking."""
+    path = s["resume"]
+    if not path:
+        raise Refused("there is no state/RESUME.md yet")
+    lines = sv.read(path).split("\n")
+    for i, line in enumerate(lines):
+        if line.strip().startswith("- ") and line.strip()[2:].strip() == text:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines[i] = f"{indent}- (resolved {stamp()}, owner) {text}"
+    write_text(path, "\n".join(lines))
 
 
 def one_line(value) -> str:

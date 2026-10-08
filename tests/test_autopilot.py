@@ -504,6 +504,57 @@ class Feature(unittest.TestCase):
         self.assertEqual(self.state()["status"]["T001"], "done")
         self.assertEqual(self.state()["autopilot"]["queued"], [])
 
+    def test_a_blocked_card_waits_and_carries_on_when_its_blocker_is_resolved(self):
+        autopilot.change_settings(self.tasks, max_attempts=1)
+        self.script_for({"T001": ["blocked", "done"]})
+        self.settle()
+        s = self.state()
+        self.assertEqual(s["autopilot"]["attention"], {}, "a recorded blocker is a wait, not a failed try")
+        self.assertEqual(s["autopilot"]["blocked_on"], {"T001": ["T001: needs a key"]})
+        self.assertEqual(len(self.launched()), 1, "nothing resumes while the blocker stands")
+        autopilot.act(self.tasks, "resolve-blocker", {"text": "T001: needs a key"})
+        self.assertIn("- (resolved ", self.resume_text())
+        self.settle()
+        second = [c for c in self.launched() if c["card"] == "T001"][1]["args"]
+        self.assertIn("--resume", second)
+        self.assertIn("has been cleared", second[-1])
+        s = self.state()
+        self.assertEqual(s["status"]["T001"], "done")
+        self.assertEqual(s["autopilot"]["blocked_on"], {})
+
+    def test_cards_stuck_on_blockers_are_converted(self):
+        autopilot.change_settings(self.tasks, max_attempts=1)
+        self.script_for({"T001": ["blocked", "done"]})
+        self.settle()
+        reg = autopilot.registry(self.tasks)  # what an older dispatcher left behind
+        reg["blocked_on"] = {}
+        reg["attention"]["T001"] = "1 sessions ended without finishing it; the last said: AUTOPILOT: BLOCKED"
+        autopilot.save_registry(self.tasks, reg)
+        text = self.resume_text().replace("- T001: needs a key\n", "")  # the owner fixed it by hand
+        open(self.state()["resume"], "w").write(text)
+        self.settle()
+        self.assertEqual(self.state()["status"]["T001"], "done")
+
+    def test_unblock_continues_a_card_whose_blocker_names_no_card(self):
+        self.script_for({"T001": ["blocked", "done"]})
+        self.settle()
+        text = self.resume_text().replace("- T001: needs a key", "- the staging login is broken")
+        open(self.state()["resume"], "w").write(text)
+        reg = autopilot.registry(self.tasks)
+        reg["blocked_on"]["T001"] = []
+        autopilot.save_registry(self.tasks, reg)
+        self.settle()
+        self.assertEqual(len(self.launched()), 1, "no blocker to watch: it waits for the owner")
+        self.assertIn("unblocked", autopilot.act(self.tasks, "unblock", {"card": "T001"}))
+        self.settle()
+        self.assertEqual(self.state()["status"]["T001"], "done")
+
+    def test_a_blocker_written_twice_counts_once_and_approvals_are_numbered_per_card(self):
+        text = self.resume_text().replace("## Blockers\n", "## Blockers\n- T004: needs a key\n- T004: needs a key\n")
+        open(self.state()["resume"], "w").write(text)
+        self.assertEqual(len(self.state()["blockers"]), 1)
+        self.assertIn("`<card>.<n>`", autopilot.RULES)
+
     def test_report_without_autopilot_has_no_gates(self):
         os.remove(os.path.join(os.path.dirname(self.tasks), "state", "autopilot.json"))
         s = self.state()

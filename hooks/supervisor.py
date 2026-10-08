@@ -331,6 +331,8 @@ def parse_resume(text: str) -> dict:
             continue
         if item.lower().startswith("(resolved"):  # kept in RESUME as history, no longer blocks anyone
             continue
+        if any(b["text"] == item for b in blockers):
+            continue  # the same blocker written twice blocks once
         blockers.append({"text": item, "cards": blocker_subjects(item)})
     lock = next((line.strip() for line in section(secs, "deploy lock") if line.strip()), "")
     return {"status": status, "decisions": decisions, "approvals": approvals, "blockers": blockers, "lock": lock}
@@ -600,6 +602,7 @@ def build(tasks: str, stale_hours: float) -> dict:
             "attention": attention,
             "manual": registry.get("manual", []),
             "queued": [c for c in registry.get("queued", []) if c in cards and status[c] not in FINISHED],
+            "blocked_on": {c: v for c, v in registry.get("blocked_on", {}).items() if c in cards and status[c] not in FINISHED},
             "unkinded": [c for c in order if not cards[c]["kind"] and status[c] not in FINISHED],
             "beat": beat,
             "spent_usd": round(sum(r["cost"] for r in runs.values()), 2),
