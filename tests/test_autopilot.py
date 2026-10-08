@@ -223,6 +223,8 @@ class Feature(unittest.TestCase):
         runs = [c for c in self.launched() if c["card"] == "T001"]
         self.assertEqual(len(runs), 2)
         self.assertIn("--resume", runs[1]["args"], "a session that did work is resumed, not restarted")
+        self.assertIn("The last session ended with:", runs[1]["args"][-1])
+        self.assertIn("Tried, did not work", runs[1]["args"][-1])
         self.assertIn("T001", self.state()["autopilot"]["attention"])
         autopilot.act(self.tasks, "retry", {"card": "T001"})
         self.settle()
@@ -664,6 +666,364 @@ after: T002B2 · S · effort low · kind backend
         self.assertIn("Balance: backend 0/3, frontend 0/2", sv.render(s))
 
 
+    WHO = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", self.root, *args], check=True, capture_output=True, text=True,
+                              env={**os.environ, **self.WHO}).stdout.strip()
+
+    def commit(self, path: str, message: str) -> str:
+        full = os.path.join(self.root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "a") as handle:
+            handle.write(message + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+    def finish(self, cid: str, commit: str = "-", handoff: str = "") -> None:
+        text = re.sub(rf"\| {cid} \| x \| todo \| - \| - \|", f"| {cid} | x | done | b | {commit} |", self.resume_text())
+        open(self.state()["resume"], "w").write(text)
+        text = open(self.tasks).read().replace(f"- [ ] {cid} ", f"- [x] {cid} ")
+        open(self.tasks, "w").write(text)
+        folder = os.path.join(os.path.dirname(self.tasks), "state", "handoff")
+        os.makedirs(folder, exist_ok=True)
+        open(os.path.join(folder, f"{cid}.md"), "w").write(f"# {cid}\n{handoff}")
+
+    CHECKS = "| criterion | verdict | evidence | correction |\n| --- | --- | --- | --- |\n"
+
+    def add_to_tasks(self, before: str, block: str) -> None:
+        text = open(self.tasks).read().replace(before, block + "\n" + before, 1)
+        open(self.tasks, "w").write(text)
+
+    def add_to_resume(self, block: str) -> None:
+        text = self.resume_text().replace("## Status", block + "\n\n## Status", 1)
+        open(self.state()["resume"], "w").write(text)
+
+    def pins(self) -> list:
+        return [d for d in self.state()["drift"] if "pinning" in d]
+
+    def with_pins(self, *rows: str) -> None:
+        self.add_to_tasks("## 4. Cards", "## 2. Templates\n\n" + self.CHECKS + "\n## 3. Traceability\n\n"
+                          "| id | requirement | cards |\n| --- | --- | --- |\n"
+                          "| NFR-2 | invariants have a pinning test | T009 |\n\n"
+                          "| rule | **Pinning test** | card |\n| --- | --- | --- |\n" + "".join(rows))
+
+    def test_a_pinning_test_changed_by_another_card_is_drift(self):
+        # a requirement row that says "pinning test" sits above the pins table; a second pins table follows
+        self.with_pins("| totals never go negative | `tests/test_totals.py` | T002 |\n")
+        self.add_to_tasks("## 4. Cards", "More pins:\n\n| rule | pinning test | card |\n| --- | --- | --- |\n"
+                          "| ids are unique | `tests/test_ids.py` | T003 |\n")
+        self.assertEqual(sv.pinned_tests(open(self.tasks).read()),
+                         {"tests/test_totals.py": "T002", "tests/test_ids.py": "T003"})
+        self.finish("T002", self.commit("tests/test_totals.py", "test: pin totals (T002)"))
+        self.assertFalse(self.pins(), "the writer may change its own pin")
+        sha = self.commit("tests/test_totals.py", "fix: storage (T004)")
+        self.finish("T004", sha)
+        drift = self.pins()
+        self.assertEqual(len(drift), 1, drift)
+        self.assertIn(f"T004's commit {sha[:7]}", drift[0])
+        self.assertIn("tests/test_totals.py", drift[0])
+        self.commit("tests/test_ids.py", "fix: ids (T004)")
+        self.assertEqual(len(self.pins()), 2, "every pins table is read")
+
+    def test_pin_changes_are_found_on_merged_branches_and_by_resume_commit(self):
+        self.with_pins("| totals | `./tests/test_totals.py::test_never_negative` | T002 |\n",
+                       "| shapes | `tests/pins/*.py` | T002 |\n")
+        self.commit("tests/test_totals.py", "test: pin totals (T002)")
+        main = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.git("checkout", "-qb", "t004")
+        branch = self.commit("tests/test_totals.py", "fix: storage (T004)")
+        self.git("checkout", "-q", main)
+        self.git("merge", "-q", "--no-ff", "-m", "merge the storage branch", "t004")
+        self.git("branch", "-qD", "t004")  # only the merge reaches it now
+        drift = self.pins()
+        self.assertEqual(len(drift), 1, drift)
+        self.assertIn(f"T004's commit {branch[:7]} changes the pinning test tests/test_totals.py", drift[0])
+        # no card in the subject: RESUME's commit column names it (short and full hash: one line)
+        tidy = self.commit("tests/pins/shape.py", "chore: tidy")
+        self.finish("T003", f"{tidy[:7].upper()}, {tidy}")
+        self.assertEqual(len([d for d in self.pins() if tidy[:7] in d]), 1, self.pins())
+        self.assertIn("T003", [d for d in self.pins() if tidy[:7] in d][0])
+        self.commit("tests/pins/other.py", "chore: nobody's")  # no card to name: skipped, not guessed
+        self.assertEqual(len(self.pins()), 2, self.pins())
+
+    def test_reviewed_pins_and_old_features_are_not_drift(self):
+        self.add_to_tasks("## 4. Cards", "| rule | pinning test | card |\n| --- | --- | --- |\n"
+                          "| totals | `tests/test_totals.py` | T002 |\n")
+        first = self.commit("tests/test_totals.py", "fix: storage (T004)")
+        self.assertFalse(self.pins(), "a feature without the Checks template gets no new drift")
+        self.add_to_tasks("## 4. Cards", "## 2. Templates\n\n" + self.CHECKS)
+        self.assertEqual(len(self.pins()), 1)
+        self.add_to_resume(f"## Pins\nPins reviewed up to 0000000\nPins reviewed up to `{first[:9]}`")
+        self.assertFalse(self.pins(), "a checkpoint reviewed it (the last line wins)")
+        later = self.commit("tests/test_totals.py", "fix: storage again (T004)")
+        self.assertEqual([d.split(" changes")[0] for d in self.pins()], [f"T004's commit {later[:7]}"])
+
+    def test_done_cards_list_their_open_checks(self):
+        self.add_to_tasks("## 6. Supervisor", "## 2. Templates\n\n" + self.CHECKS)
+        table = "## Checks\n" + self.CHECKS
+        self.finish("T001", handoff="- Built: x\n| step | result |\n| --- | --- |\n| a | b |\n")
+        self.finish("T002", handoff=table + "| tests green | **PASS** | `pytest` 12 passed | - |\n"
+                                            "| api \\| health | ✅ | `curl` 200 | - |\n")
+        old = sv.snapshot(self.state())
+        self.finish("T004", handoff=table + "| loads in 1 s | unresolved | - | no data yet |\n"
+                                            "| saves | pass | N/A | - |\n| exports | Passed. | <file path> | - |\n")
+        self.finish("CPA", handoff=table + "| merged | ❌ | `make check` 2 failed | one fix |\n")
+        self.finish("T003", handoff=table + "| copy reviewed | waived | - | - |\n")
+        self.finish("T006", handoff=table + "| pays | waived | - | - |\n")
+        open(os.path.join(os.path.dirname(self.state()["resume"]), "design-review.md"), "w").write(
+            "- 2026-10-09 CPA checkout: make check fails twice\n")
+        autopilot.act(self.tasks, "decision", {"n": "1", "answer": "skip the payment check"})  # T006's decision
+        s = self.state()
+        self.assertIn("T001 is done but its hand-off has no Checks table (criterion | verdict | evidence)", s["drift"])
+        self.assertFalse([d for d in s["drift"] if re.match(r"(T002|T003|T004|T006|CPA) ", d)], s["drift"])
+        got = {(c["card"], c["criterion"]): (c["verdict"], c["note"]) for c in s["open_checks"]}
+        self.assertEqual(got, {
+            ("T004", "loads in 1 s"): ("unresolved", "no data yet"),
+            ("T004", "saves"): ("pass", "no evidence"),
+            ("T004", "exports"): ("pass", "no evidence"),
+            ("CPA", "merged"): ("fail", "in design-review.md"),
+            ("T003", "copy reviewed"): ("waived", "waived without an owner's decision"),
+        })
+        report = sv.render(s)
+        self.assertIn('Open checks (the owner decides):\n  T003 "copy reviewed": waived', report)
+        self.assertIn('\n  T004 "loads in 1 s": unresolved (no data yet)\n', report)
+        self.assertIn('Open checks at the close (the owner decides):', sv.lessons(s))
+        self.assertIn('open check: T004 "saves": pass (no evidence)', sv.changes(old, sv.snapshot(s)))
+        self.assertFalse([c for c in sv.changes(old, sv.snapshot(s)) if "T006" in c and "open check" in c])
+
+    def test_checks_tables_are_found_and_read_like_a_person_would(self):
+        notes = "## Notes\n| criterion | note |\n| --- | --- |\n| x | y |\n\n"
+        checks = sv.handoff_checks(notes + "**Checks**\n| **Criterion** (Done when) | **Verdict** | Evidence |\n"
+                                           "| --- | --- | --- |\n| a | ok | `ls` |\n")
+        self.assertEqual([(c["criterion"], c["verdict"]) for c in checks], [("a", "pass")])
+        checks = sv.handoff_checks("| step | result |\n| --- | --- |\n| 1 | 2 |\n\n"
+                                   "| Criterion (Done when) | `verdict` | evidence |\n| --- | --- | --- |\n| b | fail | - |\n")
+        self.assertEqual([(c["criterion"], c["verdict"]) for c in checks], [("b", "fail")])
+        self.assertIsNone(sv.handoff_checks("| step | result |\n| --- | --- |\n| 1 | 2 |\n"))
+        # a "|" left unescaped in the criterion: the verdict is found further right
+        row = sv.handoff_checks(self.CHECKS + "| a | b | pass | `pytest` ok | - |\n")[0]
+        self.assertEqual((row["criterion"], row["verdict"], row["evidence"]), ("a | b", "pass", "`pytest` ok"))
+        row = sv.handoff_checks(self.CHECKS + "| a \\| b | pass | `pytest` ok | - |\n")[0]
+        self.assertEqual((row["criterion"], row["verdict"]), ("a \\| b", "pass"))
+        self.assertEqual(sv.handoff_checks(self.CHECKS + "| a | partly | x | - |\n")[0]["verdict"], "")
+        verdicts = {"**PASS**": "pass", "`pass`": "pass", "Passed.": "pass", "✅": "pass", "✅ ok": "pass",
+                    "_green_": "pass", "Yes": "pass", "❌": "fail", "❌ pass": "fail", "Failed": "fail",
+                    "*unresolved*": "unresolved", "waived": "waived", "partly": "", "": ""}
+        self.assertEqual({v: sv.verdict(v) for v in verdicts}, verdicts)
+        evidence = {"N/A": False, "na": False, "**None**": False, "TBD": False, "–": False, "—": False,
+                    "`-`": False, "<command and its decisive output line>": False, "?": False,
+                    "`pytest` 12 passed": True, "state/screens/T003/phone.png": True}
+        self.assertEqual({e: sv.has_evidence(e) for e in evidence}, evidence)
+
+    def test_lessons_measure_what_each_card_took(self):
+        self.script_for({"T001": ["doing", "done"]})
+        self.settle()
+        tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Los_Angeles"  # "ended" is UTC; read as local time it is 7 hours off
+        time.tzset()
+        try:
+            out = sv.lessons(self.state())
+        finally:
+            if tz is None:
+                os.environ.pop("TZ")
+            else:
+                os.environ["TZ"] = tz
+            time.tzset()
+        head = next(line for line in out.splitlines() if line.startswith("| card "))
+        row = dict(zip([h.strip() for h in head.split("|")], [c.strip() for c in
+                   next(line for line in out.splitlines() if line.startswith("| T001 ")).split("|")]))
+        self.assertEqual((row["effort"], row["runs"], row["tries"]), ("high", "2", "2"), row)
+        self.assertTrue(0 <= float(row["hours"]) < 1, row)
+        self.assertIn("| effort | cards run | tries per card |", out)
+        self.assertIn('Cards run by hand have no measurements ("-").', out)
+        self.assertRegex(next(line for line in out.splitlines() if line.startswith("| T005 ")), r"\| - \| - \| - \| - \|")
+
+    def lessons_row(self, cid: str) -> list:
+        out = sv.lessons(self.state())
+        return [c.strip() for c in next(line for line in out.splitlines() if line.startswith(f"| {cid} ")).split("|")]
+
+    def test_lessons_say_what_the_owner_was_needed_for(self):
+        self.script_for({"T001": ["approval", "done"]})
+        self.settle()
+        autopilot.act(self.tasks, "approval", {"n": "A1", "card": "T001", "verdict": "approved", "note": ""})
+        self.settle()
+        row = self.lessons_row("T001")
+        self.assertEqual((row[7], row[8], row[11]), ("2", "1", "1 approval"), row)  # the answer is not a try
+
+    def test_lessons_count_retries_and_flatten_the_owner_column(self):
+        self.script_for({"T001": ["doing", "doing", "done"]})
+        self.settle()
+        reg = autopilot.registry(self.tasks)
+        reg["attention"]["T001"] = "2 sessions ended | without\nfinishing it; " + "x" * 200
+        autopilot.save_registry(self.tasks, reg)
+        cell = sv.cells(next(line for line in sv.lessons(self.state()).splitlines() if line.startswith("| T001 ")))[-1]
+        self.assertTrue(cell.startswith("2 sessions ended \\| without finishing it;"), cell)
+        self.assertLessEqual(len(cell), 80)
+        autopilot.act(self.tasks, "retry", {"card": "T001"})
+        self.settle()
+        row = self.lessons_row("T001")
+        self.assertEqual((row[7], row[8], row[11]), ("3", "3", "owner retry"), row)
+
+    BATCH = """## 5. Backlog
+
+### Batches
+
+- [ ] B1 Login polish
+
+| batch | name | cards, in order | effort | Start with |
+| --- | --- | --- | --- | --- |
+| B1 | Login polish | T003B, T003C | | `Demo · B1. Follow {tasks} §1, then the cards of batch B1 (§5, Batches) in order.` |
+
+- [ ] T003B Empty state copy
+  added by T003 · after: T003 · S · effort medium · kind frontend
+  **Start with:** `Demo · T003B. Follow {tasks} §1, then card T003B.`
+- [ ] T003C Focus ring
+  added by T003 · after: T003B · S · effort high · kind frontend · model sonnet
+  **Start with:** `Demo · T003C. Follow {tasks} §1, then card T003C.`
+
+"""
+
+    def add_batch(self) -> None:
+        self.add_to_tasks("## 6. Supervisor", self.BATCH.replace("{tasks}", self.tasks))
+        open(self.state()["resume"], "a").write("| T003B | x | todo | - | - | - |\n| T003C | x | todo | - | - | - |\n")
+
+    def batch(self, s: dict, bid: str = "B1") -> dict:
+        return next(b for b in s["batches"] if b["id"] == bid)
+
+    def test_batches_are_parsed_with_their_tick(self):
+        self.add_batch()
+        s = self.state()
+        b = self.batch(s)
+        self.assertEqual((b["name"], b["cards"], b["effort"], b["ticked"]), ("Login polish", ["T003B", "T003C"], "high", False))
+        self.assertTrue(b["start_with"].startswith("Demo · B1. Follow ") and b["start_with"].endswith("in order."))
+        self.assertNotIn("B1", s["cards"], "a batch is not a card")
+        self.assertEqual(s["total"], 10, "progress stays per card")
+        self.assertEqual(s["batch_of"], {"T003B": "B1", "T003C": "B1"})
+        self.assertFalse([d for d in s["drift"] if "batch" in d], s["drift"])
+        text = open(self.tasks).read()
+        cards, order = sv.parse_tasks(text.replace("- [ ] B1 ", "- [x] B1 "))
+        parsed = sv.parse_batches(text.replace("- [ ] B1 ", "- [x] B1 "), cards, order)[0][0]
+        self.assertEqual((parsed["ticked"], parsed["effort"]), (True, ""), "the row names no effort; build() fills it in")
+        bad = text.replace("| B1 | Login polish | T003B, T003C | |", "| B1 | Login polish | T003B, T009Z | medium |")
+        bad = bad.replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- |\n"
+                          "| B2 | Seconds | T003B, T003C | low | no line |\n", 1)
+        batches, drift = sv.parse_batches(bad, cards, order)
+        self.assertEqual([(b["id"], b["cards"], b["effort"]) for b in batches],
+                         [("B2", ["T003B", "T003C"], "low"), ("B1", [], "medium")])
+        self.assertEqual(drift, ["batch B2 has no Start with line (a backticked line in its table row)",
+                                 "T003B is in two batches (B2, B1); it runs with B2",
+                                 "batch B1 names T009Z, which tasks.md does not define",
+                                 "batch B1 names no card"])
+
+    def test_a_ready_batch_replaces_its_cards(self):
+        self.add_batch()
+        for cid in ("T001", "T002"):
+            self.finish(cid)
+        s = self.state()
+        b = self.batch(s)
+        self.assertEqual((b["status"], b["waits"]), ("waiting", [{"kind": "card", "on": "T003", "status": "todo",
+                                                                  "conditional": False}]))
+        self.assertEqual(s["ready_batches"], [], "a batch waiting on a card outside it is not ready")
+        old = sv.snapshot(s)
+        self.finish("T003")
+        s = self.state()
+        self.assertNotIn("T003B", s["ready"])
+        self.assertNotIn("T003C", s["ready"], "T003C waits only on T003B, inside its batch")
+        self.assertEqual([x["id"] for x in s["ready_batches"]], ["B1"])
+        self.assertEqual(self.batch(s)["waits"], [])
+        self.assertIn("batch B1 is now ready", sv.changes(old, sv.snapshot(s)))
+        report = sv.render(s)
+        self.assertIn("  B1 Login polish · batch of 2 (T003B, T003C) · effort high\n    Start with: Demo · B1. Follow ", report)
+        self.assertNotIn("  T003B Empty state copy", report.split("Waiting:")[0])
+
+    def test_a_batch_is_done_by_its_cards_or_its_tick_and_drift_says_when_they_disagree(self):
+        self.add_batch()
+        for cid in ("T001", "T002", "T003", "T003B", "T003C"):
+            self.finish(cid)
+        s = self.state()
+        self.assertEqual(self.batch(s)["status"], "done")
+        self.assertIn("every card of batch B1 is finished but its line in tasks.md is not ticked", s["drift"])
+        self.tick_batch()
+        self.assertFalse([d for d in self.state()["drift"] if "B1" in d])
+
+    def tick_batch(self) -> None:
+        text = open(self.tasks).read().replace("- [ ] B1 ", "- [x] B1 ")
+        with open(self.tasks, "w") as handle:
+            handle.write(text)
+
+    def test_a_batch_ticked_with_a_card_still_open_is_drift(self):
+        self.add_batch()
+        for cid in ("T001", "T002", "T003", "T003B"):
+            self.finish(cid)
+        self.tick_batch()
+        s = self.state()
+        self.assertEqual(self.batch(s)["status"], "done")
+        self.assertIn("batch B1 is ticked in tasks.md but T003C is todo", s["drift"])
+        self.assertIn("T003C", s["ready"], "its batch is over: the card left open runs on its own")
+
+    def test_the_autopilot_runs_a_batch_in_one_session(self):
+        self.add_batch()
+        self.settle()
+        launched = [c["card"] for c in self.launched()]
+        self.assertEqual(launched.count("B1"), 1)
+        self.assertNotIn("T003B", launched, "a batch's cards never start on their own")
+        self.assertNotIn("T003C", launched)
+        args = next(c for c in self.launched() if c["card"] == "B1")["args"]
+        self.assertEqual(args[args.index("-n") + 1], "001 B1 Login polish")
+        self.assertEqual(args[args.index("--effort") + 1], "high", "no effort in the row: the highest of its cards")
+        self.assertEqual(args[args.index("--model") + 1], "sonnet")
+        self.assertEqual(args[-1], self.batch(self.state())["start_with"])
+        rules = args[args.index("--append-system-prompt") + 1]
+        self.assertIn("for batch B1 (cards T003B, T003C, in this order", rules)
+        self.assertIn("Never start a card or batch beyond the one you were", rules)
+        s = self.state()
+        self.assertEqual((s["status"]["T003B"], s["status"]["T003C"], self.batch(s)["status"]), ("done", "done", "done"))
+        run = next(r for r in autopilot.registry(self.tasks)["runs"] if r.get("batch"))
+        self.assertEqual((run["card"], run["batch"]), ("T003B", "B1"))
+        self.assertFalse([d for d in s["drift"] if "B1" in d], s["drift"])
+
+    def test_an_interrupted_batch_resumes_its_session(self):
+        self.add_batch()
+        self.script_for({"B1": ["doing", "done"]})
+        self.settle()
+        runs = [c for c in self.launched() if c["card"] == "B1"]
+        self.assertEqual(len(runs), 2)
+        first, second = runs[0]["args"], runs[1]["args"]
+        self.assertEqual(second[second.index("--resume") + 1], first[first.index("--session-id") + 1])
+        self.assertIn("batch B1 is not finished: cards still open: T003C (RESUME says doing)", second[-1])
+        s = self.state()
+        self.assertEqual(self.batch(s)["status"], "done")
+        reg = autopilot.registry(self.tasks)
+        self.assertEqual([r["card"] for r in reg["runs"] if r.get("batch") == "B1"], ["T003B", "T003C"])
+        out = sv.lessons(s)
+        self.assertIn("| B1 Login polish | T003B, T003C | high | 2 | 2 | 0.25 |", out)
+        self.assertRegex(next(line for line in out.splitlines() if line.startswith("| T003B ")),
+                         r"\| in B1 \| in B1 \| in B1 \| in B1 \|")
+
+    def test_the_owner_starts_a_batch_from_any_of_its_cards(self):
+        self.add_batch()
+        for cid in ("T001", "T002", "T003", "T004"):
+            self.finish(cid)
+        autopilot.change_settings(self.tasks, auto=False)
+        self.script_for({"B1": ["sleep"]})
+        self.assertTrue(autopilot.acquire(self.tasks))
+        self.assertEqual(autopilot.act(self.tasks, "start", {"card": "T003C"}), "B1 started")
+        self.assertEqual([c["card"] for c in self.wait_calls(1)], ["B1"])
+        self.assertTrue(self.batch(self.state())["live"])
+        with self.assertRaises(autopilot.Refused):
+            autopilot.act(self.tasks, "start", {"card": "B1"})  # it already has a live session
+
+    def test_a_continued_session_hears_how_the_last_one_ended(self):
+        error = autopilot.ending({"error": "api_error: " + "x" * 400 + " TAIL", "result": "ignored"})
+        self.assertTrue(error.startswith("api_error: xxx") and "TAIL" not in error and len(error) == 300, error)
+        result = autopilot.ending({"error": "", "result": "HEAD\n" + "y" * 400 + "\nAUTOPILOT: SPLIT"})
+        self.assertTrue(result.endswith("y AUTOPILOT: SPLIT") and "HEAD" not in result, result)
+        self.assertIn("stopped or interrupted", autopilot.ending({"error": "", "result": ""}))
+
+
 class CloseWaits(unittest.TestCase):
     def test_after_section_5_waits_for_every_backlog_card(self):
         text = (
@@ -696,6 +1056,34 @@ class Template(unittest.TestCase):
                                 "| A1 | T003 | deploy | verify | pending | |", 1)
         parsed = sv.parse_resume(resume)
         self.assertEqual(parsed["approvals"][0]["card"], "T003")
+
+    def test_template_pins_and_checks_parse(self):
+        skill = open(os.path.join(HERE, "..", "SKILL.md"), encoding="utf-8").read()
+        block = skill.split("### tasks.md", 1)[1].split("````markdown", 1)[1].split("\n````", 1)[0]
+        self.assertEqual(list(sv.pinned_tests(block)), ["<test file>"])
+        handoff = block.split("**Hand-off note**", 1)[1].split("```markdown", 1)[1].split("```", 1)[0]
+        checks = sv.handoff_checks(handoff)
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(sv.column(checks[0], "criterion"), "<each Done when line>")
+        self.assertEqual(checks[0]["verdict"], "pass")  # "pass / fail / unresolved": judged by its first word
+        resume = block.split("**RESUME**", 1)[1].split("```markdown", 1)[1].split("```", 1)[0]
+        self.assertIn("Pins reviewed up to <commit>", resume)
+        self.assertEqual(sv.parse_resume(resume)["pins_reviewed"], "", "the placeholder is no commit")
+
+    def test_template_rules_agree(self):
+        skill = open(os.path.join(HERE, "..", "SKILL.md"), encoding="utf-8").read()
+        block = skill.split("### tasks.md", 1)[1].split("````markdown", 1)[1].split("\n````", 1)[0]
+        finish = re.sub(r"\s+", " ", block.split("9. **Finish.**", 1)[1].split("2. Commit", 1)[0])
+        self.assertIn("a check recorded as `fail` in the Checks table with its design-review.md line (item 5)", finish)
+        self.assertIn("write a `|` inside a cell as `\\|`", finish)
+        self.assertIn("(In the Checks table, write a `|` inside a cell as `\\|`.)", block)
+        self.assertIn("In the Checks table too, write a `|` inside a cell as `\\|`.", autopilot.RULES)
+        routine = re.sub(r"\s+", " ", block.split("**Checkpoint routine**", 1)[1].split("### Stage 1", 1)[0])
+        self.assertIn("write `Pins reviewed up to <commit>`", routine)
+        # the autopilot's rules cite §1 items by number
+        for n, title in (("4", "Preconditions"), ("5", "Stay in scope"), ("6", "Context budget"),
+                         ("7", "Owner's yes"), ("9", "Finish")):
+            self.assertRegex(block, rf"\n{n}\. \*\*{re.escape(title)}")
 
 
 class Server(unittest.TestCase):

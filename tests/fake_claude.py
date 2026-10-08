@@ -6,6 +6,10 @@ FAKE_SCRIPT (a JSON file) maps a card to the behaviour of each of its sessions, 
 "doing" marks it doing and stops, "work" acts out a realistic session (to-dos, tools, pauses) and finishes, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
 records a blocker, "apierror" fails the way an expired login does, "budget" hits the dollar
 cap, "sleep" stays alive until killed. Every call is appended to FAKE_CALLS as one JSON line.
+
+A batch session (SPEC_GRILL_CARD is a §5 batch id such as B1) reads its cards from the batch table:
+"done" finishes every open card of the batch in order and ticks the batch's line; "doing" finishes
+only the first open card and marks the next one doing (a batch interrupted half way).
 """
 
 import json
@@ -44,10 +48,37 @@ def emit(event: dict) -> None:
     print(json.dumps({**event, "session_id": session}), flush=True)
 
 
-def set_status(status: str) -> None:
+def set_status(status: str, cid: str = card) -> None:
     text = open(resume).read()
-    text = re.sub(rf"^\| {card} \|([^|]*)\| [a-z]+ \|", rf"| {card} |\1| {status} |", text, flags=re.M)
-    open(resume, "w").write(text)
+    text = re.sub(rf"^\| {cid} \|([^|]*)\| [a-z]+ \|", rf"| {cid} |\1| {status} |", text, flags=re.M)
+    with open(resume, "w") as handle:
+        handle.write(text)
+
+
+def finish(cid: str) -> None:
+    """Finish a card the way §1 item 9 says: RESUME row done, ticked, hand-off written, committed."""
+    set_status("done", cid)
+    text = open(tasks).read()
+    with open(tasks, "w") as handle:
+        handle.write(re.sub(rf"^- \[ \] {cid}\b", f"- [x] {cid}", text, flags=re.M))
+    os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
+    with open(os.path.join(os.path.dirname(resume), "handoff", f"{cid}.md"), "w") as handle:
+        handle.write(f"# {cid}\n")
+    if os.environ.get("FAKE_COMMIT"):  # commit the way a card session does at §1 item 9
+        import subprocess
+        who = {"GIT_AUTHOR_NAME": "card", "GIT_AUTHOR_EMAIL": "card@example.invalid",
+               "GIT_COMMITTER_NAME": "card", "GIT_COMMITTER_EMAIL": "card@example.invalid"}
+        subprocess.run(["git", "commit", "--allow-empty", "-qm", f"feat: finish the card's work ({cid})"],
+                       env={**os.environ, **who}, capture_output=True)
+
+
+def batch_cards() -> list:
+    """A batch session's open cards, in the batch table's order."""
+    text = open(tasks).read()
+    row = re.search(rf"^\|\s*{card}\s*\|[^|\n]*\|([^|\n]*)\|", text, re.M)
+    cards = re.findall(r"\b(?:T\d+(?:[A-Z]+\d*)*|CP[A-Z0-9]+)\b", row.group(1)) if row else []
+    rows = open(resume).read()
+    return [c for c in cards if not re.search(rf"^\| {c} \|[^|]*\| (?:done|waived) \|", rows, re.M)]
 
 
 emit({"type": "system", "subtype": "init"})
@@ -79,20 +110,22 @@ if behaviour == "work":  # a realistic session: a to-do list, tool calls with re
     behaviour = "done"
 
 emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})
-if behaviour == "sleep":
+if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):  # a §5 batch
+    todo = batch_cards()
+    for cid in todo if behaviour == "done" else todo[:1]:
+        finish(cid)
+    if behaviour == "done":
+        text = open(tasks).read()
+        with open(tasks, "w") as handle:
+            handle.write(re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
+    elif todo[1:]:
+        set_status("doing", todo[1])
+elif behaviour == "sleep":
     time.sleep(600)
-if behaviour == "done":
-    set_status("done")
-    text = open(tasks).read()
-    open(tasks, "w").write(re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
-    os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
-    open(os.path.join(os.path.dirname(resume), "handoff", f"{card}.md"), "w").write(f"# {card}\n")
-    if os.environ.get("FAKE_COMMIT"):  # commit the way a card session does at §1 item 9
-        import subprocess
-        who = {"GIT_AUTHOR_NAME": "card", "GIT_AUTHOR_EMAIL": "card@example.invalid",
-               "GIT_COMMITTER_NAME": "card", "GIT_COMMITTER_EMAIL": "card@example.invalid"}
-        subprocess.run(["git", "commit", "--allow-empty", "-qm", f"feat: finish the card's work ({card})"],
-                       env={**os.environ, **who}, capture_output=True)
+if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):
+    pass  # acted out above
+elif behaviour == "done":
+    finish(card)
     if "answered approval" in args[-1] and "approved" in args[-1]:
         text = open(resume).read()
         open(resume, "w").write(re.sub(r"\| approved \|", "| done |", text))

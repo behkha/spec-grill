@@ -211,6 +211,7 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 .notes summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 4px 0; }
 .notes ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
 .notes li { margin: 3px 0; }
+.notes .link { font-size: 12px; }
 
 /* sessions */
 .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px 28px; }
@@ -294,6 +295,9 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 .tile .id i { width: 7px; height: 7px; border-radius: 50%; background: var(--c); }
 .tile .t { display: block; margin-top: 2px; overflow-wrap: anywhere; }
 .tile .why { display: block; margin-top: 2px; font-size: 11.5px; color: var(--muted); }
+.tile .id .tag { font-family: inherit; font-weight: 600; font-size: 11px; padding: 0 5px; margin-left: auto; }
+.batch-sum { display: flex; gap: 4px 12px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin: -2px 0 8px; }
+.batch-sum b { color: var(--text); font-weight: 600; }
 .more { width: 100%; font-size: 12px; color: var(--muted); background: transparent; border-style: dashed; margin-bottom: 6px; }
 
 /* map */
@@ -331,6 +335,8 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 .feed time { color: var(--faint); font-family: var(--mono); font-size: 11.5px; flex: none; padding-top: 2px; }
 .drift-item { padding: 4px 0; border-top: 1px solid var(--border); font-size: 13px; }
 .drift-item:first-child { border-top: 0; }
+.drift-item.fresh { animation: fresh 2s ease-out; border-radius: 6px; }
+section[aria-labelledby="h-checks"] { scroll-margin-top: 104px; }
 .ok-line { display: flex; align-items: center; gap: 8px; color: var(--done-ink); font-size: 13px; font-weight: 550; }
 
 /* drawer */
@@ -416,6 +422,7 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
   <div id="v-board" role="tabpanel" data-view="board">
   <section aria-labelledby="h-board">
     <div class="head"><h2 id="h-board">Board</h2><span class="hint">Select a card for its details</span></div>
+    <div class="batch-sum" id="board-batches" hidden></div>
     <div class="board" id="board"></div>
   </section>
 
@@ -441,6 +448,7 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
     <div>
       <section aria-labelledby="h-feed"><div class="head"><h2 id="h-feed">Activity</h2></div><ol class="feed" id="feed"></ol></section>
       <section aria-labelledby="h-drift"><div class="head"><h2 id="h-drift">Drift</h2><span class="hint">Where the files disagree</span></div><div id="drift"></div></section>
+      <section aria-labelledby="h-checks"><div class="head"><h2 id="h-checks">Open checks</h2><span class="hint">The owner decides</span></div><div id="checks"></div></section>
     </div>
   </div>
   </div>
@@ -528,27 +536,36 @@ const clock = () => new Date().toTimeString().slice(0, 5);
 const icon = (name) => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const blank = (v) => !v || v === "-" || v === "—";
 const finished = (s, id) => ["done", "waived"].includes(s.status[id]);
+/* §5's batches: several small cards run in one session; a batch is not a card */
+const batchById = (s, id) => (s.batches || []).find((b) => b.id === id) || null;
+const batchOf = (s, id) => batchById(s, (s.batch_of || {})[id]);
+const openBatch = (s, id) => { const b = batchOf(s, id); return b && b.status !== "done" ? b : null; };
+const unitCards = (s, unit) => batchById(s, unit)?.cards || [unit];
+const progress = (b) => `${b.finished}/${b.cards.length}`;
 
 /* ---------- one state per card, shown the same everywhere ---------- */
 
 function cardState(s, id) {
   const st = s.status[id], a = s.autopilot, w = s.waiting[id] || [];
   if (st === "done" || st === "waived") return st;
-  if (a.live.includes(id)) return "running";
-  if (a.attention[id]) return "stuck";
-  if ((a.queued || []).includes(id)) return "ready";
+  const b = openBatch(s, id);  // a card of an unfinished batch shares its batch's session, queue and attention
+  if (a.live.includes(id) || (b && b.live && b.current === id)) return "running";
+  if (a.attention[id] || (b && a.attention[b.id])) return "stuck";
+  if ((a.queued || []).includes(id) || (b && !b.live && (a.queued || []).includes(b.id))) return "ready";
   if (s.approvals.some((x) => x.card === id)) return "yours";
   if (st === "blocked" || w.some((r) => r.kind === "blocker")) return "blocked";
   if (w.some((r) => r.kind === "owner" || r.kind === "gate") || s.yours.includes(id)) return "yours";
   if (st === "doing") return a.used && a.dispatcher && !(a.manual || []).includes(id) ? "waiting" : "running";
-  if (s.ready.includes(id)) return "ready";
+  if (s.ready.includes(id) || (b && b.status === "ready")) return "ready";
   return "waiting";
 }
 
 function why(s, id) {
-  const a = s.autopilot, cat = cardState(s, id);
-  if (cat === "stuck") return "stuck: " + humanStuck(a.attention[id]).replace(/^./, (c) => c.toLowerCase());
+  const a = s.autopilot, cat = cardState(s, id), b = openBatch(s, id);
+  if (cat === "stuck") return "stuck: " + humanStuck(a.attention[id] || a.attention[b?.id]).replace(/^./, (c) => c.toLowerCase());
   if ((a.queued || []).includes(id) && !a.live.includes(id)) return "queued: starts when a slot frees up";
+  if (b && cat === "ready") return (a.queued || []).includes(b.id) ? `queued with batch ${b.id}` : `starts with batch ${b.id}`;
+  if (b && b.live && cat !== "running") return `waits its turn in batch ${b.id}`;
   const approval = s.approvals.find((x) => x.card === id);
   if (approval) return `asks you to approve ${approval.n}`;
   if (s.yours.includes(id)) return "your card";
@@ -604,7 +621,8 @@ function render(s) {
   tabN("#t-now", n, n ? "hot" : "");
   tabN("#t-board", Object.keys(s.cards).length);
   tabN("#t-screens", shotsN);
-  tabN("#t-activity", s.drift.length ? `${s.drift.length} drift` : "", "bad");
+  const gaps = [s.drift.length && `${s.drift.length} drift`, s.open_checks?.length && `${s.open_checks.length} open`];
+  tabN("#t-activity", gaps.filter(Boolean).join(" · "), "bad");
   inkTo(document.querySelector(`[data-tab="${view}"]`));
   if (s.now) skew = s.now - Date.now() / 1000;
   renderCommits(s);
@@ -737,13 +755,14 @@ function inboxItems(s) {
       ${actionBlock(key, (d.recommended ? btn(`data-act="decision" data-n="${esc(d.n)}" data-key="${esc(key)}" data-use="${esc(plain(d.recommended))}" data-primary data-fkey="${esc(key)}-rec"`, "Use recommended", "primary") : "") + btn(`data-act="decision" data-n="${esc(d.n)}" data-key="${esc(key)}"${d.recommended ? "" : " data-primary"} data-fkey="${esc(key)}-ans"`, d.recommended ? "Answer with mine" : "Answer", d.recommended ? "" : "primary"))}` : ""}` });
   });
   Object.entries(a.attention).forEach(([c, text]) => {
-    const key = `stuck:${c}`;
-    wantLog(s, c);
-    items.push({ key, card: c, kind: "Stuck", c: "--block", body: `
-      <div class="what"><span class="mono">${esc(c)}</span> ${rich(s.cards[c]?.title || "")}</div>
+    const key = `stuck:${c}`, b = batchById(s, c);
+    const logId = b ? b.run_card : c, open = b ? b.current || b.cards[0] : c;  // a batch's session is logged under its card
+    if (logId) wantLog(s, logId);
+    items.push({ key, card: open, kind: "Stuck", c: "--block", body: `
+      <div class="what"><span class="mono">${esc(c)}</span> ${rich(b ? b.name : s.cards[c]?.title || "")}${b ? ` <span class="tag">batch ${progress(b)}</span>` : ""}</div>
       <div class="note">${rich(humanStuck(text))}</div>
-      ${logs[c]?.text ? `<div class="evidence"><h3>The session's last lines</h3>${lastLines(c)}</div>` : ""}
-      <div class="actions">${DISPATCH ? btn(`data-act="retry" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-retry"`, "Retry", "primary") : ""}${btn(`data-act="takeover" data-card="${esc(c)}" data-fkey="${esc(key)}-take"`, "Take over")}${btn(`data-open="${esc(c)}"`, "Details", "quiet")}</div>` });
+      ${logs[logId]?.text ? `<div class="evidence"><h3>The session's last lines</h3>${lastLines(logId)}</div>` : ""}
+      <div class="actions">${DISPATCH ? btn(`data-act="retry" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-retry"`, "Retry", "primary") : ""}${btn(`data-act="takeover" data-card="${esc(c)}" data-fkey="${esc(key)}-take"`, "Take over")}${btn(`data-open="${esc(open)}"`, "Details", "quiet")}</div>` });
   });
   s.blockers.filter((b) => b.cards.length).forEach((b, i) => {
     const key = `blocker:${i}:${b.cards.join(",")}`;
@@ -753,12 +772,13 @@ function inboxItems(s) {
       <div class="note">${a.used ? "Fix the cause, then mark it resolved: the card carries on by itself." : "Fix the cause, then mark it resolved."}</div>
       <div class="actions">${btn(`data-act="resolve-blocker" data-text="${esc(b.text)}" data-primary data-fkey="${esc(key)}-ok"`, "Resolved", "primary")}${btn(`data-open="${esc(b.cards[0])}"`, "Details", "quiet")}</div>` });
   });
-  Object.entries(a.blocked_on || {}).filter(([c]) => !s.blockers.some((b) => b.cards.includes(c)) && !(a.queued || []).includes(c) && !a.live.includes(c) && !a.attention[c]).forEach(([c]) => {
-    const key = `unblock:${c}`;
-    items.push({ key, card: c, kind: "Blocked", c: "--block", body: `
-      <div class="what"><span class="mono">${esc(c)}</span> ${rich(s.cards[c]?.title || "")}</div>
+  Object.entries(a.blocked_on || {}).filter(([c]) => !s.blockers.some((b) => unitCards(s, c).some((m) => b.cards.includes(m))) && !(a.queued || []).includes(c)
+      && !a.live.includes(c) && !batchById(s, c)?.live && !a.attention[c]).forEach(([c]) => {
+    const key = `unblock:${c}`, b = batchById(s, c), open = b ? b.current || b.cards[0] : c;
+    items.push({ key, card: open, kind: "Blocked", c: "--block", body: `
+      <div class="what"><span class="mono">${esc(c)}</span> ${rich(b ? b.name : s.cards[c]?.title || "")}</div>
       <div class="note">Its session stopped on a blocker that names no card. When the cause is fixed, let it carry on.</div>
-      <div class="actions">${btn(`data-act="unblock" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-go"`, "Unblock and continue", "primary")}${btn(`data-open="${esc(c)}"`, "Details", "quiet")}</div>` });
+      <div class="actions">${btn(`data-act="unblock" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-go"`, "Unblock and continue", "primary")}${btn(`data-open="${esc(open)}"`, "Details", "quiet")}</div>` });
   });
   s.yours.forEach((c) => {
     const key = `yours:${c}`;
@@ -785,14 +805,18 @@ function renderInbox(s) {
   const kept = {};
   $("#inbox").querySelectorAll("[data-keep]").forEach((x) => (kept[x.id] = x.value));
   const focusKey = document.activeElement?.dataset?.fkey;
-  const notesOpen = $("#inbox .notes")?.open;
+  const notesOpen = $("#inbox .notes.heads")?.open, checksOpen = $("#inbox .notes.checks")?.open;
+  const checks = s.open_checks || [];
   $("#inbox-n").textContent = items.length ? items.length : "";
   $("#inbox-hint").hidden = !items.length;
   $("#inbox").innerHTML = (items.length
     ? items.map((it) => `<div class="inbox-item" tabindex="-1" data-item="${esc(it.key)}" data-fkey="item-${esc(it.key)}" data-card-of="${esc(it.card)}">
         <span class="kind" style="--c:var(${it.c});--c-ink:var(${ink(it.c)})"><i></i>${it.kind}</span><div>${it.body}</div></div>`).join("")
     : `<div class="all-clear">${icon("check")}Nothing needs you right now.</div>`)
-    + (notes.length ? `<details class="notes inbox-item" style="display:block"${notesOpen ? " open" : ""}><summary>${notes.length} heads-up${notes.length > 1 ? "s" : ""}</summary><ul>${notes.map((n) => `<li>${n}</li>`).join("")}</ul></details>` : "");
+    + (notes.length ? `<details class="notes heads inbox-item" style="display:block"${notesOpen ? " open" : ""}><summary>${notes.length} heads-up${notes.length > 1 ? "s" : ""}</summary><ul>${notes.map((n) => `<li>${n}</li>`).join("")}</ul></details>` : "")
+    // open checks wait for the owner's review in one go: a quiet line here, the full list on Activity
+    + (checks.length ? `<details class="notes checks inbox-item" style="display:block"${checksOpen ? " open" : ""}><summary>${checks.length} open check${checks.length > 1 ? "s" : ""} to review</summary><ul>${checks.map((c) =>
+        `<li><button type="button" class="link" data-goto-check="${esc(c.card)}" title="Show it in Activity, Open checks">${esc(c.card)}</button> ${rich(c.criterion)}: <b>${esc(c.verdict)}</b>${c.note ? ` (${rich(c.note)})` : ""}</li>`).join("")}</ul></details>` : "");
   Object.entries(kept).forEach(([id, v]) => { const x = document.getElementById(id); if (x) x.value = v; });
   if (focusKey) document.querySelector(`[data-fkey="${CSS.escape(focusKey)}"]`)?.focus();
   if (seenItems) items.filter((it) => !seenItems.has(it.key)).forEach((it) => document.querySelector(`[data-item="${CSS.escape(it.key)}"]`)?.classList.add("arrive"));
@@ -832,9 +856,13 @@ function apStatus(s) {
   if (!a.dispatcher) return `<b>Autopilot not running.</b> Start <code>supervisor.py … --serve --autopilot</code> to dispatch${lastTxt}.`;
   if (a.settings.auto && checked != null && checked > 60) return `<span class="warn">The dispatcher has not checked in for <span data-ago="${a.beat}">${ago(checked)}</span>: is supervisor.py still running?</span>`;
   if (!a.settings.auto) return `<b>Paused.</b> ${a.settings.paused_reason ? rich(a.settings.paused_reason) : "Press Resume to continue."}${lastTxt}`;
-  if (a.live.length) return `<b>Working</b> on ${a.live.map(esc).join(", ")}${beat}${lastTxt}`;
+  if (a.live.length) return `<b>Working</b> on ${[...new Set(a.live.map((id) => a.runs[id]?.batch || id))].map(esc).join(", ")}${beat}${lastTxt}`;
   if (s.done.length + s.waived.length === s.total) return `<b>Feature done.</b>${lastTxt}`;
-  const next = [...(a.queued || []), ...s.ready].find((id) => !a.live.includes(id) && s.cards[id].kind && s.cards[id].kind !== "owner" && !(a.manual || []).includes(id) && !a.attention[id]);
+  const next = [...(a.queued || []), ...s.ready, ...(s.ready_batches || []).map((b) => b.id)].find((id) => {
+    const b = batchById(s, id);
+    if ((a.manual || []).includes(id) || a.attention[id]) return false;
+    return b ? !b.live : !a.live.includes(id) && s.cards[id]?.kind && s.cards[id].kind !== "owner";
+  });
   if (next) return `<b>Between cards.</b> ${esc(next)} starts on the next check${beat}${lastTxt}`;
   const n = inboxCount(s);
   if (n) return `<b>Waiting for you:</b> ${n} item${n > 1 ? "s" : ""} in Needs you${beat}${lastTxt}`;
@@ -847,34 +875,52 @@ function renderSessions(s) {
   const status = apStatus(s);
   $("#ap-status").hidden = !status;
   $("#ap-status").innerHTML = status;
-  const running = Object.keys(s.cards).filter((id) => cardState(s, id) === "running");
-  $("#run-n").textContent = running.length || "";
-  $("#running").closest(".cols").classList.toggle("solo", running.length > 1 && !s.ready.length);
-  $("#running").innerHTML = running.length ? running.map((id) => {
-    const c = s.cards[id], live = a.live.includes(id);
+  // a batch's live session is one card, keyed by the card its run names (that is what /api/live follows)
+  const liveBatches = (s.batches || []).filter((b) => b.live && b.run_card);
+  const running = Object.keys(s.cards).filter((id) => cardState(s, id) === "running" && !liveBatches.some((b) => b.cards.includes(id)));
+  const queued = (a.queued || []).filter((id) => !a.live.includes(id) && !batchById(s, id)?.live);
+  const readyBatches = (s.ready_batches || []).map((b) => b.id);
+  const readyIds = [...queued, ...s.ready.filter((id) => !queued.includes(id)), ...readyBatches.filter((id) => !queued.includes(id))];
+  const nRunning = running.length + liveBatches.length;
+  $("#run-n").textContent = nRunning || "";
+  $("#running").closest(".cols").classList.toggle("solo", nRunning > 1 && !readyIds.length);
+  const batchCard = (b) => {
+    const key = b.run_card, cur = b.current || key;
+    return `<div class="live-card" data-live="${esc(key)}"><div class="top-line"><span><span class="pulse" aria-hidden="true"></span><button type="button" class="what" data-open="${esc(cur)}"><span class="mono">${esc(b.id)}</span> ${rich(b.name)}</button></span>
+      <span class="meta"><span class="tag">batch ${progress(b)}</span>${b.current ? `<span class="tag">on ${esc(b.current)}</span>` : ""}${b.effort ? `<span class="tag">effort ${esc(b.effort)}</span>` : ""}</span></div>
+      <div data-live-body="${esc(key)}">${liveBody(key)}</div></div>`;
+  };
+  $("#running").innerHTML = nRunning ? liveBatches.map(batchCard).join("") + running.map((id) => {
+    const c = s.cards[id], live = a.live.includes(id), bid = a.runs[id]?.batch;
     return `<div class="live-card" data-live="${esc(id)}"><div class="top-line"><span>${live ? '<span class="pulse" aria-hidden="true"></span>' : ""}<button type="button" class="what" data-open="${esc(id)}"><span class="mono">${esc(id)}</span> ${rich(c.title)}</button></span>
-      <span class="meta">${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}${c.model ? `<span class="tag">${esc(c.model)}</span>` : ""}${live ? "" : `<span class="tag">by hand</span>`}</span></div>
+      <span class="meta">${bid ? `<span class="tag">${esc(bid)}</span>` : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}${c.model ? `<span class="tag">${esc(c.model)}</span>` : ""}${live ? "" : `<span class="tag">by hand</span>`}</span></div>
       <div data-live-body="${esc(id)}">${live ? liveBody(id) : '<div class="note">Started by hand: its progress is in its own session.</div>'}</div></div>`;
   }).join("") : `<div class="empty">No session is running.</div>`;
 
   const auto = a.dispatcher && a.settings.auto;
   $("#next-hint").textContent = auto ? "The autopilot starts these as room frees up" : a.dispatcher ? "Autopilot paused: start them yourself" : DISPATCH ? "" : "Paste a line into a fresh session";
-  const queued = (a.queued || []).filter((id) => !a.live.includes(id));
-  const readyIds = [...queued, ...s.ready.filter((id) => !queued.includes(id))];
   $("#ready-n").textContent = readyIds.length || "";
   if (!readyIds.length) {
     $("#next").innerHTML = `<div class="empty">Nothing is ready${s.doing.length ? `; waiting for ${s.doing.map(esc).join(", ")}` : ""}.</div>`;
     return;
   }
+  const startOrCopy = (id, line) => DISPATCH && a.dispatcher ? `<button type="button" data-act="start" data-card="${esc(id)}" data-fkey="start-${esc(id)}">Start now</button>`
+    : line ? `<button type="button" data-copy="${esc(line)}" data-label="Copy line">Copy line</button>` : "";
+  const queuedTag = `<span class="tag p">queued${a.settings.auto ? "" : " · resume to start"}</span>`;
   $("#next").innerHTML = readyIds.map((id) => {
-    const c = s.cards[id], opens = s.unblocks[id] || [];
-    const act = queued.includes(id) ? `<span class="tag p">queued${a.settings.auto ? "" : " · resume to start"}</span>`
-      : c.kind === "owner" ? '<span class="note" style="margin:0">Your card</span>'
-      : DISPATCH && a.dispatcher ? `<button type="button" data-act="start" data-card="${esc(id)}" data-fkey="start-${esc(id)}">Start now</button>`
-      : c.start_with ? `<button type="button" data-copy="${esc(c.start_with)}" data-label="Copy line">Copy line</button>` : "";
+    const opens = s.unblocks[id] || [], b = batchById(s, id);
+    const unblocks = opens.length ? `<span class="note" style="flex-basis:100%;margin:0">Unblocks ${opens.map(esc).join(", ")}</span>` : "";
+    if (b) {  // one row for the whole batch: one session runs its cards in order
+      const act = queued.includes(id) ? queuedTag : startOrCopy(id, b.start_with);
+      return `<div class="row"><button type="button" class="what" data-open="${esc(b.current || b.cards[0])}"><span class="mono">${esc(id)}</span> ${rich(b.name)}</button>
+        <span class="meta"><span class="tag">batch · ${b.cards.length} card${b.cards.length === 1 ? "" : "s"}</span>${b.effort ? `<span class="tag">effort ${esc(b.effort)}</span>` : ""}${act}</span>
+        <span class="note" style="flex-basis:100%;margin:0"><span class="mono">${b.cards.map(esc).join(" → ")}</span>${b.finished ? ` · ${progress(b)} finished` : ""}</span>${unblocks}</div>`;
+    }
+    const c = s.cards[id];
+    const act = queued.includes(id) ? queuedTag : c.kind === "owner" ? '<span class="note" style="margin:0">Your card</span>' : startOrCopy(id, c.start_with);
     return `<div class="row"><button type="button" class="what" data-open="${esc(id)}"><span class="mono">${esc(id)}</span> ${rich(c.title)}</button>
       <span class="meta">${c.parallel ? '<span class="tag p">[P]</span>' : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}${c.kind ? `<span class="tag">${esc(c.kind)}</span>` : ""}${act}</span>
-      ${opens.length ? `<span class="note" style="flex-basis:100%;margin:0">Unblocks ${opens.map(esc).join(", ")}</span>` : ""}</div>`;
+      ${unblocks}</div>`;
   }).join("");
 }
 
@@ -1004,6 +1050,10 @@ function renderBoard(s) {
     cols[cat === "waived" ? "done" : cat === "stuck" ? "blocked" : cat].push(id);
   });
   const names = { ...Object.fromEntries(Object.entries(STATES).map(([k, v]) => [k, v.label])), blocked: "Blocked or stuck" };
+  const batches = s.batches || [];
+  $("#board-batches").hidden = !batches.length;
+  $("#board-batches").innerHTML = batches.length ? `<span>Batches</span>` + batches.map((b) =>
+    `<span><span class="mono">${esc(b.id)}</span> ${rich(b.name)} <b>${progress(b)}</b>${b.status === "done" ? "" : ` · ${esc({ running: "running", ready: "ready", waiting: "waiting" }[b.status] || b.status)}`}</span>`).join("") : "";
   const before = {};
   if (!REDUCE.matches && view === "board") $("#board").querySelectorAll(".tile[data-open]").forEach((t) => (before[t.dataset.open] = t.getBoundingClientRect()));
   $("#board").innerHTML = Object.entries(cols).map(([k, ids]) => {
@@ -1011,8 +1061,9 @@ function renderBoard(s) {
     const tiles = list.map((id) => {
       const c = s.cards[id], cat = cardState(s, id);
       const sub = k === "done" ? (s.status[id] === "waived" ? "waived" : blank(s.rows[id]?.date) ? "" : s.rows[id].date) : why(s, id);
-      return `<button type="button" class="tile" style="--c:var(${STATES[cat].c})" data-open="${esc(id)}" aria-label="${esc(id)} ${esc(plain(c.title))}: ${STATES[cat].label}${sub ? ", " + esc(sub) : ""}">
-        <span class="id"><i></i>${esc(id)}${c.parallel ? " [P]" : ""}</span><span class="t">${rich(c.title)}</span>${sub ? `<span class="why">${esc(sub)}</span>` : ""}</button>`;
+      const b = batchOf(s, id), inBatch = b ? `in batch ${b.id} ${b.name}, ${progress(b)} finished` : "";
+      return `<button type="button" class="tile" style="--c:var(${STATES[cat].c})" data-open="${esc(id)}" aria-label="${esc(id)} ${esc(plain(c.title))}: ${STATES[cat].label}${sub ? ", " + esc(sub) : ""}${inBatch ? ", " + esc(plain(inBatch)) : ""}">
+        <span class="id"><i></i>${esc(id)}${c.parallel ? " [P]" : ""}${b ? `<span class="tag" title="${esc(plain(inBatch))}">${esc(b.id)}</span>` : ""}</span><span class="t">${rich(c.title)}</span>${sub ? `<span class="why">${esc(sub)}</span>` : ""}</button>`;
     }).join("");
     const more = list.length < ids.length ? `<button type="button" class="more" data-more>Show all ${ids.length}</button>` : "";
     return `<div class="col${ids.length ? "" : " none"}"><div class="col-head"><span class="sw" style="background:var(${STATES[k].c})"></span>${names[k]}<span class="n">${ids.length}</span></div>${more}${tiles || '<div class="empty">None</div>'}</div>`;
@@ -1094,6 +1145,10 @@ function renderScreens(s) {
 function renderDrift(s) {
   $("#drift").innerHTML = s.drift.length ? s.drift.map((d) => `<div class="drift-item">${rich(d)}</div>`).join("")
     : `<div class="ok-line">${icon("check")}tasks.md, RESUME and the hand-offs agree.</div>`;
+  const checks = s.open_checks || [];
+  $("#checks").innerHTML = checks.length
+    ? checks.map((c) => `<div class="drift-item" data-check="${esc(c.card)}"><span class="mono">${esc(c.card)}</span> ${rich(c.criterion)}: <b>${esc(c.verdict)}</b>${c.note ? ` (${rich(c.note)})` : ""}</div>`).join("")
+    : `<div class="ok-line">${icon("check")}Every done card's checks pass with evidence.</div>`;
 }
 
 function renderFeed() {
@@ -1123,18 +1178,20 @@ function markdown(text) {
 async function openDrawer(id, fresh = true) {
   const s = state, c = s.cards[id];
   if (!c) return;
-  const cat = cardState(s, id), row = s.rows[id] || {}, a = s.autopilot, run = a.runs[id];
-  const manual = (a.manual || []).includes(id), done = finished(s, id);
+  const cat = cardState(s, id), row = s.rows[id] || {}, a = s.autopilot, inBatch = batchOf(s, id), ob = openBatch(s, id);
+  // a card of a batch shows its batch's session (logged under the card that session started on)
+  const runId = a.runs[id] ? id : inBatch?.run_card && a.runs[inBatch.run_card] ? inBatch.run_card : id, run = a.runs[runId];
+  const manual = (a.manual || []).includes(id) || (ob && (a.manual || []).includes(ob.id)), done = finished(s, id);
   const link = (x) => `<button type="button" class="link" data-open="${esc(x)}">${esc(x)}</button> <span class="hint">${esc(STATES[cardState(s, x)]?.label || "")}</span>`;
   const needed = neededBy(s, id), reasons = s.waiting[id] || [];
   const oldMd = $("#drawer").querySelector(".md");
   const handoff = oldMd && oldMd.dataset.card === id ? oldMd.outerHTML : null;
   const approvals = s.approvals.filter((x) => x.card === id);
-  if (run) wantLog(s, id);
+  if (run) wantLog(s, runId);
   const gate = s.gates.includes(id), pairs = gate ? stageShots(s, id) : (s.screens?.[id] ? [[id, s.screens[id]]] : []);
   const sessionActions = run ? (run.live ? `<button type="button" class="danger" data-act="stop" data-card="${esc(id)}">Stop session</button>`
     : manual ? `<button type="button" data-copy="claude --resume ${esc(run.session)}" data-label="Copy resume command">Copy resume command</button>${DISPATCH && !done ? `<button type="button" data-act="retry" data-card="${esc(id)}">Hand back to autopilot</button>` : ""}`
-    : done ? "" : `${DISPATCH && (cat === "blocked" || (a.blocked_on || {})[id]) ? `<button type="button" data-act="unblock" data-card="${esc(id)}">Unblock and continue</button>` : ""}${DISPATCH ? `<button type="button" data-act="retry" data-card="${esc(id)}">Retry</button>` : ""}<button type="button" data-act="takeover" data-card="${esc(id)}">Take over</button>`) : "";
+    : done ? "" : `${DISPATCH && (cat === "blocked" || (a.blocked_on || {})[id] || (ob && (a.blocked_on || {})[ob.id])) ? `<button type="button" data-act="unblock" data-card="${esc(id)}">Unblock and continue</button>` : ""}${DISPATCH ? `<button type="button" data-act="retry" data-card="${esc(id)}">Retry</button>` : ""}<button type="button" data-act="takeover" data-card="${esc(id)}">Take over</button>`) : "";
   const note = cat !== "done" && cat !== "waived" ? why(s, id) : "";
   const drawer = $("#drawer"), focused = drawer.contains(document.activeElement) ? document.activeElement : null;
   const focusKey = focused ? (focused.id || focused.dataset.fkey || "") : "";
@@ -1143,7 +1200,7 @@ async function openDrawer(id, fresh = true) {
     <div class="drawer-top"><span class="pill" style="--c:var(${STATES[cat].c});--c-ink:var(${ink(STATES[cat].c)})">${STATES[cat].label}</span>
       <button type="button" class="quiet" id="close-drawer" aria-label="Close details">${icon("x")}</button></div>
     <h3 id="drawer-title" tabindex="-1"><span class="mono">${esc(id)}</span> ${rich(c.title)}</h3>
-    <div class="meta">${c.stage ? `<span class="tag">${esc(c.stage)}</span>` : ""}${c.kind ? `<span class="tag">${esc(c.kind)}</span>` : ""}${c.parallel ? '<span class="tag p">[P]</span>' : ""}${c.size ? `<span class="tag">size ${esc(c.size)}</span>` : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}</div>
+    <div class="meta">${inBatch ? `<span class="tag">batch ${esc(inBatch.id)} · ${progress(inBatch)}</span>` : ""}${c.stage ? `<span class="tag">${esc(c.stage)}</span>` : ""}${c.kind ? `<span class="tag">${esc(c.kind)}</span>` : ""}${c.parallel ? '<span class="tag p">[P]</span>' : ""}${c.size ? `<span class="tag">size ${esc(c.size)}</span>` : ""}${c.effort ? `<span class="tag">effort ${esc(c.effort)}</span>` : ""}</div>
     ${note ? `<p class="note">${esc(note.replace(/^./, (x) => x.toUpperCase()))}</p>` : ""}
     ${gate ? `<div class="confirm"><b>This stage waits for your review.</b>${pairs.length ? shots(pairs, true) : '<span class="warn">No screenshots were saved for this stage.</span>'}
       ${actionBlock(`gate:${id}`, `<button type="button" class="primary" data-act="gate" data-gate="${esc(id)}" data-key="gate:${esc(id)}">Approve stage</button>`)}</div>` : ""}
@@ -1151,10 +1208,12 @@ async function openDrawer(id, fresh = true) {
       ${actionBlock(`approval:${p.card}:${p.n}`, `<button type="button" class="primary" data-act="approval" data-verdict="approved" data-n="${esc(p.n)}" data-card="${esc(id)}" data-key="approval:${esc(id)}:${esc(p.n)}">Approve</button><button type="button" data-act="approval" data-verdict="rejected" data-n="${esc(p.n)}" data-card="${esc(id)}" data-key="approval:${esc(id)}:${esc(p.n)}">Reject</button>`)}</div>`).join("")}
     <dl class="dl">
       ${done ? handoffBlock : ""}
-      ${run ? `<dt>Sessions</dt><dd>${run.sessions} · $${run.cost.toFixed(2)} · ${run.live ? "running now" : `last ended ${esc(run.ended)}`}${run.error ? `<div class="note">${rich(run.error)}</div>` : ""}
+      ${run ? `<dt>Sessions${run.batch ? ` (batch ${esc(run.batch)})` : ""}</dt><dd>${run.sessions} · $${run.cost.toFixed(2)} · ${run.live ? "running now" : `last ended ${esc(run.ended)}`}${run.error ? `<div class="note">${rich(run.error)}</div>` : ""}
         ${manual ? `<div class="note">You took this card over; the autopilot leaves it alone.</div>` : ""}
         ${sessionActions ? `<div class="actions">${sessionActions}</div>` : ""}</dd><dt>${run.live ? "Live transcript" : "Transcript"}</dt><dd><div id="tx-slot"></div></dd>` : ""}
-      ${!done && c.start_with ? `<dt>Start with</dt><dd><div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}" data-label="Copy">Copy</button></div></dd>` : ""}
+      ${inBatch ? `<dt>Batch</dt><dd><span class="mono">${esc(inBatch.id)}</span> ${rich(inBatch.name)} · ${progress(inBatch)} finished${inBatch.effort ? ` · effort ${esc(inBatch.effort)}` : ""}<br>${inBatch.cards.map((x) => x === id ? `<span class="mono">${esc(x)}</span> <span class="hint">this card</span>` : link(x)).join("<br>")}${ob ? `<div class="note">One session runs these cards in order; start the batch, not the card.</div>` : ""}</dd>` : ""}
+      ${ob && ob.start_with ? `<dt>Start with (batch ${esc(ob.id)})</dt><dd><div class="paste"><code>${esc(ob.start_with)}</code><button type="button" data-copy="${esc(ob.start_with)}" data-label="Copy">Copy</button></div></dd>`
+        : !ob && !done && c.start_with ? `<dt>Start with</dt><dd><div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}" data-label="Copy">Copy</button></div></dd>` : ""}
       ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : r.kind === "gate" ? `your review of stage ${link(r.on)}` : r.kind === "owner" ? `your answer: ${rich(r.on)}` : `blocker: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
       <dt>After</dt><dd>${c.after.length ? c.after.map(link).join("<br>") : `<span class="hint">${esc(c.after_text || "nothing")}</span>`}</dd>
       <dt>Needed by</dt><dd>${needed.length ? needed.map(link).join("<br>") : '<span class="hint">no card waits for it</span>'}</dd>
@@ -1164,7 +1223,7 @@ async function openDrawer(id, fresh = true) {
       ${done ? "" : handoffBlock}
     </dl>`;
   drawer.querySelectorAll("button, a[href], input, select").forEach((el, i) => { if (!el.id && !el.dataset.fkey) el.dataset.fkey = `d${i}-${(el.textContent || "").trim().slice(0, 12)}`; });
-  if (run) mountTranscript(id);
+  if (run) mountTranscript(runId);
   if (focusKey && !drawer.hidden) (document.getElementById(focusKey) || drawer.querySelector(`[data-fkey="${CSS.escape(focusKey)}"]`) || $("#drawer-title")).focus();
   if ($("#drawer").hidden) {
     opener = document.activeElement;
@@ -1297,6 +1356,10 @@ function diff(a, b) {
     else if (label(a, id) !== label(b, id)) out.push(`${id}: ${label(a, id)} → ${label(b, id)}`);
   });
   b.handoffs.filter((id) => !a.handoffs.includes(id)).forEach((id) => out.push(`Hand-off ${id}.md written`));
+  (b.batches || []).forEach((x) => {
+    const was = (a.batches || []).find((y) => y.id === x.id);
+    if (was && was.status !== x.status) out.push(`Batch ${x.id}: ${was.status} → ${x.status}`);
+  });
   b.approvals.filter((x) => !a.approvals.some((y) => y.n === x.n && y.card === x.card)).forEach((x) => out.push(`${x.card} asks you to approve ${x.n}`));
   b.gates.filter((g) => !a.gates.includes(g)).forEach((g) => out.push(`Stage ${g} finished and waits for your review`));
   const q = (d) => `${d.n}: ${d.question}`, aq = a.open_decisions.map(q), bq = b.open_decisions.map(q);
@@ -1364,6 +1427,15 @@ document.addEventListener("click", (e) => {
   if (e.target.closest("[data-tx-latest]")) { const box = tx.el?.querySelector(".tx"); if (box) { box.scrollTop = box.scrollHeight; tx.follow = true; } return; }
   const tab = e.target.closest("[data-tab]");
   if (tab) return show(tab.dataset.tab);
+  const check = e.target.closest("[data-goto-check]");
+  if (check) {  // from Now's open-checks line to the full list on Activity
+    show("activity");
+    $('section[aria-labelledby="h-checks"]').scrollIntoView({ block: "start", behavior: REDUCE.matches ? "auto" : "smooth" });
+    document.querySelectorAll(`#checks [data-check="${CSS.escape(check.dataset.gotoCheck)}"]`).forEach((row) => {
+      row.classList.remove("fresh"); void row.offsetWidth; row.classList.add("fresh");
+    });
+    return;
+  }
   const u = e.target.closest("[data-undo]");
   if (u) return undo(u.dataset.undo);
   const action = e.target.closest("[data-act]");

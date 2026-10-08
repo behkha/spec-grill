@@ -159,7 +159,7 @@ Not grilled. `tasks.md` is written as the **entry point of every implementation 
 The file has six fixed sections:
 
 1. **Session protocol** — one card per session, renamed to the card it completes; what to read and in what order; finding code by symbol, not line number; preconditions; staying in scope; the context budget; which steps need the owner's yes; how to finish (verify, commit, hand-off note, tick, stop).
-2. **Templates** — the hand-off note each card leaves behind and the `RESUME.md` state file (status table, decisions waiting on the owner, locks, blockers).
+2. **Templates** — the hand-off note each card leaves behind (with a Checks table: each Done when criterion, its verdict and its evidence, and the approaches that were tried and failed) and the `RESUME.md` state file (status table, decisions waiting on the owner, locks, blockers).
 3. **Traceability** — every requirement to its cards, every success criterion to the card that measures it, every invariant to the test that pins it. Gaps get flagged.
 4. **Cards** — grouped into stages, each stage closed by a checkpoint card that merges, runs the checks and reviews the stage's diff (and, when the stage built screens, reviews their design from fresh screenshots). With an interface, stages follow user scenarios end to end — storage, API and screens together — so the UI is built from the first stage, not left for last. Every card carries *fulfills · after · size · effort · kind* (`backend`, `frontend`, `fullstack`, or `owner` for cards only you can do), a paste-ready **Start with** line, **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** and **Never**. Cards marked `[P]` may run side by side in their own worktree. Interface cards verify by looking: they drive their screens in a browser and save screenshots at phone and desktop width to `state/screens/`.
 5. **Backlog** — cards added during execution (review findings, work split off when a session ran out of room).
@@ -224,18 +224,18 @@ python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retrie
 It opens `http://127.0.0.1:8765` (local only, no dependencies) and refreshes every 3 seconds:
 
 - **Progress** — one bar split by status, with counts, and the back-end / front-end balance.
-- **Run next** — every ready card with its effort tier and a copy button for its **Start with** line (or a Start button, with the autopilot), plus which ones may run side by side.
-- **Needs you** — approvals to give, stages to review, stuck cards, your own cards, open decisions (answer them right there), blockers, stalled cards, a held deploy lock, and a warning when the interface falls behind the back end.
+- **Run next** — every ready card with its effort tier and a copy button for its **Start with** line (or a Start button, with the autopilot), plus which ones may run side by side. A ready batch of small backlog cards is one row: its id and name, its cards in order, its effort and its own line.
+- **Needs you** — approvals to give, stages to review, stuck cards, your own cards, open decisions (answer them right there), blockers, stalled cards, a held deploy lock, and a warning when the interface falls behind the back end; open checks wait there in one quiet, collapsed line that jumps to the full list.
 - **Screens** — the screenshots every interface card saved, card by card.
 - **Live sessions** — with the autopilot, each running session shows its elapsed time, time since its last output, its to-do progress, the step it is on and its latest lines, refreshed every 2 seconds; its drawer follows the whole transcript as it grows.
-- **Board** — running, ready, waiting, blocked and done columns.
+- **Board** — running, ready, waiting, blocked and done columns; a batch's cards carry its tag, and each batch's progress shows above the columns.
 - **Who waits for whom** — the dependency map; click a card to trace what it waits for and what waits for it, and open its details (RESUME row, hand-off note, the log of its session).
 - **Commits and the autopilot's status** — the latest commit (with its card) under the progress bar, a toast when a card commits, the commit list on every branch, and a line saying what the autopilot is doing right now: working on which cards, between cards and what starts next, waiting for you, paused, or a dispatcher that has stopped checking in.
 - **Activity** and **Drift** — what changed since you opened the page, and where the files disagree.
 
 A picker switches between every feature in `specs/`. The supervisor session offers to start it for you; just say "show the dashboard."
 
-Add `--watch` instead for a live view in a terminal that redraws whenever the state changes; leave it open in a terminal tab and it costs nothing. `--wait` blocks until something changes and prints what did (that's what wakes the supervisor session); `--json` is for your own scripts. It also flags stalled cards (doing, but no commit or hand-off for 4 hours) and drift (a card ticked in `tasks.md` but not done in `RESUME.md`, done with no hand-off, and so on).
+Add `--watch` instead for a live view in a terminal that redraws whenever the state changes; leave it open in a terminal tab and it costs nothing. `--wait` blocks until something changes and prints what did (that's what wakes the supervisor session); `--json` is for your own scripts. It also flags stalled cards (doing, but no commit or hand-off for 4 hours), drift (a card ticked in `tasks.md` but not done in `RESUME.md`, done with no hand-off or no Checks table, a commit that changes a pinning test outside the card that writes it until a checkpoint records `Pins reviewed up to <commit>` in RESUME, and so on), and open checks for you to decide (a check a done card recorded as `fail` or `unresolved`, a pass without evidence, a waiver you have not granted). `--lessons` prints what each card and each batch really took (runs, tries, cost, hours beside its size and effort); the close card appends it to `specs/lessons.md`, which the next feature's task drafting reads.
 
 ### The autopilot
 
@@ -247,7 +247,7 @@ python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retrie
 
 It needs the `claude` CLI logged in and the project folder trusted (run `claude` there once). Then it:
 
-- **starts every ready card** in its own headless session (`claude -p`): the card's **Start with** line, its effort tier and model, the session named after the card, a dollar cap, and up to 3 sessions at once (at most one card without `[P]`, since those share the integration worktree);
+- **starts every ready card** in its own headless session (`claude -p`): the card's **Start with** line, its effort tier and model, the session named after the card, a dollar cap, and up to 3 sessions at once (at most one card without `[P]` or batch, since those share the integration worktree). A ready **batch** of small cards gets one session for all of them, in order, from the batch's own line;
 - **asks you through the dashboard**, never in a chat: a step that needs your yes (a deploy, a paid run) becomes an Approve / Reject button, and the session resumes with your answer; open questions get an answer box with the recommended default filled in;
 - **holds each stage for your review**: after a checkpoint, the next stage waits until you have looked at the findings and the screenshots and pressed "Approve stage";
 - **runs as the right account**: if you have several Claude accounts, §6's `**Runs as:** you@example.com via ~/.local/bin/claude-work` makes sessions start with that launcher and pauses the autopilot when it is logged in as anyone else; with Chrome on, a quick check first confirms the sessions' Chrome reaches the app signed in;

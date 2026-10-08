@@ -7,6 +7,8 @@
     supervisor.py TASKS --watch      live view for a terminal, redrawn when the state changes
     supervisor.py TASKS --wait       block until the state differs from the last --wait
                                      snapshot, print what changed and the report, exit
+    supervisor.py TASKS --lessons    what each card took (runs, tries, cost, hours), for the
+                                     close card's retro
     supervisor.py TASKS --serve      dashboard at http://127.0.0.1:8765 for every feature
                                      beside TASKS (local only; add --open to open a browser)
     supervisor.py TASKS --serve --autopilot
@@ -25,6 +27,7 @@ library only.
 import argparse
 import datetime as dt
 import fcntl
+import fnmatch
 import glob
 import json
 import os
@@ -41,6 +44,9 @@ SECTION_RE = re.compile(r"^#{2,3} (.+?)\s*$", re.M)
 COND_RE = re.compile(r"\(([^)]*\bif\b[^)]*)\)")  # "(T036 if German)": a dependency under a condition
 BEFORE_RE = re.compile(rf"\bbefore:?\s+({ID})")
 HEAD_RE = re.compile(rf"^#{{3,4}} ({ID})((?: \[P\])?) — (.+?)\s*$", re.M)
+BATCH = r"B\d+"  # §5's batches of small cards: B1, B2, … (not cards: they are never in order or progress)
+BATCH_CHECK_RE = re.compile(rf"^- \[([ xX])\] ({BATCH})\b(?: (.+?))?\s*$", re.M)
+EFFORT_RANK = ["low", "medium", "high", "xhigh", "max"]
 FINISHED = {"done", "waived"}
 STATUSES = {"todo", "doing", "done", "blocked", "waived"}
 OPEN_ANSWERS = {"", "-", "—", "?", "tbd", "todo", "open", "pending"}
@@ -232,6 +238,55 @@ def read_meta(c: dict, body: str) -> None:
         c["start_with"] = found.group(1)
 
 
+def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
+    """§5's batches: every table whose header has a "batch…" and a "cards…" column, one row per batch
+    (id, name, its cards in order, effort, the backticked Start with), ticked by its "- [x] B1 …" line.
+    Returns the batches in order and the drift they show (unknown cards, a card in two batches, no
+    Start with)."""
+    found: dict = {}
+    for _, lines in table_blocks(text):
+        rows = [{head_cell(k): v for k, v in row.items()} for row in table(lines)]
+        head = [head_cell(c) for c in cells(lines[0])]
+        if not (any(h.startswith("batch") for h in head) and any(h.startswith("cards") for h in head)):
+            continue
+        for row in rows:
+            bid = re.search(rf"\b{BATCH}\b", column(row, "batch"))
+            if not bid or bid.group(0) in found:
+                continue
+            start = re.search(r"`([^`]+)`", column(row, "start"))
+            effort = re.sub(r"[`*_]", "", column(row, "effort")).strip().lower().split()
+            found[bid.group(0)] = {
+                "id": bid.group(0), "name": re.sub(r"[`*]", "", column(row, "name")).strip(),
+                "named": ids_in(column(row, "cards"), order), "effort": effort[0] if effort else "",
+                "start_with": start.group(1).strip() if start else "", "ticked": False, "row": True,
+            }
+    for m in BATCH_CHECK_RE.finditer(text):
+        b = found.setdefault(m.group(2), {"id": m.group(2), "name": "", "named": [], "effort": "",
+                                          "start_with": "", "ticked": False, "row": False})
+        b["ticked"] |= m.group(1).lower() == "x"
+        b["name"] = b["name"] or (m.group(3) or "").strip()
+    drift, owner = [], {}
+    batches = []
+    for b in found.values():
+        b["cards"] = []
+        for c in b.pop("named"):
+            if c not in cards:
+                drift.append(f"batch {b['id']} names {c}, which tasks.md does not define")
+            elif c in owner:
+                drift.append(f"{c} is in two batches ({owner[c]}, {b['id']}); it runs with {owner[c]}")
+            else:
+                owner[c] = b["id"]
+                b["cards"].append(c)
+        if not b.pop("row"):
+            drift.append(f"batch {b['id']} is in the checklist but has no row in §5's batch table")
+        elif not b["cards"]:
+            drift.append(f"batch {b['id']} names no card")
+        elif not b["start_with"]:
+            drift.append(f"batch {b['id']} has no Start with line (a backticked line in its table row)")
+        batches.append(b)
+    return batches, drift
+
+
 def runs_as(text: str) -> dict:
     """tasks.md §6: "**Runs as:** owner@example.com via `~/.local/bin/claude-work`" (the account the
     feature's sessions must use, and the CLI launcher logged in as it) and "**App URL:** http://…" (the
@@ -285,11 +340,14 @@ def section(secs: dict, name: str) -> list:
     return next((lines for key, lines in secs.items() if key.startswith(name)), [])
 
 
+def cells(line: str) -> list:
+    return [cell.strip() for cell in PIPE_RE.split(line.strip().strip("|"))]
+
+
 def table(lines: list) -> list:
     rows = [line.strip() for line in lines if line.strip().startswith("|")]
     if not rows:
         return []
-    cells = lambda line: [cell.strip() for cell in PIPE_RE.split(line.strip().strip("|"))]  # noqa: E731
     head = [h.lower() for h in cells(rows[0])]
     out = []
     for row in rows[1:]:
@@ -302,6 +360,216 @@ def table(lines: list) -> list:
 
 def column(row: dict, name: str) -> str:
     return next((v for k, v in row.items() if k.startswith(name)), "")
+
+
+VERDICTS = {  # a Checks row's verdict, judged by its first word
+    "pass": {"pass", "passed", "ok", "green", "yes"},
+    "fail": {"fail", "failed", "failing", "red", "no"},
+    "unresolved": {"unresolved", "open", "pending", "unknown", "untested", "blocked"},
+    "waived": {"waived", "waiver"},
+}
+NO_EVIDENCE = OPEN_ANSWERS | {"n/a", "na", "none", "tbd", "–", "—", "-"}
+# a session that stopped to wait for the owner; is_try() leaves it out, here and in autopilot.py
+WAITED = re.compile(r"AUTOPILOT: (?:WAITING FOR (?:DECISION|APPROVAL)|BLOCKED)")
+REVIEWED_RE = re.compile(r"Pins reviewed up to[\s`*:]*([0-9a-f]{7,40})\b", re.I)
+GIT: dict = {}  # cached git answers: the repo root, the pin history (per ref state), ancestry
+
+
+def flat(value, limit: int = 80, cell: bool = True) -> str:
+    """On one line and at most limit characters; as a table cell (cell), with its pipes escaped."""
+    text = re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
+    text = PIPE_RE.sub(r"\\|", text) if cell else text
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def head_cell(cell: str) -> str:
+    """A header cell as plain lowercase words: "**Criterion** (Done when)" -> "criterion (done when)"."""
+    return re.sub(r"[*`_]", "", cell).strip().lower()
+
+
+def head_index(head: list, name: str, default: int) -> int:
+    """The first header column that starts with name, else default."""
+    return next((i for i, h in enumerate(head) if h.startswith(name)), default)
+
+
+def verdict(cell: str) -> str:
+    """pass, fail, unresolved or waived, from a Checks row's verdict cell; "" when it is none of them."""
+    if "❌" in cell:
+        return "fail"
+    words = [w for w in re.split(r"[\s/]+", re.sub(r"[`*_.✅]", " ", cell).lower()) if w.strip(":;,()")]
+    if not words:
+        return "pass" if "✅" in cell else ""
+    word = words[0].strip(":;,()")
+    return next((name for name, group in VERDICTS.items() if word in group), "")
+
+
+def has_evidence(cell: str) -> bool:
+    plain = re.sub(r"[`*_]", "", cell).strip().lower().strip(". ")
+    return not (plain in NO_EVIDENCE or re.fullmatch(r"<.*>", plain, re.S))
+
+
+def table_blocks(text: str) -> list:
+    """Each Markdown table in text as (the heading above it, its lines), in order."""
+    lines, out, heading, i = text.splitlines(), [], "", 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("|"):
+            j = i
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                j += 1
+            out.append((heading, lines[i:j]))
+            i = j
+            continue
+        if re.match(r"#+\s", line) or re.fullmatch(r"\*\*[^*]+\*\*:?", line):
+            heading = re.sub(r"^#+\s*|\*", "", line).strip(" :").lower()
+        i += 1
+    return out
+
+
+def separator(line: str) -> bool:
+    return line.strip().startswith("|") and "-" in line and set(line.strip()) <= set("|-: ")
+
+
+def pinned_tests(text: str) -> dict:
+    """§3's "Rules pinned by a test" tables: each pinning test (path, glob or file::test) -> the card
+    that writes it. A table counts when its header has a "pinning …" and a "card" column."""
+    out = {}
+    for _, lines in table_blocks(text):
+        head = [head_cell(c) for c in cells(lines[0])]
+        pin, card = head_index(head, "pinning", -1), head_index(head, "card", -1)
+        if pin < 0 or card < 0 or len(lines) < 2 or not separator(lines[1]):
+            continue
+        for line in lines[2:]:
+            row = cells(line)
+            if separator(line) or len(row) <= max(pin, card):
+                continue
+            found = ID_RE.search(row[card])
+            for path in re.findall(r"`([^`]+)`", row[pin]) or [p for p in row[pin].split(",") if p.strip()]:
+                out[path.strip()] = found.group(0) if found else ""
+    return out
+
+
+def handoff_checks(text: str) -> list | None:
+    """The hand-off's Checks table, one dict per row (criterion, verdict as pass/fail/unresolved/waived
+    or "", raw, evidence, correction); None without one. The table under a "Checks" heading wins, else
+    the first whose header has a criterion and a verdict column."""
+    blocks = table_blocks(text)
+    heads = [[head_cell(c) for c in cells(lines[0])] for _, lines in blocks]
+    pick = next((i for i, (heading, _) in enumerate(blocks) if heading == "checks"), None)
+    if pick is None:
+        pick = next((i for i, h in enumerate(heads) if head_index(h, "criterion", -1) >= 0
+                     and head_index(h, "verdict", -1) >= 0), None)
+    if pick is None:
+        return None
+    head = heads[pick]
+    ic = head_index(head, "criterion", 0)
+    iv = head_index(head, "verdict", ic + 1)
+    ie = head_index(head, "evidence", iv + 1)
+    ix = head_index(head, "correction", ie + 1)
+    out = []
+    for line in blocks[pick][1][1:]:
+        row = cells(line)
+        if separator(line):
+            continue
+        cell = lambda i: row[i] if i < len(row) else ""  # noqa: E731
+        shift, said = 0, verdict(cell(iv))
+        if not said:  # a "|" left unescaped in the criterion pushes the verdict right
+            for j in range(iv + 1, len(row)):
+                if verdict(row[j]):
+                    shift, said = j - iv, verdict(row[j])
+                    break
+        criterion = " | ".join(row[ic: iv + shift]) if shift and ic < iv else cell(ic)
+        if criterion:
+            out.append({"criterion": criterion, "verdict": said, "raw": cell(iv + shift),
+                        "evidence": cell(ie + shift), "correction": cell(ix + shift)})
+    return out
+
+
+def git(root: str, *args: str, timeout: float = 5) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def git_root(folder: str) -> str:
+    if not GIT.get(("root", folder)):  # a folder that is not in a repo yet is asked again
+        out = git(folder, "rev-parse", "--show-toplevel", timeout=3)
+        GIT[("root", folder)] = out.stdout.strip() if out and out.returncode == 0 else ""
+    return GIT[("root", folder)]
+
+
+def pin_history(root: str, specs: list, tasks: str) -> tuple:
+    """Every non-merge commit on any branch that changes a path under specs, as (sha, time, subject,
+    paths), and when tasks (relative to root) was first committed (0: never). Read again only when a
+    ref moves, so the dashboard's refresh stays cheap."""
+    refs = git(root, "rev-parse", "--all", "HEAD", timeout=3)
+    key = ("pins", root, tuple(specs), tasks)
+    stamp = refs.stdout if refs else ""
+    if key in GIT and GIT[key][0] == stamp:
+        return GIT[key][1]
+    out = git(root, "log", "--all", "--full-history", "--no-merges", "-z",
+              "--format=%x1e%H%x1f%ct%x1f%s", "--name-only", "--", *specs, timeout=10)
+    commits: list = []
+    for token in (out.stdout.split("\0") if out and out.returncode == 0 else []):
+        if token.startswith("\x1e"):  # -z: "<marker>sha␟time␟subject", then "\nfirst path", "path", …
+            sha, ct, subject = (token[1:].split("\x1f", 2) + ["", ""])[:3]
+            commits.append((sha, int(ct) if ct.isdigit() else 0, subject, []))
+        elif token.strip("\n") and commits:
+            commits[-1][3].append(token.lstrip("\n"))
+    began = git(root, "log", "--all", "--format=%ct", "--diff-filter=A", "--", tasks, timeout=5)
+    began = min((int(x) for x in began.stdout.split() if x.isdigit()), default=0) if began else 0
+    GIT[key] = (stamp, (commits, began))
+    return commits, began
+
+
+def is_ancestor(root: str, sha: str, reviewed: str) -> bool:
+    key = ("ancestor", root, sha, reviewed)
+    if key not in GIT:
+        out = git(root, "merge-base", "--is-ancestor", sha, reviewed, timeout=3)
+        GIT[key] = bool(out and out.returncode == 0)
+    return GIT[key]
+
+
+def pin_drift(tasks: str, cards: dict, rows: dict, pins: dict, reviewed: str) -> list:
+    """A commit by any card but a pin's writer that changes the pin, since the feature began and not
+    yet reviewed by a checkpoint (RESUME's "Pins reviewed up to <commit>")."""
+    folder = os.path.realpath(os.path.dirname(tasks))  # git answers with real paths (/private/tmp)
+    root = git_root(folder)
+    if not root or not pins:
+        return []
+    project = os.path.relpath(os.path.dirname(os.path.dirname(folder)), root)  # the folder holding specs/
+    wanted = {}
+    for pin, writer in pins.items():
+        path = re.sub(r"^\./", "", pin.split("::", 1)[0].strip())
+        if not path:
+            continue
+        for form in dict.fromkeys([path] + ([os.path.normpath(os.path.join(project, path))] if project != "." else [])):
+            wanted[form] = (pin, writer)
+    recorded = []  # RESUME's commit column: (hash prefix, card)
+    for cid, row in rows.items():
+        recorded += [(h, cid) for h in re.findall(r"\b[0-9a-f]{7,40}\b", (row.get("commit") or "").lower())]
+    commits, began = pin_history(root, sorted(wanted), os.path.relpath(os.path.join(folder, "tasks.md"), root))
+    out, seen = [], set()
+    for sha, ct, subject, paths in commits:
+        if ct < began:
+            continue  # older than this feature: another feature's cards may share these ids
+        cid = next((x for x in ID_RE.findall(subject) if x in cards), "") \
+            or next((c for h, c in recorded if sha.startswith(h)), "")
+        if not cid:
+            continue  # no card to name: don't guess
+        for path in paths:
+            for form, (pin, writer) in wanted.items():
+                inside = fnmatch.fnmatchcase(path, form) or path.startswith(form.rstrip("/") + "/")  # a folder
+                if cid == writer or not inside or (cid, sha, path) in seen:
+                    continue
+                seen.add((cid, sha, path))
+                if reviewed and is_ancestor(root, sha, reviewed):
+                    continue
+                out.append(f"{cid}'s commit {sha[:7]} changes the pinning test {path}"
+                           f" (written by {writer or 'another card'}): check no test was weakened, then"
+                           " record `Pins reviewed up to <commit>` in RESUME")
+    return out
 
 
 def parse_resume(text: str) -> dict:
@@ -356,7 +624,9 @@ def parse_resume(text: str) -> dict:
             continue  # the same blocker written twice blocks once
         blockers.append({"text": item, "cards": blocker_subjects(item)})
     lock = next((line.strip() for line in section(secs, "deploy lock") if line.strip()), "")
-    return {"status": status, "decisions": decisions, "approvals": approvals, "blockers": blockers, "lock": lock}
+    reviewed = REVIEWED_RE.findall(text)  # a checkpoint's "Pins reviewed up to <commit>"; the last one counts
+    return {"status": status, "decisions": decisions, "approvals": approvals, "blockers": blockers, "lock": lock,
+            "pins_reviewed": reviewed[-1] if reviewed else ""}
 
 
 def blocker_subjects(item: str) -> list:
@@ -426,6 +696,8 @@ def ago(seconds: float) -> str:
 def build(tasks: str, stale_hours: float) -> dict:
     text = read(tasks)
     cards, order = parse_tasks(text)
+    batches, batch_drift = parse_batches(text, cards, order)
+    batch_of = {c: b["id"] for b in batches for c in b["cards"]}
     folder = os.path.dirname(tasks)
     state_dir = os.path.join(folder, "state")
     resume_path = os.path.join(state_dir, "RESUME.md")
@@ -479,20 +751,67 @@ def build(tasks: str, stale_hours: float) -> dict:
     registry = read_json(os.path.join(state_dir, "runs.json"), {})
     registry = registry if isinstance(registry, dict) else {}
     alive = {id(r): run_alive(r) for r in registry.get("runs", []) if not r.get("ended")}
+    live_runs = [r for r in registry.get("runs", []) if alive.get(id(r))]
+    batch_runs = {r["batch"]: r for r in live_runs if r.get("batch")}
+    for b in batches:  # done when every card is finished, or when its line is ticked (drift if not both)
+        if b["effort"] not in EFFORT_RANK:  # none written: the highest of its cards'
+            tiers = [cards[c]["effort"] for c in b["cards"] if cards[c]["effort"] in EFFORT_RANK]
+            b["effort"] = max(tiers, key=EFFORT_RANK.index) if tiers else b["effort"]
+        b["open"] = [c for c in b["cards"] if status[c] not in FINISHED]
+        b["finished"] = len(b["cards"]) - len(b["open"])
+        b["current"] = b["open"][0] if b["open"] else ""
+        b["live"] = b["id"] in batch_runs
+        b["running"] = False
+        everything = bool(b["cards"]) and not b["open"]
+        if b["ticked"] and b["cards"] and not everything:
+            batch_drift.append(f"batch {b['id']} is ticked in tasks.md but "
+                               + ", ".join(f"{c} is {status[c]}" for c in b["open"]))
+        elif everything and not b["ticked"]:
+            batch_drift.append(f"every card of batch {b['id']} is finished but its line in tasks.md is not ticked")
+        b["done"] = everything or b["ticked"]
+        mine = [r for r in registry.get("runs", []) if r.get("batch") == b["id"]]
+        b["run_card"] = (batch_runs.get(b["id"]) or (mine[-1] if mine else {})).get("card", "")
+    open_batch = {b["id"]: b for b in batches if not b["done"]}
     live_cards = [c for c in order if status[c] not in FINISHED and any(
-        r.get("card") == c and alive.get(id(r)) for r in registry.get("runs", []))]
+        r.get("card") == c for r in live_runs)]
+    # a live batch session works on its batch's first open card, whichever card it was started on
+    live_cards += [b["current"] for b in open_batch.values() if b["live"] and b["current"] not in live_cards]
     # a session the autopilot started is running even before it marks its row doing
     doing = [c for c in order if status[c] == "doing" or c in live_cards]
     serial_doing = [c for c in doing if not cards[c]["parallel"]]
+    for b in open_batch.values():
+        b["running"] = b["live"] or any(c in doing for c in b["cards"])
+        if b["running"] and not any(c in serial_doing for c in b["cards"]):
+            # a batch is serial: it holds the integration worktree whatever its cards say
+            serial_doing.append(next((c for c in b["cards"] if c in doing), b["current"]))
     ready = []
     for cid in order:
-        if status[cid] != "todo" or waits[cid] or cid in live_cards:
-            continue
+        if status[cid] != "todo" or waits[cid] or cid in live_cards or batch_of.get(cid) in open_batch:
+            continue  # a card of an unfinished batch runs with its batch, never on its own
         if not cards[cid]["parallel"] and serial_doing:
             # cards without [P] share the integration worktree: one at a time
             waits[cid].append({"kind": "worktree", "on": serial_doing[0], "status": "doing"})
             continue
         ready.append(cid)
+    for b in batches:
+        # what the batch waits for outside itself: its cards run in order, so waits inside it don't count
+        b["waits"] = []
+        for c in b.get("open", []):
+            for w in waits.get(c, []):
+                if not (w["kind"] == "card" and w["on"] in b["cards"]) and w not in b["waits"]:
+                    b["waits"].append(w)
+        if b["done"]:
+            b["status"] = "done"
+        elif not b["cards"]:
+            b["status"] = "waiting"  # names no card: drift, nothing to run
+        elif b["running"]:
+            b["status"] = "running"
+        else:
+            held = [c for c in serial_doing if c not in b["cards"]]
+            if not b["waits"] and held:
+                b["waits"].append({"kind": "worktree", "on": held[0], "status": "doing"})
+            b["status"] = "waiting" if b["waits"] else "ready"
+    ready_batches = [b for b in batches if b["status"] == "ready"]
 
     unblocks = {}
     for cid in doing + ready:
@@ -500,6 +819,12 @@ def build(tasks: str, stale_hours: float) -> dict:
             other for other in order
             if waits.get(other) and all(w.get("on") == cid for w in waits[other])
         ]
+    for b in batches:  # what finishing the whole batch unblocks: cards outside it that wait only on it
+        if b["status"] in ("ready", "running"):
+            unblocks[b["id"]] = [
+                other for other in order if other not in b["cards"] and waits.get(other)
+                and all(w.get("on") in b["cards"] for w in waits[other])
+            ]
 
     stamp = now().timestamp()
     stalled = []
@@ -530,6 +855,38 @@ def build(tasks: str, stale_hours: float) -> dict:
         for dep in cards[cid]["after"]:
             if dep not in cards:
                 drift.append(f"{cid} waits for {dep}, which tasks.md does not define")
+    drift += batch_drift
+    # features whose templates have a Checks table: a pinning test changed by any card but its writer is
+    # drift until a checkpoint reviews it, and every done card shows its checks with their evidence
+    open_checks = []
+    if re.search(r"\|\s*criterion\s*\|\s*verdict\s*\|", text, re.I):
+        drift += pin_drift(tasks, cards, resume["status"], pinned_tests(text), resume["pins_reviewed"])
+        review = read(os.path.join(state_dir, "design-review.md")).splitlines()
+        for cid in order:
+            if status[cid] != "done" or cid not in handoffs:
+                continue
+            checks = handoff_checks(read(os.path.join(handoff_dir, f"{cid}.md")))
+            if not checks:
+                drift.append(f"{cid} is done but its hand-off has no Checks table (criterion | verdict | evidence)")
+                continue
+            for r in checks:
+                said, note = r["verdict"], ""
+                if said == "pass" and has_evidence(r["evidence"]):
+                    continue
+                if said == "pass":
+                    note = "no evidence"
+                elif said == "waived":
+                    if any(cid in d["before"] and not d["open"] for d in resume["decisions"]):
+                        continue  # the owner's answer in RESUME's decisions waived it
+                    note = "waived without an owner's decision"
+                elif said == "fail":
+                    named = any(re.search(rf"\b{cid}\b", line) for line in review)
+                    note = "in design-review.md" if named else "not in design-review.md"
+                else:
+                    said = said or "unmarked"
+                    note = flat(r["correction"], 80, cell=False) if has_evidence(r["correction"]) else ""
+                open_checks.append({"card": cid, "criterion": flat(r["criterion"], 120, cell=False),
+                                    "verdict": said, "note": note})
     lock = resume["lock"]
     holder = ID_RE.search(lock or "")
     if holder and status.get(holder.group(0)) in FINISHED:
@@ -537,21 +894,25 @@ def build(tasks: str, stale_hours: float) -> dict:
 
     runs: dict = {}
     # a resumed session reports its running total, so a session costs the most any of its runs reported
+    # (a batch's session is resumed on later cards of the batch: it still counts once)
     session_cost: dict = {}
     for run in registry.get("runs", []):
-        key = (run.get("card", ""), run.get("session", ""))
+        key = run.get("session") or id(run)
         session_cost[key] = max(session_cost.get(key, 0.0), float(run.get("cost") or 0))
     for run in registry.get("runs", []):
         cid = run.get("card", "")
         live = bool(alive.get(id(run)))
-        entry = runs.setdefault(cid, {"sessions": 0, "cost": 0.0})
+        entry = runs.setdefault(cid, {"sessions": 0, "cost": 0.0, "keys": set()})
         entry["sessions"] += 1
-        entry["cost"] = round(sum(v for (c, _), v in session_cost.items() if c == cid), 4)
+        entry["keys"].add(run.get("session") or id(run))
+        entry["cost"] = round(sum(session_cost[k] for k in entry["keys"]), 4)
         entry.update({
             "live": live, "session": run.get("session", ""), "reason": run.get("reason", ""),
             "started": run.get("started", ""), "ended": run.get("ended", ""),
-            "result": run.get("result", ""), "error": run.get("error", ""),
+            "result": run.get("result", ""), "error": run.get("error", ""), "batch": run.get("batch", ""),
         })
+    for entry in runs.values():
+        entry.pop("keys")
     attention = registry.get("attention", {})
     runs_file = os.path.join(state_dir, "runs.json")
     beat = os.path.getmtime(runs_file) if os.path.exists(runs_file) else None
@@ -594,6 +955,9 @@ def build(tasks: str, stale_hours: float) -> dict:
         "waived": waived,
         "doing": doing,
         "ready": ready,
+        "batches": batches,
+        "ready_batches": ready_batches,
+        "batch_of": batch_of,
         "waiting": {c: w for c, w in waits.items() if w},
         "unblocks": unblocks,
         "open_decisions": open_decisions,
@@ -601,6 +965,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         "lock": lock,
         "stalled": stalled,
         "drift": drift,
+        "open_checks": open_checks,
         "handoffs": sorted(handoffs),
         "last_handoff": {"card": last_handoff[0], "ago": ago(stamp - last_handoff[1])} if last_handoff else None,
         "recent_handoffs": [
@@ -627,11 +992,12 @@ def build(tasks: str, stale_hours: float) -> dict:
             "live": [c for c, r in runs.items() if r["live"]],
             "attention": attention,
             "manual": registry.get("manual", []),
-            "queued": [c for c in registry.get("queued", []) if c in cards and status[c] not in FINISHED],
-            "blocked_on": {c: v for c, v in registry.get("blocked_on", {}).items() if c in cards and status[c] not in FINISHED},
+            "queued": [c for c in registry.get("queued", []) if (c in cards and status[c] not in FINISHED) or c in open_batch],
+            "blocked_on": {c: v for c, v in registry.get("blocked_on", {}).items()
+                           if (c in cards and status[c] not in FINISHED) or c in open_batch},
             "unkinded": [c for c in order if not cards[c]["kind"] and status[c] not in FINISHED],
             "beat": beat,
-            "spent_usd": round(sum(r["cost"] for r in runs.values()), 2),
+            "spent_usd": round(sum(session_cost.values()), 2),
             "runs_as": runs_as(text),
             "account": registry.get("account"),
             "chrome_check": registry.get("chrome_check"),
@@ -686,6 +1052,9 @@ def render(s: dict) -> str:
         extra = ", ".join(x for x in (row.get("branch") not in blank and row.get("branch"),
                                       row.get("date") not in blank and f"since {row['date']}") if x)
         opens = s["unblocks"].get(cid)
+        b = next((b for b in s["batches"] if b["id"] == s["batch_of"].get(cid) and b["status"] == "running"), None)
+        if b:
+            extra = ", ".join(x for x in (f"batch {b['id']}, {b['finished']}/{len(b['cards'])} finished", extra) if x)
         lines.append(f"  {label(s, cid)}" + (f" ({extra})" if extra else ""))
         if opens:
             lines.append(f"    finishing it unblocks {', '.join(opens)}")
@@ -702,7 +1071,14 @@ def render(s: dict) -> str:
             lines.append(f"    Start with: {c['start_with']}")
         if s["unblocks"].get(cid):
             lines.append(f"    finishing it unblocks {', '.join(s['unblocks'][cid])}")
-    if not s["ready"]:
+    for b in s["ready_batches"]:
+        lines.append(f"  {b['id']} {b['name']} · batch of {len(b['cards'])} ({', '.join(b['cards'])})"
+                     + (f" · effort {b['effort']}" if b["effort"] else ""))
+        if b["start_with"]:
+            lines.append(f"    Start with: {b['start_with']}")
+        if s["unblocks"].get(b["id"]):
+            lines.append(f"    finishing it unblocks {', '.join(s['unblocks'][b['id']])}")
+    if not s["ready"] and not s["ready_batches"]:
         lines.append("  nothing" + (" until a running card finishes" if s["doing"] else ""))
     parallel = [c for c in s["ready"] if s["cards"][c]["parallel"]]
     if len(s["ready"]) > 1 and parallel:
@@ -754,19 +1130,120 @@ def render(s: dict) -> str:
         lines.append("")
         lines.append("Drift (files disagree):")
         lines += [f"  {d}" for d in s["drift"]]
+    if s["open_checks"]:
+        lines.append("")
+        lines.append("Open checks (the owner decides):")
+        lines += [f"  {check_line(c)}" for c in s["open_checks"]]
     return "\n".join(lines)
+
+
+def check_line(c: dict) -> str:
+    return f"{c['card']} \"{c['criterion']}\": {c['verdict']}" + (f" ({c['note']})" if c["note"] else "")
+
+
+def is_try(run: dict) -> bool:
+    """A session that counts against a card's attempts: not one that stopped to wait for the owner,
+    one resumed with the owner's answer, or one that never reached the API."""
+    return (not run.get("api_error") and not str(run.get("reason") or "").startswith("answer")
+            and not WAITED.search(run.get("result") or ""))
+
+
+def lessons(s: dict) -> str:
+    """What each card really took (runs, tries, cost, hours) beside what the plan guessed (size, effort),
+    as Markdown for the close card's retro and specs/lessons.md. Only measured numbers; a card the
+    autopilot never ran shows "-"."""
+    registry = read_json(os.path.join(os.path.dirname(s["tasks"]), "state", "runs.json"), {})
+    registry = registry if isinstance(registry, dict) else {}
+    runs, attention = registry.get("runs", []), registry.get("attention", {})
+    resume = parse_resume(read(s["resume"])) if s["resume"] else {"approvals": [], "decisions": []}
+    utc = lambda v: dt.datetime.strptime(v, "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc).timestamp()  # noqa: E731
+    def measure(mine: list) -> tuple:
+        """runs, tries, cost and hours of some runs (each session's cost once, at its highest report)."""
+        cost: dict = {}
+        hours = 0.0
+        for r in mine:
+            key = r.get("session") or id(r)
+            cost[key] = max(cost.get(key, 0.0), float(r.get("cost") or 0))
+            try:
+                if r.get("ended"):
+                    began = float(r["started_ts"]) if r.get("started_ts") else utc(r["started"])
+                    hours += max(utc(r["ended"]) - began, 0) / 3600  # "ended" keeps minutes only
+            except (KeyError, ValueError, TypeError):
+                pass
+        return len(mine), sum(1 for r in mine if is_try(r)), sum(cost.values()), hours
+
+    lines = ["| card | kind | size | effort | model | status | runs | tries | cost $ | hours | needed the owner |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    tiers: dict = {}
+    batch_of = s.get("batch_of", {})
+    for cid, c in s["cards"].items():
+        mine = [r for r in runs if r.get("card") == cid and not r.get("batch")]  # a batch is measured whole
+        n, tries, cost, hours = measure(mine)
+        blank = f"in {batch_of[cid]}" if cid in batch_of and not mine else "-"
+        lines.append("| " + " | ".join(flat(v) for v in (
+            cid, c["kind"] or "-", c["size"] or "-", c["effort"] or "-", c["model"] or "-", s["status"][cid],
+            n or blank, tries if mine else blank, round(cost, 2) if mine else blank,
+            round(hours, 1) if mine else blank, owner_part(cid, mine, resume, attention) or "-")) + " |")
+        if mine:
+            tier = tiers.setdefault(c["effort"] or "-", {"cards": 0, "runs": 0, "tries": 0, "cost": 0.0, "retried": 0})
+            tier["cards"] += 1
+            tier["runs"] += n
+            tier["tries"] += tries
+            tier["cost"] += cost
+            tier["retried"] += tries > 1
+    out = [f"# What the cards took: {s['feature']}", "", *lines, "",
+           "Runs: every session the autopilot started or resumed for the card. Tries: the runs that count"
+           " against its attempts (not waiting for the owner, not resumed with an answer, not an API error)."
+           " Cards run by hand have no measurements (\"-\")"
+           + ("; a batch's cards say `in B<n>`, and the batch is measured as a whole in the next table."
+              if s.get("batches") else ".")]
+    if s.get("batches"):
+        out += ["", "| batch | cards | effort | runs | tries | cost $ | hours |", "| --- | --- | --- | --- | --- | --- | --- |"]
+        for b in s["batches"]:
+            n, tries, cost, hours = measure([r for r in runs if r.get("batch") == b["id"]])
+            out.append("| " + " | ".join(flat(v) for v in (
+                f"{b['id']} {b['name']}".strip(), ", ".join(b["cards"]) or "-", b["effort"] or "-", n or "-",
+                tries if n else "-", round(cost, 2) if n else "-", round(hours, 1) if n else "-")) + " |")
+    if tiers:
+        out += ["", "| effort | cards run | tries per card | runs per card | cost per card $ | cards needing more than one try |",
+                "| --- | --- | --- | --- | --- | --- |"]
+        out += [f"| {flat(t)} | {v['cards']} | {v['tries'] / v['cards']:.1f} | {v['runs'] / v['cards']:.1f}"
+                f" | {v['cost'] / v['cards']:.2f} | {v['retried']} |" for t, v in sorted(tiers.items())]
+    if s["drift"]:
+        out += ["", "Drift at the close:", *[f"- {d}" for d in s["drift"]]]
+    if s["open_checks"]:
+        out += ["", "Open checks at the close (the owner decides):", *[f"- {check_line(c)}" for c in s["open_checks"]]]
+    return "\n".join(out)
+
+
+def owner_part(cid: str, mine: list, resume: dict, attention: dict) -> str:
+    """What a card needed from the owner, read from its runs and RESUME: "2 approvals, 1 decision, owner retry"."""
+    approvals = {a["n"] for a in resume["approvals"] if a["card"] == cid}
+    approvals |= {r["reason"].split(" ", 1)[1] for r in mine if str(r.get("reason") or "").startswith("answer ")}
+    decisions = sum(1 for d in resume["decisions"] if cid in d["before"])
+    by_owner = [r for r in mine if str(r.get("reason") or "").endswith("(owner)")]
+    starts = sum(1 for r in by_owner if r is mine[0] and r["reason"].startswith("start"))
+    retries = len(by_owner) - starts
+    parts = [f"{len(approvals)} approval{'s' * (len(approvals) != 1)}" if approvals else "",
+             f"{decisions} decision{'s' * (decisions != 1)}" if decisions else "",
+             "owner start" if starts else "",
+             (f"{retries} owner retries" if retries > 1 else "owner retry") if retries else ""]
+    said = ", ".join(p for p in parts if p)
+    return said or flat(attention.get(cid, ""), 60)
 
 
 def snapshot(s: dict) -> dict:
     return {
         "status": s["status"],
         "ready": s["ready"],
+        "batches": {b["id"]: b["status"] for b in s.get("batches", [])},
         "open_decisions": [f"{d['n']}: {d['question']}" for d in s["open_decisions"]],
         "blockers": [b["text"] for b in s["blockers"]],
         "lock": s["lock"],
         "handoffs": s["handoffs"],
         "stalled": [x["card"] for x in s["stalled"]],
         "drift": s["drift"],
+        "open_checks": [check_line(c) for c in s["open_checks"]],
         "approvals": [f"{a['n']} {a['card']}: {a['step']}" for a in s["approvals"]],
         "gates": s["gates"],
         "attention": sorted(s["autopilot"]["attention"]),
@@ -785,6 +1262,12 @@ def changes(old: dict, new: dict) -> list:
             out.append(f"{cid}: {before} → {st}")
     out += [f"{cid} was removed from tasks.md" for cid in old["status"] if cid not in new["status"]]
     out += [f"{cid} is now ready" for cid in new["ready"] if cid not in old["ready"]]
+    for bid, st in new.get("batches", {}).items():
+        before = old.get("batches", {}).get(bid)
+        if st == before:
+            continue
+        out.append(f"batch {bid} is now ready" if st == "ready" else f"batch {bid} is done" if st == "done"
+                   else f"new batch {bid} ({st})" if before is None else f"batch {bid}: {before} → {st}")
     out += [f"hand-off {cid}.md written" for cid in new["handoffs"] if cid not in old["handoffs"]]
     out += [f"decision answered: {d}" for d in old["open_decisions"] if d not in new["open_decisions"]]
     out += [f"decision needed: {d}" for d in new["open_decisions"] if d not in old["open_decisions"]]
@@ -794,6 +1277,7 @@ def changes(old: dict, new: dict) -> list:
         out.append(f"deploy lock: {old['lock'] or 'unset'} → {new['lock'] or 'unset'}")
     out += [f"{cid} looks stalled" for cid in new["stalled"] if cid not in old["stalled"]]
     out += [f"drift: {d}" for d in new["drift"] if d not in old["drift"]]
+    out += [f"open check: {c}" for c in new.get("open_checks", []) if c not in old.get("open_checks", [])]
     out += [f"approval needed: {a}" for a in new.get("approvals", []) if a not in old.get("approvals", [])]
     out += [f"stage {g} finished and waits for your review" for g in new.get("gates", []) if g not in old.get("gates", [])]
     out += [f"{c} needs you" for c in new.get("attention", []) if c not in old.get("attention", [])]
@@ -811,6 +1295,8 @@ def main() -> None:
     mode.add_argument("--watch", action="store_true", help="live view, redrawn on change")
     mode.add_argument("--wait", action="store_true", help="block until the state changes")
     mode.add_argument("--serve", action="store_true", help="serve the dashboard on localhost")
+    mode.add_argument("--lessons", action="store_true",
+                      help="print what each card took (runs, tries, cost, hours) for the close card's retro")
     parser.add_argument("--autopilot", action="store_true",
                         help="also run the dispatcher that starts card sessions (with --serve, or alone)")
     parser.add_argument("--port", type=int, default=8765, help="dashboard port (8765)")
@@ -823,6 +1309,8 @@ def main() -> None:
 
     if args.json:
         print(json.dumps(build(tasks, args.stale_hours), indent=2, ensure_ascii=False))
+    elif args.lessons:
+        print(lessons(build(tasks, args.stale_hours)))
     elif args.watch:
         shown, drawn = None, 0.0
         try:
