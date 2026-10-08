@@ -618,6 +618,25 @@ function render(s) {
   if (selected && s.cards[selected] && !$("#drawer").hidden) openDrawer(selected, false);
 }
 
+function account(a) {
+  const info = a.account, want = a.runs_as?.email;
+  if (!info && !want) return "";
+  if (!info) return `<span>runs as <b>…</b></span>`;
+  if (info.error) return `<span class="warn">${esc(info.error)}</span>`;
+  const bad = want && info.email.toLowerCase() !== want.toLowerCase();
+  return bad ? `<span class="warn" title="tasks.md §6 expects ${esc(want)}">runs as <b>${esc(info.email)}</b>, expects ${esc(want)}</span>`
+    : `<span title="${esc(info.launcher)}">runs as <b>${esc(info.email || "unknown")}</b></span>`;
+}
+
+function chromeCheck(a) {
+  const c = a.chrome_check;
+  const again = `<button type="button" class="link" data-act="check-chrome">Check again</button>`;
+  if (!c) return "Its sign-in is checked before the first session.";
+  if (c.running) return "Checking that it reaches the app signed in…";
+  return c.ok ? `Checked <span data-ago="${c.ts}">${ago(Date.now() / 1000 + skew - c.ts)}</span> ago: ${esc(c.detail || "signed in")}. ${again}`
+    : `<span class="warn">Check failed: ${esc(c.detail)}</span> ${again}`;
+}
+
 function renderAuto(s) {
   const a = s.autopilot, el = $("#auto");
   el.hidden = !a.used && !DISPATCH;
@@ -627,6 +646,7 @@ function renderAuto(s) {
   const [c, text] = !a.dispatcher ? ["--idle", "Autopilot not running"] : on ? ["--done", "Autopilot on"] : ["--your", "Autopilot paused"];
   el.innerHTML = `<span class="pill" style="--c:var(${c});--c-ink:var(${ink(c)})">${text}</span>
     ${a.dispatcher ? `<button type="button" data-act="settings" data-auto="${on ? 0 : 1}" data-fkey="auto-toggle"${on ? "" : ' class="primary"'}>${on ? "Pause" : "Resume"}</button>` : ""}
+    ${account(a)}
     <span>${a.live.length ? `<b>${a.live.length}</b> running` : "none running"} · <b>$${a.spent_usd.toFixed(2)}</b> spent${a.settings.budget_total_usd ? ` of $${esc(a.settings.budget_total_usd)}` : ""}</span>
     <details class="settings"${open || confirming ? " open" : ""}><summary>${icon("gear")}Settings</summary><div class="settings-body">
       ${!a.dispatcher ? `<p class="note">To start sessions, run <code>supervisor.py … --serve --autopilot</code>.</p>` : ""}
@@ -634,7 +654,7 @@ function renderAuto(s) {
       <label>Hold each stage for my review <input type="checkbox" id="set-gate"${a.settings.gate_checkpoints ? " checked" : ""}></label>
       <label>Give sessions Chrome <input type="checkbox" id="set-chrome"${a.settings.chrome ? " checked" : ""}></label>
       ${confirming === "chrome-on" ? `<div class="confirm"><span>Sessions will drive your real Chrome, signed in to your accounts, one session at a time. They are told to use their own tab and only the app under test.</span><div class="actions" style="margin:0"><button type="button" class="primary" data-act="chrome-on">Give them Chrome</button><button type="button" data-cancel>Not now</button></div></div>` : ""}
-      ${a.settings.chrome ? `<p class="note">Sessions use Claude in Chrome, one at a time.</p>` : ""}
+      ${a.settings.chrome ? `<p class="note">Sessions use Claude in Chrome, one at a time. ${chromeCheck(a)}</p>` : ""}
       ${confirming === "gate-off" ? `<div class="confirm"><span>Turn off stage reviews? The autopilot will start each next stage as soon as its checkpoint finishes.</span><div class="actions" style="margin:0"><button type="button" class="danger" data-act="gate-off">Turn off</button><button type="button" data-cancel>Keep reviews</button></div></div>` : ""}
       <div><div class="note" style="margin:0 0 4px">Never run unattended (tasks.md §6)</div><div class="deny">${a.deny.length ? a.deny.map((d) => `<code>${esc(d)}</code>`).join("") : '<span class="warn">None listed: the autopilot will not start.</span>'}</div></div>
     </div></details>

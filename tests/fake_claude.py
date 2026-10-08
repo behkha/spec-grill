@@ -15,6 +15,13 @@ import sys
 import time
 
 args = sys.argv[1:]
+if args[:2] == ["auth", "status"]:  # who the CLI is logged in as
+    print(json.dumps({"loggedIn": True, "email": os.environ.get("FAKE_EMAIL", "owner@example.com")}))
+    sys.exit(0)
+if os.environ.get("SPEC_GRILL_PROBE"):  # the autopilot's Chrome check
+    ok = os.environ.get("FAKE_CHROME", "ok") == "ok"
+    print(json.dumps({"type": "result", "result": json.dumps({"ok": ok, "final_url": "http://localhost:3000/login" if not ok else "http://localhost:3000/", "detail": "signed in" if ok else "the app shows its login page"})}))
+    sys.exit(0)
 card = os.environ["SPEC_GRILL_CARD"]
 tasks = os.environ["FAKE_TASKS"]
 resume = os.path.join(os.path.dirname(tasks), "state", "RESUME.md")
@@ -114,6 +121,10 @@ elif behaviour == "blocked":
     set_status("blocked")
     text = open(resume).read()
     open(resume, "w").write(text.replace("## Blockers\n", f"## Blockers\n- {card}: needs a key\n"))
+if behaviour == "hang":  # gives its final result, then never exits
+    emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+          "result": "You've hit your session limit · resets 3:10pm", "total_cost_usd": 1.5})
+    time.sleep(600)
 if behaviour == "budget":
     emit({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
           "terminal_reason": "max_budget", "result": "Reached the budget", "total_cost_usd": 20})

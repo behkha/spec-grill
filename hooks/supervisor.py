@@ -33,7 +33,7 @@ import subprocess
 import sys
 import time
 
-ID = r"(?:T\d+[A-Z]*|CP[A-Z0-9]+)"
+ID = r"(?:T\d+(?:[A-Z]+\d*)*|CP[A-Z0-9]+)"  # T001, T012A, follow-ups like T042B2 and T042R2A; CPA, CP0, CPEND
 ID_RE = re.compile(rf"\b{ID}\b")
 RANGE_RE = re.compile(rf"\b({ID})\s*[–-]\s*({ID})\b")
 CHECK_RE = re.compile(rf"^- \[([ xX])\] ({ID})((?: \[P\])?)(?: (.+?))?(?: — fulfills .*)?\s*$", re.M)
@@ -59,6 +59,7 @@ SETTINGS = {  # state/autopilot.json; the dashboard changes them, autopilot.py a
     "max_run_hours": 6,
     "notify": True,              # desktop notification when something needs the owner
     "chrome": False,             # give sessions Claude in Chrome (the owner's real browser); one at a time
+    "result_grace_s": 30,        # stop a session this long after its final result if it has not exited
     "claude": "claude",
     "paused_reason": "",
 }
@@ -221,6 +222,18 @@ def read_meta(c: dict, body: str) -> None:
         c["model"] = found.group(1)
     if found := re.search(r"\*\*Start with:\*\*\s*`([^`]+)`", body):
         c["start_with"] = found.group(1)
+
+
+def runs_as(text: str) -> dict:
+    """tasks.md §6: "**Runs as:** owner@example.com via `~/.local/bin/claude-work`" (the account the
+    feature's sessions must use, and the CLI launcher logged in as it) and "**App URL:** http://…" (the
+    page a Chrome check opens)."""
+    out = {"email": "", "launcher": "", "app_url": ""}
+    if found := re.search(r"\*\*Runs as\s*:?\*\*:?\s*`?([^\s`]+@[^\s`]+?)`?(?:\s+via\s+`?([^\s`]+)`?)?\s*$", text, re.M | re.I):
+        out["email"], out["launcher"] = found.group(1).strip(".,;"), (found.group(2) or "").strip(".,;")
+    if found := re.search(r"\*\*App URL\s*:?\*\*:?\s*`?(https?://[^\s`]+)`?", text, re.I):
+        out["app_url"] = found.group(1).rstrip(".,;")
+    return out
 
 
 def unattended_deny(text: str) -> list:
@@ -515,12 +528,17 @@ def build(tasks: str, stale_hours: float) -> dict:
         drift.append(f"the deploy lock is still held by {holder.group(0)}, which is {status[holder.group(0)]}")
 
     runs: dict = {}
+    # a resumed session reports its running total, so a session costs the most any of its runs reported
+    session_cost: dict = {}
+    for run in registry.get("runs", []):
+        key = (run.get("card", ""), run.get("session", ""))
+        session_cost[key] = max(session_cost.get(key, 0.0), float(run.get("cost") or 0))
     for run in registry.get("runs", []):
         cid = run.get("card", "")
         live = bool(alive.get(id(run)))
         entry = runs.setdefault(cid, {"sessions": 0, "cost": 0.0})
         entry["sessions"] += 1
-        entry["cost"] = round(entry["cost"] + float(run.get("cost") or 0), 4)
+        entry["cost"] = round(sum(v for (c, _), v in session_cost.items() if c == cid), 4)
         entry.update({
             "live": live, "session": run.get("session", ""), "reason": run.get("reason", ""),
             "started": run.get("started", ""), "ended": run.get("ended", ""),
@@ -606,6 +624,9 @@ def build(tasks: str, stale_hours: float) -> dict:
             "unkinded": [c for c in order if not cards[c]["kind"] and status[c] not in FINISHED],
             "beat": beat,
             "spent_usd": round(sum(r["cost"] for r in runs.values()), 2),
+            "runs_as": runs_as(text),
+            "account": registry.get("account"),
+            "chrome_check": registry.get("chrome_check"),
             "deny": unattended_deny(text),
         },
     }

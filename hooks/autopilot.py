@@ -52,7 +52,9 @@ LOCK = threading.RLock()  # the dispatcher thread and the dashboard's requests w
 LOCAL = threading.local()
 PROCS: dict = {}  # session id -> Popen, for the sessions this process started
 HELD: dict = {}  # tasks -> the open dispatcher lock file this process holds
-API_ERROR = re.compile(r"authenticat|oauth|log ?in|rate.?limit|usage limit|overloaded|credit balance|quota", re.I)
+API_ERROR = re.compile(r"authenticat|oauth|log ?in|rate.?limit|usage limit|session limit|limit_reached|hit your|"
+                       r"overloaded|credit balance|quota", re.I)
+ACCOUNT_AGE = 300  # seconds an account check stays good for display; spawning re-checks after 60
 BUDGET = re.compile(r"budget", re.I)
 
 RULES = """You are running unattended: the Spec-Grill autopilot started this session for card {card} of
@@ -259,7 +261,7 @@ def permitted(deny: list, step: str) -> list:
 
 def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: bool, deny: list) -> list:
     card = s["cards"][cid]
-    cmd = [cfg["claude"], "-p", "--output-format", "stream-json", "--verbose",
+    cmd = [launcher(cfg, s), "-p", "--output-format", "stream-json", "--verbose",
            "--permission-mode", str(cfg["permission_mode"]),
            "--max-budget-usd", str(cfg["budget_per_card_usd"])]
     cmd += ["--resume", session] if resume else ["--session-id", session, "-n", session_name(s, cid)]
@@ -300,7 +302,7 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
         run["pid"] = proc.pid
         PROCS[session] = proc
     except OSError as error:
-        run.update(ended=stamp(), error=f"could not start {cfg['claude']}: {error}")
+        run.update(ended=stamp(), error=f"could not start {launcher(cfg, s)}: {error}")
     reg["runs"].append(run)
     reg["attention"].pop(cid, None)
     if approval and not run["error"]:
@@ -406,7 +408,105 @@ def live(reg: dict) -> list:
 
 
 def spent(reg: dict) -> float:
-    return sum(float(r.get("cost") or 0) for r in reg["runs"])
+    """What the sessions cost: a resumed session reports its running total, so each session counts once,
+    at the most any of its runs reported."""
+    most: dict = {}
+    for r in reg["runs"]:
+        key = (r["card"], r.get("session", ""))
+        most[key] = max(most.get(key, 0.0), float(r.get("cost") or 0))
+    return sum(most.values())
+
+
+# --- the account the sessions run as, and the browser they get ---------------------------
+
+
+def launcher(cfg: dict, s: dict) -> str:
+    """The CLI the sessions start with: the settings' "claude" when the owner set one, else the launcher
+    §6's **Runs as:** names, else plain claude."""
+    chosen = cfg["claude"] if cfg["claude"] != "claude" else (s["autopilot"]["runs_as"]["launcher"] or "claude")
+    return os.path.expanduser(chosen)
+
+
+def check_account(reg: dict, cli: str, max_age: float) -> dict:
+    """`<cli> auth status`: which account the sessions would bill, cached in the registry."""
+    known = reg.get("account") or {}
+    if known.get("launcher") == cli and time.time() - known.get("ts", 0) < max_age:
+        return known
+    info = {"launcher": cli, "ts": time.time(), "email": "", "logged_in": False, "error": ""}
+    try:
+        out = subprocess.run([cli, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
+        data = json.loads(out.stdout or "{}")
+        info.update(email=str(data.get("email") or ""), logged_in=bool(data.get("loggedIn")))
+        if not info["logged_in"]:
+            info["error"] = f"{cli} is not logged in"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        info["error"] = f"could not ask {cli} who it is logged in as: {error}"
+    reg["account"] = info
+    return info
+
+
+def account_problem(s: dict, reg: dict, cfg: dict, max_age: float) -> str:
+    """Why sessions must not start under the current account ("" when they may)."""
+    info = check_account(reg, launcher(cfg, s), max_age)
+    expected = s["autopilot"]["runs_as"]["email"]
+    if not expected:
+        return ""
+    if info["error"]:
+        return info["error"]
+    if info["email"].lower() != expected.lower():
+        return (f"sessions would run as {info['email'] or 'an unknown account'}, but the feature expects {expected} "
+                f"(tasks.md §6 **Runs as:**); point the autopilot at the launcher logged in as {expected}")
+    return ""
+
+
+PROBE = """You are a short check started by the Spec-Grill autopilot, not a card session. Using Claude in
+Chrome, {what} Then close any tab you opened. Reply with one line of JSON and nothing else:
+{{"ok": true or false, "final_url": "<the URL the tab ended on>", "detail": "<one short sentence>"}}.
+"ok" is false when Chrome tools are missing, the page did not load, or it shows a sign-in or login page
+instead of the app."""
+
+
+def probe_chrome(tasks: str, s: dict, cfg: dict, account: str = "") -> None:
+    """Check once, in the background, that the sessions' Chrome reaches the app signed in."""
+    url = s["autopilot"]["runs_as"]["app_url"]
+    what = (f"open {url} in a new tab and wait for it to load." if url
+            else "list the open tabs (this only checks that the Chrome tools work).")
+    cmd = [launcher(cfg, s), "-p", "--chrome", "--output-format", "json", "--model", "haiku",
+           "--max-budget-usd", "0.5", "--permission-mode", "auto", PROBE.format(what=what)]
+    result = {"ok": False, "detail": "", "ts": time.time(), "running": False, "url": url, "account": account}
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=240, cwd=repo_root(tasks),
+                             env={**os.environ, "SPEC_GRILL_PROBE": "1"})
+        text = str(json.loads(out.stdout or "{}").get("result") or "")
+        found = re.search(r"\{.*\}", text, re.S)
+        answer = json.loads(found.group(0)) if found else {}
+        result.update(ok=bool(answer.get("ok")), detail=str(answer.get("detail") or text)[:300],
+                      final_url=str(answer.get("final_url") or ""))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        result["detail"] = f"the check could not run: {error}"
+    with guard(tasks):
+        reg = registry(tasks)
+        reg["chrome_check"] = result
+        save_registry(tasks, reg)
+        if not result["ok"] and settings(tasks)["auto"]:
+            change_settings(tasks, auto=False, paused_reason=f"Chrome check failed: {result['detail']} "
+                            "Fix it (sign the sessions' Chrome in to the app), then press Check again.")
+
+
+def chrome_problem(tasks: str, s: dict, reg: dict, cfg: dict) -> str:
+    """With Chrome on: start the check when none is recent, and hold sessions until it passes."""
+    if not cfg.get("chrome"):
+        return ""
+    check = reg.get("chrome_check") or {}
+    account = (reg.get("account") or {}).get("email", "")
+    fresh = check and time.time() - check.get("ts", 0) < 6 * 3600 and check.get("account") == account
+    if check.get("running") and time.time() - check.get("ts", 0) < 300:
+        return "checking that the sessions' Chrome reaches the app signed in"
+    if not fresh:
+        reg["chrome_check"] = {"running": True, "ts": time.time(), "account": account}
+        threading.Thread(target=probe_chrome, args=(tasks, s, cfg, account), daemon=True).start()
+        return "checking that the sessions' Chrome reaches the app signed in"
+    return "" if check.get("ok") else f"the Chrome check failed: {check.get('detail', '')}"
 
 
 def step(tasks: str) -> list:
@@ -426,8 +526,15 @@ def step(tasks: str) -> list:
                 cfg = change_settings(tasks, auto=False, paused_reason=f"API error in {cid}: {run['error'][:200]}")
                 events.append("autopilot paused: API error")
 
-        # silent or overlong sessions
+        # sessions that gave their final result but did not exit hold a slot and hide a pause: stop them
         now = time.time()
+        for run in live(reg):
+            view = live_view(tasks, run["card"], events=False)
+            if view.get("final") and view.get("last_output_ts") and now - view["last_output_ts"] > cfg["result_grace_s"]:
+                kill(run)
+                events.append(f"{run['card']}: its session gave its result but did not exit; stopped it")
+
+        # silent or overlong sessions
         for run in live(reg):
             path = os.path.join(state_dir(tasks), run["log"])
             quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
@@ -461,6 +568,13 @@ def step(tasks: str) -> list:
                 "tasks.md §6 has no **Never unattended:** line; add one (for example `Bash(git push:*)`) "
                 "so unattended sessions cannot deploy or push"))
             events.append("autopilot paused: no Never unattended list")
+        if cfg["auto"]:
+            problem = account_problem(s, reg, cfg, 60)
+            if problem:
+                cfg = change_settings(tasks, auto=False, paused_reason=problem)
+                events.append(f"autopilot paused: {problem}")
+        else:
+            check_account(reg, launcher(cfg, s), ACCOUNT_AGE)  # for the dashboard's "runs as"
         if cfg["auto"]:
             events += dispatch(tasks, s, reg, cfg)
             save_registry(tasks, reg)
@@ -542,6 +656,8 @@ def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
     running = live(reg)
     if len(running) >= cfg["max_parallel"]:
         return f"{len(running)} sessions are running (the limit is {cfg['max_parallel']})"
+    if cfg.get("chrome") and (reg.get("chrome_check") or {}).get("running"):
+        return "checking that the sessions' Chrome reaches the app signed in"
     if cfg.get("chrome") and running:
         return f"{len(running)} sessions are running (with Chrome, the limit is 1: they share one browser)"
     if not s["cards"][cid]["parallel"]:
@@ -557,6 +673,9 @@ def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
 
 def dispatch(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
     events = []
+    held = chrome_problem(tasks, s, reg, cfg)
+    if held:
+        return events
     for cid, reason, prompt, session, approval, deny in plan(tasks, s, reg, cfg):
         why = room(s, reg, cfg, cid)
         if why.startswith("another session"):
@@ -665,7 +784,11 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(f"{cid} still waits for {', '.join(w['on'] for w in waits)}")
             if any(a["card"] == cid for a in s["approvals"]):
                 raise Refused(f"{cid} waits for your answer to its approval")
-            why = room(s, reg, cfg, cid)
+            problem = account_problem(s, reg, cfg, 60)
+            if problem:
+                save_registry(tasks, reg)
+                raise Refused(problem)
+            why = room(s, reg, cfg, cid) or chrome_problem(tasks, s, reg, cfg)
             was_stuck = reg["attention"].pop(cid, None) is not None
             if cid in reg["manual"]:
                 reg["manual"].remove(cid)
@@ -729,6 +852,11 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(f"{gate} is not waiting for a review")
             change_settings(tasks, approved_gates=cfg["approved_gates"] + [gate])
             return f"stage {gate} approved"
+        if action == "check-chrome":
+            reg["chrome_check"] = None
+            reg["account"] = None
+            save_registry(tasks, reg)
+            return "checking again on the next pass"
         if action == "resolve-blocker":
             text = str(data.get("text", "")).strip()
             if not any(b["text"] == text for b in s["blockers"]):

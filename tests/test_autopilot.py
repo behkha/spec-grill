@@ -555,6 +555,104 @@ class Feature(unittest.TestCase):
         self.assertEqual(len(self.state()["blockers"]), 1)
         self.assertIn("`<card>.<n>`", autopilot.RULES)
 
+    def runs_as(self, email: str):
+        wrapper = os.path.join(self.root, "claude")
+        text = open(self.tasks).read().replace("## 6. Supervisor\n", f"## 6. Supervisor\n\n**Runs as:** {email} via `{wrapper}`\n**App URL:** http://localhost:3000/\n")
+        open(self.tasks, "w").write(text)
+        autopilot.change_settings(self.tasks, claude="claude")  # the default: §6 decides
+        return wrapper
+
+    def test_sessions_use_the_launcher_and_account_section_6_names(self):
+        wrapper = self.runs_as("owner@example.com")
+        self.assertEqual(self.state()["autopilot"]["runs_as"]["app_url"], "http://localhost:3000/")
+        autopilot.step(self.tasks)
+        self.assertEqual(self.wait_calls(1)[0]["args"][0], "-p")
+        reg = autopilot.registry(self.tasks)
+        self.assertEqual((reg["account"]["email"], reg["account"]["launcher"]), ("owner@example.com", wrapper))
+        self.assertTrue(self.state()["autopilot"]["settings"]["auto"])
+
+    def test_the_wrong_account_pauses_before_any_session(self):
+        self.runs_as("someone-else@example.com")
+        autopilot.step(self.tasks)
+        self.assertEqual(self.launched(), [])
+        s = self.state()
+        self.assertFalse(s["autopilot"]["settings"]["auto"])
+        self.assertIn("expects someone-else@example.com", s["autopilot"]["settings"]["paused_reason"])
+        with self.assertRaises(autopilot.Refused):
+            autopilot.act(self.tasks, "start", {"card": "T001"})
+
+    def test_a_session_that_hangs_after_its_result_is_stopped_and_pauses(self):
+        autopilot.change_settings(self.tasks, result_grace_s=1)
+        self.script_for({"T001": ["hang"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        for _ in range(40):
+            autopilot.step(self.tasks)
+            if not autopilot.live(autopilot.registry(self.tasks)):
+                break
+            time.sleep(0.2)
+        self.assertEqual(autopilot.live(autopilot.registry(self.tasks)), [], "the hung session was stopped")
+        s = self.state()
+        self.assertFalse(s["autopilot"]["settings"]["auto"])
+        self.assertIn("session limit", s["autopilot"]["settings"]["paused_reason"])
+
+    def test_spend_counts_each_session_once(self):
+        reg = autopilot.registry(self.tasks)
+        base = {"attempt": 1, "reason": "start", "pid": None, "started": autopilot.stamp(), "ended": autopilot.stamp(),
+                "exit": 0, "result": "", "error": "", "log": "runs/x.jsonl"}
+        reg["runs"] = [{**base, "card": "T001", "session": "a", "cost": 2.0}, {**base, "card": "T001", "session": "a", "cost": 5.0},
+                       {**base, "card": "T002", "session": "b", "cost": 1.0}]
+        autopilot.save_registry(self.tasks, reg)
+        self.assertEqual(autopilot.spent(reg), 6.0)
+        self.assertEqual(self.state()["autopilot"]["spent_usd"], 6.0)
+
+    def test_a_failed_chrome_check_pauses_before_cards_block(self):
+        os.environ["FAKE_CHROME"] = "bad"
+        try:
+            self.runs_as("owner@example.com")
+            autopilot.act(self.tasks, "settings", {"chrome": True})
+            for _ in range(40):
+                autopilot.step(self.tasks)
+                if not self.state()["autopilot"]["settings"]["auto"]:
+                    break
+                time.sleep(0.2)
+            s = self.state()
+            self.assertEqual(self.launched(), [], "no card session starts while the check fails")
+            self.assertIn("Chrome check failed", s["autopilot"]["settings"]["paused_reason"])
+            self.assertFalse(s["autopilot"]["chrome_check"]["ok"])
+        finally:
+            os.environ.pop("FAKE_CHROME")
+
+    def test_follow_up_cards_with_a_digit_suffix_are_seen_and_run(self):
+        text = open(self.tasks).read().replace("## 6. Supervisor", """## 5. Backlog
+
+- [ ] T002B2 Second look at the API — fulfills FR-1
+  after: T002 · S · effort medium · kind backend · added by T002B
+  **Start with:** `Demo · T002B2. Follow x §1, then card T002B2.`
+
+#### T002R2A — A planned split of a follow-up
+after: T002B2 · S · effort low · kind backend
+
+**Start with:** `Demo · T002R2A. Follow x §1, then card T002R2A.`
+
+## 6. Supervisor""")
+        open(self.tasks, "w").write(text.replace("- [ ] CPEND Feature done", "- [ ] CPEND Feature done\n- [ ] T002R2A A planned split of a follow-up"))
+        resume = self.resume_text() + "| T002B2 | x | todo | - | - | - |\n| T002R2A | x | todo | - | - | - |\n"
+        open(self.state()["resume"], "w").write(resume)
+        s = self.state()
+        self.assertIn("T002B2", s["cards"])
+        self.assertEqual(s["cards"]["T002R2A"]["after"], ["T002B2"])
+        self.assertEqual(s["total"], 10)
+        self.assertNotIn("T002B2", " ".join(s["drift"]))
+        self.settle()
+        launched = [c["card"] for c in self.launched()]
+        self.assertIn("T002B2", launched)
+        self.assertIn("T002R2A", launched)
+        hook = os.path.join(HERE, "..", "hooks", "card-rename.py")
+        out = subprocess.run([sys.executable, hook], input=json.dumps({"cwd": self.root, "prompt": f"Demo · T002B2. Follow {self.tasks} §1, then card T002B2."}),
+                             capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "SPEC_GRILL_AUTOPILOT"}).stdout
+        self.assertIn("T002B2", out)
+
     def test_report_without_autopilot_has_no_gates(self):
         os.remove(os.path.join(os.path.dirname(self.tasks), "state", "autopilot.json"))
         s = self.state()

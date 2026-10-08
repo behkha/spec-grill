@@ -20,7 +20,7 @@ import subprocess
 import sys
 
 START = re.compile(
-    r"^\s*(?P<label>[^\n·]{1,80}?)\s*·\s*(?P<card>[A-Z]+[0-9]*[A-Z]*)\.\s*Follow\s+(?P<path>\S*tasks(?:\.draft)?\.md)"
+    r"^\s*(?P<label>[^\n·]{1,80}?)\s*·\s*(?P<card>[A-Z]+[0-9]*(?:[A-Z]+[0-9]*)*)\.\s*Follow\s+(?P<path>\S*tasks(?:\.draft)?\.md)"
 )
 
 
