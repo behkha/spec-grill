@@ -761,6 +761,19 @@ after: T002B2 · S · effort low · kind backend
         later = self.commit("tests/test_totals.py", "fix: storage again (T004)")
         self.assertEqual([d.split(" changes")[0] for d in self.pins()], [f"T004's commit {later[:7]}"])
 
+    def test_cards_finished_before_checks_from_are_exempt(self):
+        table = "| criterion | verdict | evidence | correction |\n| --- | --- | --- | --- |\n"
+        text = open(self.tasks).read().replace("## 6. Supervisor", "## 2. Templates\n\n**Checks from:** 2026-10-09\n\n" + table + "\n## 6. Supervisor")
+        open(self.tasks, "w").write(text)
+        self.finish("T001")
+        self.finish("T002")
+        resume = self.resume_text().replace("| T001 | x | done | b | - | - |", "| T001 | x | done | b | - | 2026-10-01 |")
+        resume = resume.replace("| T002 | x | done | b | - | - |", "| T002 | x | done | b | - | 2026-10-10 |")
+        open(self.state()["resume"], "w").write(resume)
+        drift = self.state()["drift"]
+        self.assertFalse([d for d in drift if d.startswith("T001")], "finished before the cutover")
+        self.assertIn("T002 is done but its hand-off has no Checks table (criterion | verdict | evidence)", drift)
+
     def test_done_cards_list_their_open_checks(self):
         self.add_to_tasks("## 6. Supervisor", "## 2. Templates\n\n" + self.CHECKS)
         table = "## Checks\n" + self.CHECKS
@@ -1023,6 +1036,150 @@ after: T002B2 · S · effort low · kind backend
         self.assertTrue(result.endswith("y AUTOPILOT: SPLIT") and "HEAD" not in result, result)
         self.assertIn("stopped or interrupted", autopilot.ending({"error": "", "result": ""}))
 
+    STAGE_BATCH = ("| batch | name | cards, in order | effort | Start with |\n| --- | --- | --- | --- | --- |\n"
+                   "| B1 | Orders and storage | {cards} | | `Demo · B1. Follow {tasks} §1, then the cards of batch B1"
+                   " (Stage 2's batch table) in order.` |\n\n")
+
+    def add_stage_batch(self, cards: str = "T002, T004", line: str = "- [ ] B1 Orders and storage") -> None:
+        """A planned batch in §4: its table under Stage 2's heading, its line after its last card."""
+        text = open(self.tasks).read()
+        text = text.replace("### Stage 2 — Build\n\n", "### Stage 2 — Build\n\n"
+                            + self.STAGE_BATCH.format(cards=cards, tasks=self.tasks))
+        text = text.replace("- [ ] T004 Storage — fulfills FR-3\n", f"- [ ] T004 Storage — fulfills FR-3\n{line}\n")
+        with open(self.tasks, "w") as handle:
+            handle.write(text)
+
+    def test_a_stage_batch_in_section_4_is_one_unit(self):
+        self.add_stage_batch()
+        s = self.state()
+        b = self.batch(s)
+        self.assertEqual((b["name"], b["cards"], b["effort"], b["stage"], b["parallel"]),
+                         ("Orders and storage", ["T002", "T004"], "medium", "Stage 2 — Build", False))
+        self.assertEqual((b["status"], [w["on"] for w in b["waits"]]), ("waiting", ["T001"]))
+        self.assertEqual(s["total"], 8, "a batch is not a card")
+        self.finish("T001")
+        s = self.state()
+        self.assertEqual([x["id"] for x in s["ready_batches"]], ["B1"])
+        self.assertEqual(s["ready"], ["T003"], "T002 and T004 run only with B1")
+        self.assertIn("  B1 Orders and storage · batch of 2 (T002, T004) · effort medium", sv.render(s))
+        self.assertFalse([d for d in s["drift"] if "B1" in d], s["drift"])
+        # [P] on the checklist line is read, and kept out of the batch's name
+        text = open(self.tasks).read().replace("- [ ] B1 Orders", "- [ ] B1 [P] Orders")
+        cards, order = sv.parse_tasks(text)
+        parsed = sv.parse_batches(text, cards, order)[0][0]
+        self.assertEqual((parsed["parallel"], parsed["name"]), (True, "Orders and storage"))
+
+    def test_the_autopilot_runs_a_stage_batch_and_ticks_its_line_in_section_4(self):
+        self.add_stage_batch()
+        self.settle()
+        launched = [c["card"] for c in self.launched()]
+        self.assertEqual(launched.count("B1"), 1)
+        self.assertFalse({"T002", "T004"} & set(launched), "a stage batch's cards never start on their own")
+        args = next(c for c in self.launched() if c["card"] == "B1")["args"]
+        self.assertEqual(args[args.index("-n") + 1], "001 B1 Orders and storage")
+        self.assertEqual(args[-1], self.batch(self.state())["start_with"])
+        self.assertNotIn("§1 item", " ".join(args), "the prompts name §1's items")
+        self.assertIn("§1's Finish item", args[args.index("--append-system-prompt") + 1])
+        self.assertIn("- [x] B1 Orders and storage", open(self.tasks).read())
+        s = self.state()
+        self.assertEqual((s["status"]["T002"], s["status"]["T004"], self.batch(s)["status"]), ("done", "done", "done"))
+        self.assertFalse([d for d in s["drift"] if "B1" in d], s["drift"])
+
+    def test_a_batch_an_outside_card_sits_inside_is_drift(self):
+        self.set_meta("T003", "after: T001", "after: T002")
+        self.set_meta("T004", "after: T001", "after: T003")
+        self.add_stage_batch()
+        self.finish("T001")
+        s = self.state()
+        self.assertIn("batch B1 can never run: T003, outside it, waits for T002 while T004 waits for T003;"
+                      " put T003 in the batch or take T004 out", s["drift"])
+        self.assertEqual(self.batch(s)["status"], "waiting")
+
+    def test_a_batch_holding_a_card_that_runs_alone_is_drift(self):
+        self.add_stage_batch(cards="T001, CPA, T005")
+        drift = self.state()["drift"]
+        self.assertIn("batch B1 holds T001, the first card: it runs on its own, never in a batch", drift)
+        self.assertIn("batch B1 holds CPA, a checkpoint: it runs on its own, never in a batch", drift)
+        self.assertIn("batch B1 holds T005, an owner's card: it runs on its own, never in a batch", drift)
+
+    def test_a_batch_over_the_size_budget_is_drift(self):
+        self.set_meta("T003", " · S · ", " · M · ")
+        self.set_meta("T004", " · S · ", " · M · ")
+        self.add_stage_batch(cards="T002, T003, T004")
+        self.assertIn("batch B1 is too big for one session: T002 S + T003 M + T004 M = 5"
+                      " (at most 4, counting S as 1 and M as 2)", self.state()["drift"])
+        self.set_meta("T004", " · M · ", " · L · ")
+        drift = self.state()["drift"]
+        self.assertIn("batch B1 holds T004, an L card: split it before it goes in a batch", drift)
+        self.assertFalse([d for d in drift if "too big" in d], "an L is named, not summed")
+        self.set_meta("T004", " · L · ", " · S · ")
+        self.assertFalse([d for d in self.state()["drift"] if "B1" in d], "S + M + S = 4 fits")
+
+    LOOSE = """## 5. Backlog
+
+- [ ] T003B Empty state copy
+  added by T003 · after: T003 · S · effort medium · kind frontend
+  **Start with:** `Demo · T003B. Follow {tasks} §1, then card T003B.`
+  **Touches:** `ui/tasks/list.tsx`.
+- [ ] T003C Focus ring
+  added by T003 · after: T003 · S · effort medium · kind frontend
+  **Start with:** `Demo · T003C. Follow {tasks} §1, then card T003C.`
+  **Touches:** `ui/tasks/{{row.tsx,list.tsx}}`. **Never:** change the copy.
+- [ ] T003D Row spacing
+  added by T003 · after: T003 · S · effort medium · kind frontend
+  **Start with:** `Demo · T003D. Follow {tasks} §1, then card T003D.`
+  **Touches:** `ui/tasks/row.tsx`.
+- [ ] T003E Deploy the fix
+  added by T003 · after: T003 · S · effort medium · kind frontend
+  **Do:** deploy `web` after the owner's yes.
+  **Touches:** `ui/tasks/row.tsx`.
+
+"""
+
+    def touches(self, cid: str, files: str) -> None:
+        text = open(self.tasks).read()
+        line = f"then card {cid}.`\n"
+        self.assertIn(line, text)
+        with open(self.tasks, "w") as handle:
+            handle.write(text.replace(line, f"{line}**Touches:** {files}. **Never:** guess.\n", 1))
+
+    def test_small_cards_in_no_batch_get_a_quiet_heads_up(self):
+        self.touches("T002", "`api/orders.py`")
+        self.touches("T003", "`ui/login.tsx`")
+        self.touches("T004", "`db/store.py`")
+        self.add_to_tasks("## 6. Supervisor", self.LOOSE.replace("{tasks}", self.tasks))
+        open(self.state()["resume"], "a").write("".join(f"| {c} | x | todo | - | - | - |\n"
+                                                         for c in ("T003B", "T003C", "T003D", "T003E")))
+        s = self.state()
+        self.assertEqual(s["cards"]["T003C"]["touches"], ["ui/tasks/row.tsx", "ui/tasks/list.tsx"])
+        self.assertEqual(s["cards"]["T003C"]["stage"], "Backlog")
+        self.assertTrue(s["cards"]["T003E"]["asks_owner"])
+        texts = [u["text"] for u in s["unbatched"]]
+        self.assertIn("3 small cards are in no batch: T003B, T003C, T003D (they share `ui/tasks/…`);"
+                      " batch them (§5)", texts, "T003E deploys: it runs alone")
+        self.assertNotIn("T001", " ".join(texts))
+        self.assertEqual(len(texts), 1, "T002, T003 and T004 share no file")
+        self.assertEqual(s["cards"]["T002"]["touches"], ["api/orders.py"])
+        self.assertIn("Heads-up:\n  3 small cards are in no batch: T003B, T003C, T003D", sv.render(s))
+        self.assertFalse([d for d in s["drift"] if "no batch" in d], "a heads-up, not drift")
+        self.assertNotIn("unbatched", sv.snapshot(s), "it never wakes the supervisor")
+        # batched or finished cards are not counted
+        before = open(self.tasks).read()
+        self.add_to_tasks("## 6. Supervisor", "| batch | name | cards, in order | effort | Start with |\n"
+                          "| --- | --- | --- | --- | --- |\n| B1 | Rows | T003C, T003D | | `Demo · B1.` |\n\n- [ ] B1 Rows\n\n")
+        self.assertEqual(self.state()["unbatched"], [], "T003C and T003D are batched; T003B is left alone")
+        open(self.tasks, "w").write(before)
+        self.finish("T003B")
+        self.assertEqual(self.state()["unbatched"], [], "T003B is done: two cards left in no batch")
+
+    def test_cards_without_touches_are_grouped_by_stage(self):
+        s = self.state()
+        self.assertEqual([(u["cards"], u["share"]) for u in s["unbatched"]],
+                         [(["T002", "T003", "T004"], "a stage, Stage 2 — Build; their Touches name no files")])
+        self.assertTrue(s["unbatched"][0]["text"].endswith("batch them (the batch table under Stage 2 — Build)"))
+        self.add_stage_batch()
+        self.assertEqual(self.state()["unbatched"], [], "T003 alone is no batch")
+
 
 class CloseWaits(unittest.TestCase):
     def test_after_section_5_waits_for_every_backlog_card(self):
@@ -1048,7 +1205,7 @@ class Template(unittest.TestCase):
         self.assertTrue(cards["T003"]["parallel"])
         self.assertEqual(cards["T003"]["effort"], "high")
         self.assertEqual(cards["T001"]["kind"], "fullstack")
-        self.assertTrue(all(cards[c]["kind"] for c in ("T001", "CP0", "T002", "T003", "CPA", "CPEND")))
+        self.assertTrue(all(cards[c]["kind"] for c in ("T001", "CP0", "T002", "T003", "T004", "CPA", "CPEND")))
         self.assertIn("Bash(git push:*)", sv.unattended_deny(block))
         resume = block.split("**RESUME**", 1)[1].split("```markdown", 1)[1].split("```", 1)[0]
         resume = resume.replace("| # | card | step | why | status | answer |",
@@ -1074,16 +1231,50 @@ class Template(unittest.TestCase):
         skill = open(os.path.join(HERE, "..", "SKILL.md"), encoding="utf-8").read()
         block = skill.split("### tasks.md", 1)[1].split("````markdown", 1)[1].split("\n````", 1)[0]
         finish = re.sub(r"\s+", " ", block.split("9. **Finish.**", 1)[1].split("2. Commit", 1)[0])
-        self.assertIn("a check recorded as `fail` in the Checks table with its design-review.md line (item 5)", finish)
+        self.assertIn("a check recorded as `fail` in the Checks table with its design-review.md line (the scope item)", finish)
         self.assertIn("write a `|` inside a cell as `\\|`", finish)
         self.assertIn("(In the Checks table, write a `|` inside a cell as `\\|`.)", block)
         self.assertIn("In the Checks table too, write a `|` inside a cell as `\\|`.", autopilot.RULES)
         routine = re.sub(r"\s+", " ", block.split("**Checkpoint routine**", 1)[1].split("### Stage 1", 1)[0])
         self.assertIn("write `Pins reviewed up to <commit>`", routine)
-        # the autopilot's rules cite §1 items by number
-        for n, title in (("4", "Preconditions"), ("5", "Stay in scope"), ("6", "Context budget"),
-                         ("7", "Owner's yes"), ("9", "Finish")):
-            self.assertRegex(block, rf"\n{n}\. \*\*{re.escape(title)}")
+        # the autopilot's rules name §1's items by their titles, since projects number them differently
+        for title, name in (("Preconditions.", "Preconditions"), ("Stay in scope", "scope"),
+                            ("Context budget.", "Context budget"), ("Owner's yes.", "Owner's yes"), ("Finish.", "Finish")):
+            self.assertRegex(block, rf"\n\d+\. \*\*{re.escape(title)}")
+            self.assertIn(f"§1's {name} item", autopilot.RULES)
+        prompts = [autopilot.RULES, autopilot.CHROME_RULES, autopilot.CONTINUE, autopilot.BATCH_CONTINUE,
+                   autopilot.UNBLOCKED, autopilot.ANSWER, autopilot.APPROVED, autopilot.REJECTED]
+        self.assertFalse([p for p in prompts if re.search(r"§1 items? \d|\bitems? \d", p)])
+        self.assertFalse(re.search(r"§1 items? \d", skill), "SKILL.md names §1's items, not their numbers")
+
+    def template_feature(self, ticks=()) -> str:
+        """The template written as a feature's tasks.md (no RESUME: statuses come from the ticks)."""
+        skill = open(os.path.join(HERE, "..", "SKILL.md"), encoding="utf-8").read()
+        block = skill.split("### tasks.md", 1)[1].split("````markdown", 1)[1].split("\n````", 1)[0]
+        for cid in ticks:
+            block = block.replace(f"- [ ] {cid} ", f"- [x] {cid} ")
+        root = tempfile.mkdtemp(prefix="template-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "specs", "001-t"))
+        tasks = os.path.join(root, "specs", "001-t", "tasks.md")
+        with open(tasks, "w", encoding="utf-8") as handle:
+            handle.write(block)
+        return tasks
+
+    def test_template_stage_batch_is_ready_after_its_dependencies(self):
+        s = sv.build(self.template_feature(), 4)
+        b1 = next(b for b in s["batches"] if b["id"] == "B1")
+        self.assertEqual((b1["cards"], b1["effort"], b1["stage"]), (["T002", "T004"], "high", "Stage 2 — <user scenario>"))
+        self.assertEqual(b1["status"], "waiting")
+        self.assertIn("then the cards of batch B1 (Stage 2's batch table) in order.", b1["start_with"])
+        self.assertEqual(s["cards"]["CPA"]["after"], ["T002", "T003", "T004"])
+        self.assertEqual([b["id"] for b in s["batches"]], ["B1", "B2"], "§5's batches continue the numbering")
+        self.assertFalse([d for d in s["drift"] if "B1" in d], s["drift"])
+        self.assertEqual(s["unbatched"], [], "the template leaves no small card unbatched")
+        s = sv.build(self.template_feature(ticks=("T001", "CP0")), 4)
+        self.assertEqual([b["id"] for b in s["ready_batches"]], ["B1"])
+        self.assertIn("T003", s["ready"], "T003 runs beside B1")
+        self.assertFalse({"T002", "T004"} & set(s["ready"]), "B1's cards are not ready alone")
 
 
 class Server(unittest.TestCase):

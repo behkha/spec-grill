@@ -62,7 +62,7 @@ RULES = """You are running unattended: the Spec-Grill autopilot started this ses
 only channel to the owner.
 
 - Follow that file's §1 and your {work} exactly as an attended session would.
-- A step that needs the owner's yes (§1 item 7) is never run on your own. Add a row to RESUME's
+- A step that needs the owner's yes (§1's Owner's yes item) is never run on your own. Add a row to RESUME's
   "## Approvals" table (create the section above "## Status" with the header
   `| # | card | step | why | status | answer |` if it is missing): a number of your card's own, `<card>.<n>` (T012.1, T012.2, …, so two sessions never collide);
   your card; the exact step or commands; why, and what happens if the owner says no; status
@@ -76,8 +76,8 @@ only channel to the owner.
   needs to look at (an artifact, a page) in that row or in your hand-off draft, leave your status row
   `doing`, and end with `AUTOPILOT: WAITING FOR DECISION <n>`. This session is resumed once the owner
   has answered.
-- Blocked (§1 item 4): record the blocker as §1 says, then end with `AUTOPILOT: BLOCKED`.
-- Context running out (§1 item 6): hand off and add the remainder card as §1 says, then end with
+- Blocked (§1's Preconditions item): record the blocker as §1 says, then end with `AUTOPILOT: BLOCKED`.
+- Context running out (§1's Context budget item): hand off and add the remainder card as §1 says, then end with
   `AUTOPILOT: SPLIT`.
 - Helper agents (the Agent tool) run in the foreground only (`run_in_background: false`): this session
   ends when your turn ends, and background agents end with it, before they report.
@@ -85,12 +85,12 @@ only channel to the owner.
   repo. Save a patch with `git diff` instead.
 - Never edit a card's Verify or Done when, a pinning test, or any other check to obtain a pass, and
   never record a waiver yourself: only the owner waives. A check that still fails after the card's one
-  fix goes to `state/design-review.md` (§1 item 5) and to your hand-off's Checks table as `fail`.
+  fix goes to `state/design-review.md` (§1's scope item) and to your hand-off's Checks table as `fail`.
   In the Checks table too, write a `|` inside a cell as `\\|`.
 - Before you end without `AUTOPILOT: DONE`, add to the "Tried, did not work" line of
   `state/handoff/{handoff}.md` (create it from §2's template if it is missing) each approach you tried
   and why it failed, so the session that continues the {work} does not repeat it.
-- Finished (§1 item 9): end with `AUTOPILOT: DONE`. Never start a card or batch beyond the one you were
+- Finished (§1's Finish item): end with `AUTOPILOT: DONE`. Never start a card or batch beyond the one you were
   started for.
 """
 
@@ -114,7 +114,8 @@ Re-read RESUME (the owner may have answered a decision you were waiting for), th
 the "Tried, did not work" line of their hand-offs in state/handoff/ if they exist. Don't repeat an
 approach listed there without a new reason, and say the reason. Before re-running a deploy, migration,
 paid call or message, check whether the earlier attempt already did it. Then carry on with the open cards
-in the batch's order, following tasks.md §1 (items 1 and 9 for a batch). If something prevents finishing,
+in the batch's order, following tasks.md §1 (its one-card-or-batch item and its Finish item, as they
+say for a batch). If something prevents finishing,
 record it as a blocker and stop."""
 BLOCKED = re.compile(r"AUTOPILOT: BLOCKED")
 UNBLOCKED = """The autopilot resumed this session: the blocker you recorded for {what} has been cleared
@@ -250,7 +251,7 @@ def repo_root(tasks: str) -> str:
         return folder
 
 
-# --- units: what one session runs, a card or a §5 batch of cards ----------------------------
+# --- units: what one session runs, a card or a batch of cards (a stage's or §5's) ------------
 #
 # A batch's session is registered with "card" set to the batch's first open card when it started and
 # "batch" set to the batch, so the per-card views (live view, log, drawer) find it; everything the
@@ -343,7 +344,7 @@ def start_line(s: dict, cid: str) -> str:
     b = batch(s, cid)
     if b:
         return b["start_with"] or (f"{s['feature']} · {cid}. Follow {s['tasks']} §1, then the cards of batch {cid}"
-                                   " (§5, Batches) in order.")
+                                   " in order.")
     return s["cards"][cid]["start_with"] or f"{s['feature']} · {cid}. Follow {s['tasks']} §1, then card {cid}."
 
 
@@ -728,7 +729,8 @@ def is_ready(s: dict, unit: str) -> bool:
 
 def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
     """What the autopilot would do next, in order: (unit, reason, prompt, session, approval key, deny).
-    A unit is a card, or a batch of §5 that runs in one session; a batch's own cards never start alone."""
+    A unit is a card, or a batch (a stage's or §5's) that runs in one session; a batch's own cards never
+    start alone."""
     out = []
     running = {run_unit(r) for r in live(reg)} | {r["card"] for r in live(reg)}
     for cid in units(s):

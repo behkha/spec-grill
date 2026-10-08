@@ -122,7 +122,7 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
 ### Cutting the cards
 
 1. **One card = one session.** Size each card S, M or L against one session's context budget; split every L. Also split where the work waits on someone else — an owner's decision, a paid step, an external party, a deploy — as a suffixed card (`T012A`), so no session idles while it waits.
-2. **Stages.** Group cards into numbered stages in dependency order (typical: re-verify and baseline; pure contracts; storage; services; API; UI; docs; rollout; close). **When the feature has an interface, cut stages by user scenario instead of by layer:** each build stage delivers one scenario (or a few small ones) end to end — its storage, its API and its screens — so the interface is built and seen from the first build stage, not squeezed in at the end. Never let a stage close with a scenario's back end done and its screens unbuilt. End every build stage with a **checkpoint card** (`CPA`, `CPB`, …) that merges the stage, runs the full checks and pinning tests, reviews the stage's diff at high effort, and turns each confirmed finding into a §5 backlog card.
+2. **Stages.** Group cards into numbered stages in dependency order (typical: re-verify and baseline; pure contracts; storage; services; API; UI; docs; rollout; close). **When the feature has an interface, cut stages by user scenario instead of by layer:** each build stage delivers one scenario (or a few small ones) end to end — its storage, its API and its screens — so the interface is built and seen from the first build stage, not squeezed in at the end. Never let a stage close with a scenario's back end done and its screens unbuilt. End every build stage with a **checkpoint card** (`CPA`, `CPB`, …) that merges the stage, runs the full checks and pinning tests, reviews the stage's diff at high effort, turns each confirmed finding into a §5 backlog card, and batches §5's open small cards (rule 11).
 3. **First card re-verifies.** The plan was written against older code: card T001 locates every fact the plan relies on *by symbol* on today's code, writes a code map, measures baselines (every number with the command that produced it), creates the state file and any worktree. When the spec has Open Questions that block cards, add `CP0` — one plain-words page for the owner, each question with a recommended default and the card that waits for it.
 4. **Last cards close.** A close card records the results against the success criteria in a Checks table (a report, if the project keeps one), then `CPEND` checks every card is ticked or waived and writes the **retro**: it runs `supervisor.py <tasks.md> --lessons` (each card's kind, size, effort and model beside the runs, tries, cost and hours it really took, and a summary per effort tier) and appends to `specs/lessons.md` a dated section for the feature: the measured table, then a few lines on what to do differently (tiers that were too low or too high, card shapes that overran, failures that came back, checks that were hard to evidence). Measured numbers only; a card run by hand says so, and a batch's cards are measured together, as their batch. The next feature's Phase 4 reads it.
 5. **`[P]` only when the cards' Touches lists don't overlap.** Each `[P]` card names whom it may run beside; parallel cards work in their own worktree and branch and merge back at the end of the card.
@@ -131,8 +131,15 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
 8. **Interface cards prove themselves visually.** A `kind frontend` or `kind fullstack` card's **Verify** runs the app, drives its screens in a browser through every state the card builds, saves screenshots at phone and desktop width to `state/screens/T0nn/` (names like `login-error-phone.png`), checks the browser console is clean and an accessibility check passes, and compares the result with `ux.md` and the prototype. Its **Done when** includes the screenshots; its **Read** includes the `ux.md` sections and the prototype screens it builds. Give interface cards effort high: they are judged by how they look and behave, which tests do not catch.
 9. **Owner actions.** Any step the constitution or spec reserves for the owner (deploys, production writes, paid runs, new dependencies, outward messages) is a protocol rule: the session asks in that session, then runs it after a yes — or hands over the exact commands when it can't. A session the autopilot started asks through RESUME's Approvals table and stops until the answer comes. List such steps' commands on §6's **Never unattended** line so the autopilot's sessions cannot run them on their own.
 10. **Diverging from the plan.** When a card splits, merges or reorders plan items, list each change and its reason in the header's "Where the cards differ from plan.md".
-11. **Batch the small cards.** One session per card pays the start-up cost (reading §1–§3, RESUME and the code) every time. Once the backlog holds several small (S) cards, group them into **batches** by screen or files, a handful of cards each, and run one session per batch: it reads once, commits each card on its own, and runs the full check and the browser walk-through once at the batch's end. §5 lists the batches (template below), each with its cards in order, its effort (the highest of its cards) and a **Start with** line. Walk-throughs, checkpoints and the close stay one card per session.
-12. **No follow-up cards from a card.** A card gets one fix. Whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes. The owner reviews that list in one go and decides which lines become cards. Only checkpoint reviews and the owner add §5 cards; this keeps the backlog from growing faster than it shrinks.
+11. **Batch the cards of each stage.** One session per card pays the start-up cost (reading §1–§3, RESUME and the code) every time. So once a stage's cards are cut and sized, group them into **batches**, one session per batch: it reads once, commits each card on its own, and runs the full check and the browser walk-through once at the batch's end.
+    - *What goes together:* cards of the same stage that share Touches or a screen, or that form a chain (B waits only on A), in dependency order inside the batch.
+    - *Size:* a batch fits one session's context. Count S = 1 and M = 2, keep the total at 4 or less, and never include an L (split it first). Efforts differ by one tier at most; the batch runs at the highest.
+    - *Always alone, never batched:* T001, checkpoints (CP0, CPA…, CPEND), the Results card, `kind owner` cards, a card that waits for an owner's decision, a card whose Do has an owner's-yes step (deploy, production write, paid step), and walk-throughs.
+    - *No deadlock:* no card outside a batch may sit between two of its cards in the dependency graph (an outside card that waits on one batch card while another batch card waits on it).
+    - *`[P]`:* a batch may run beside another batch or card only when none of its cards' Touches overlaps theirs; write `[P]` on the batch's checklist line and name whom it may run beside in "Who may run beside whom".
+
+    Each stage lists its batches right under its heading, in a small table with §5's columns (batch | name | cards, in order | effort | Start with), and each batch gets a checklist line `- [ ] B<n> <name>` in §4's checklist, after its last card. Batch ids run across the whole file: B1, B2, … in the stages, then §5's batches continue the numbering. A batched card keeps its full card (Start with, Read, Do, Done when, Verify, Touches) and can still be run alone by hand, but while its batch is unfinished the supervisor and the autopilot offer only the batch. During execution the checkpoint routine and the owner's design-review triage batch the new §5 cards by the same rules (rule 12, template below).
+12. **No follow-up cards from a card.** A card gets one fix. Whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes. The owner reviews that list in one go and decides which lines become cards; the new small cards are batched in the same step (rule 11), in §5's batch table. Only checkpoint reviews and the owner add §5 cards; this keeps the backlog from growing faster than it shrinks.
 13. **Parallel batches.** Batches whose cards' Touches don't overlap may run side by side: each beside the first works in its own worktree on a short-lived branch (`batch/b<n>`), with its own dev-server port so the app's data stays apart, and merges into the main branch at its end after the full check. `git stash` is shared by every worktree of a repo, so sessions never use it while another batch runs; they save a patch with `git diff` instead. When the constitution says one branch, this needs the owner's amendment first (Phase 0).
 14. **Checks are fixed, and every pass has evidence.** Each card's **Done when** is a list of observable criteria (a command and the output that counts as a pass, a file that exists, a screenshot), never "works" or "looks right". The session copies them into its hand-off's **Checks** table (criterion | verdict | evidence | correction), with `pass`, `fail` or `unresolved` and the evidence for each: the command and its decisive output line, a file path, a screenshot path. Missing evidence stays visible as `unresolved`. A session never edits a card's Verify or Done when, a pinning test, or any other check to obtain a pass, and never waives a check itself: only the owner waives (a RESUME decision). The supervisor shows as drift a done card without a Checks table, and a commit that changes a pinning test outside the card that writes it until a checkpoint has reviewed it (`Pins reviewed up to <commit>` in RESUME); it lists a row that is `fail` or `unresolved`, a pass without evidence, and a waiver the owner has not granted as **open checks** for the owner to decide.
 15. **Failed attempts are recorded.** A session that stops before its card is done (context, blocker, interruption) writes what it tried and why it failed on the hand-off's **Tried, did not work** line; the session that continues the card reads it first and does not repeat an approach listed there without a new reason. Before repeating a deploy, migration, paid call or message, it checks whether the earlier attempt already did it.
@@ -143,10 +150,11 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
 - Every FR/NFR maps to at least one card (§3 table); every `UX-n` screen maps to the frontend or fullstack card that builds it, and every user scenario has at least one; no build stage ends with only back-end cards when its scenario has screens; every success criterion names the card that measures it; every Open Question is a decisions row with the card it must be answered before; every rule that needs a pinning test names the test file and the card that writes it. Flag any gap to the user explicitly.
 - Every card has: Start with, Read, Do, Done when, Verify, Touches, and a `kind` on its meta line. No card says "see above" — a card must stand alone. Every **Done when** criterion is observable (rule 14): rewrite any that only a judgment could pass.
 - Every card's meta line has an `after:` field naming the cards it waits for by id (ranges like `T002–T005` are fine; notes go in parentheses, such as `(beside T002)`), because the supervisor builds the waiting graph from it. Run `hooks/supervisor.py` on the draft and check its "Waiting" and "Ready" lists match the stage outline.
+- Batches (rule 11): every S card that is not on the always-alone list is in a batch, unless the header says why not. Run `hooks/supervisor.py` on the draft and confirm the ready and waiting batches match the stage outline (a stage's batch is ready when the cards before it are done, and its cards never show as ready alone), the drift list says nothing about batches (an always-alone card, an L, more than 4 by size, a card outside a batch sitting between two of its cards), and the report has no "small cards are in no batch" heads-up.
 
 ### Presenting
 
-Present the complete draft for holistic approval, revise as needed, then write `tasks.md`. When the file is too long to read in chat, write it as `tasks.draft.md` and present §1–§3, the checklist, the stage outline and three full cards (T001, one checkpoint, the hardest card); rename it to `tasks.md` on approval.
+Present the complete draft for holistic approval, revise as needed, then write `tasks.md`. When the file is too long to read in chat, write it as `tasks.draft.md` and present §1–§3, the checklist, the stage outline with each stage's batches and three full cards (T001, one checkpoint, the hardest card); rename it to `tasks.md` on approval.
 
 ## Phase 5 — Handoff
 
@@ -173,7 +181,7 @@ The user loses track of a long card list: which cards finished, which wait on wh
 
 It has two halves:
 
-- **`hooks/supervisor.py`** (standard library only) — the deterministic half. It reads `tasks.md` (checklist, each card's `after:`, `blocks:`, `kind` and `model`), `state/RESUME.md` (status, decisions, approvals, blockers, deploy lock), `state/handoff/*.md`, `state/screens/`, the autopilot's `state/runs.json` and git, and reports: progress bar, done, running now, ready to run next (with each card's **Start with** line and what finishing it unblocks; a §5 batch is one entry with its cards, its effort and its own **Start with** line, and its cards never show as ready on their own), who waits for whom (a card, the integration worktree, an owner's decision, a stage review, a blocker), what needs the owner, the back-end/front-end balance (it warns when the interface falls behind), stalled cards, drift (including a done card without a Checks table, and a commit that changes a pinning test outside the card that writes it, until a checkpoint records it reviewed) and open checks for the owner (a check a done card recorded as `fail` or `unresolved`, a pass without evidence, a waiver the owner has not granted). `--lessons` prints what each card (and each batch) really took, for the close card's retro. `--serve` runs the **dashboard** (`hooks/dashboard.html`) on `http://127.0.0.1:8765`, local only: progress, a "Run next" panel (a ready batch is one row: its id, name, cards and Copy line or Start), a "Needs you" panel (with a quiet, collapsed line for the open checks) where the owner answers approvals and decisions, approves stages and marks their own cards done, a board (each batch card tagged with its batch), a dependency map, a screens gallery, the latest commit and a status line saying what the autopilot is doing (working, between cards, waiting for the owner, paused, or a dispatcher that stopped checking in), a commit list matched to cards, a live card per running session (elapsed time, last output, to-do progress, the step it is on) and a card drawer with its RESUME row, hand-off note and a transcript that follows the session as it runs, an activity feed, the drift list and the open checks. `--watch` redraws a live view in a terminal; `--wait` blocks until the state changes, prints what changed and the report, and exits; `--json` is for scripts.
+- **`hooks/supervisor.py`** (standard library only) — the deterministic half. It reads `tasks.md` (checklist, each card's `after:`, `blocks:`, `kind` and `model`), `state/RESUME.md` (status, decisions, approvals, blockers, deploy lock), `state/handoff/*.md`, `state/screens/`, the autopilot's `state/runs.json` and git, and reports: progress bar, done, running now, ready to run next (with each card's **Start with** line and what finishing it unblocks; a batch, a stage's or §5's, is one entry with its cards, its effort and its own **Start with** line, and its cards never show as ready on their own), who waits for whom (a card, the integration worktree, an owner's decision, a stage review, a blocker), what needs the owner, the back-end/front-end balance (it warns when the interface falls behind), a quiet heads-up when 3 or more open small cards that could share a session (shared Touches, a chain, or the same stage when Touches can't be read) are in no batch, stalled cards, drift (including a batch that breaks rule 11's rules: an always-alone card in it, an L or more than 4 by size, an outside card between two of its cards; a done card without a Checks table, and a commit that changes a pinning test outside the card that writes it, until a checkpoint records it reviewed) and open checks for the owner (a check a done card recorded as `fail` or `unresolved`, a pass without evidence, a waiver the owner has not granted). `--lessons` prints what each card (and each batch) really took, for the close card's retro. `--serve` runs the **dashboard** (`hooks/dashboard.html`) on `http://127.0.0.1:8765`, local only: progress, a "Run next" panel (a ready batch is one row: its id, name, cards and Copy line or Start), a "Needs you" panel (with quiet, collapsed lines for the heads-ups, such as small cards in no batch, and the open checks) where the owner answers approvals and decisions, approves stages and marks their own cards done, a board (each batch card tagged with its batch, and a line of the batches with each one's stage and progress), a dependency map, a screens gallery, the latest commit and a status line saying what the autopilot is doing (working, between cards, waiting for the owner, paused, or a dispatcher that stopped checking in), a commit list matched to cards, a live card per running session (elapsed time, last output, to-do progress, the step it is on) and a card drawer with its RESUME row, hand-off note and a transcript that follows the session as it runs, an activity feed, the drift list and the open checks. `--watch` redraws a live view in a terminal; `--wait` blocks until the state changes, prints what changed and the report, and exits; `--json` is for scripts.
 - **The supervisor session** — the conversational half. It follows tasks.md §6: it stays armed with `--wait` as a background command, so every change (a card finished, an approval requested, a stage waiting for review) wakes it to report, and it answers the user's questions at any time from fresh output and the hand-off notes.
 
 When the user asks only to see the dashboard, start `--serve` in the background, open its URL and stop there; the full supervisor session is not needed for that.
@@ -182,12 +190,23 @@ When the user asks only to see the dashboard, start `--serve` in the background,
 
 "Never sleeps" has two layers and the user should know which is which: `supervisor.py --watch` or `--serve` in a terminal tab costs nothing and runs until the tab closes; the supervisor session sleeps between events and is woken by each `--wait` exit, so it spends tokens only when something changed. It lasts as long as the session stays open (on desktop, the app's keep-awake setting stops the machine sleeping under it). If it is closed, a new session started from §6's line picks up from the files with nothing lost.
 
+### Upgrading a tasks.md drafted with an older template
+
+When the user asks to bring an existing `tasks.md` up to the current template (after this skill was updated), merge the template's rules into the file; never replace it. The file's own content stays: its paths, project rules, item wording, cards and §3. Steps:
+
+1. Make sure no card session works on the feature: the autopilot is paused and `runs.json` has no live run, or the owner confirms no session is open. Copy the file (and RESUME) to a backup first.
+2. §1: add what the template's §1 has and the file lacks, inside the matching items (start, scope, context budget, owner's yes, finish), keeping the file's numbering. The autopilot's unattended rules name §1's items by their titles (the Preconditions, scope, Context budget, Owner's yes and Finish items), not by number: when one of the file's items has a different title, say which and offer to rename it.
+3. §2: add the hand-off template's missing lines and its Checks table; add RESUME's missing sections to the RESUME template.
+4. The checkpoint routine, the Results and CPEND cards, §5's Batches heading, and a batch table for each stage whose cards are not started yet (rule 11): as in the template, cards not started only. Never edit a done card, a ticked line, or a card that is `doing`.
+5. When cards are already done, add `**Checks from:** <today>` under §2's hand-off template: cards finished before that day are exempt from the evidence checks (their hand-offs predate the Checks table). Write `Pins reviewed up to <HEAD's commit>` in RESUME, so the pin check starts from today instead of reporting the feature's whole history.
+6. Run `supervisor.py` on the file before and after; the ready and waiting lists must not change, and new drift must be only what the upgrade intends. Show the owner a short summary of what changed.
+
 ### Autopilot
 
 `supervisor.py <tasks.md> --serve --autopilot` adds the **dispatcher** (`hooks/autopilot.py`, standard library only) to the dashboard. The owner starts it in their own terminal; it needs the `claude` CLI logged in and the project folder trusted. Every few seconds, while the feature's autopilot is on, it:
 
-- **starts each ready card, or ready batch,** in a headless session (`claude -p`) from the repository root. A §5 batch runs as one session for all its cards in order (its **Start with** line, its effort or else the highest of its cards', the session named `<NNN> B1 <batch name>`); the batch's cards never start on their own, and attempts, approvals, blockers and resumes count per batch. A card: the card's **Start with** line as the prompt, `--effort` from the card's tier, `--model` when the card names one, the session named `<NNN> T0nn <title>` (`-n`), a dollar cap per session, `--permission-mode auto`, §6's **Never unattended** tool patterns denied, and rules appended to the system prompt for running unattended (below). At most "Parallel" sessions at once (3 by default), and at most one card without `[P]` or batch, since those share the integration worktree. An owner's card (`kind owner`) is never started;
-- **turns the owner's yes into a button**: a session that reaches a step needing the owner (§1 item 7) adds a row to RESUME's **Approvals** table and ends its turn; the dashboard shows Approve / Reject with an optional note; on an answer the dispatcher resumes that same session (`--resume`) with it, and lifts the deny pattern the approved step needs for that resume only;
+- **starts each ready card, or ready batch,** in a headless session (`claude -p`) from the repository root. A batch (a stage's or §5's) runs as one session for all its cards in order (its **Start with** line, its effort or else the highest of its cards', the session named `<NNN> B1 <batch name>`); the batch's cards never start on their own, and attempts, approvals, blockers and resumes count per batch. A card: the card's **Start with** line as the prompt, `--effort` from the card's tier, `--model` when the card names one, the session named `<NNN> T0nn <title>` (`-n`), a dollar cap per session, `--permission-mode auto`, §6's **Never unattended** tool patterns denied, and rules appended to the system prompt for running unattended (below). At most "Parallel" sessions at once (3 by default), and at most one card without `[P]` or batch, since those share the integration worktree. An owner's card (`kind owner`) is never started;
+- **turns the owner's yes into a button**: a session that reaches a step needing the owner (§1's Owner's yes item) adds a row to RESUME's **Approvals** table and ends its turn; the dashboard shows Approve / Reject with an optional note; on an answer the dispatcher resumes that same session (`--resume`) with it, and lifts the deny pattern the approved step needs for that resume only;
 - **turns the owner's choices into answers**: a session that needs a pick only the owner can make (a design option, an open question) adds a row to RESUME's **Decisions** table naming its card, keeps the card `doing` and stops; once the owner answers on the dashboard, the session is resumed. Waiting this way never counts as a failed try;
 - **holds each stage for review**: when a checkpoint card (CPA, CPB, …) is done, the cards after it wait until the owner presses "Approve stage" (after looking at its findings and the screens). The owner can switch this off ("Hold each stage for my review");
 - **runs as the right account**: when §6 says `**Runs as:** <email> via <launcher>`, sessions start with that launcher (unless the settings name another), and before dispatching and before each session the dispatcher asks `<launcher> auth status`; on a different account it pauses ("sessions would run as X, but the feature expects Y"), so nothing bills the wrong account or pairs with the wrong Chrome profile. With Chrome on, one cheap check session first opens §6's **App URL** and pauses the autopilot if it lands on a sign-in page instead of the app. The dashboard shows "runs as <email>" and the Chrome check's result;
@@ -304,7 +323,7 @@ Spec: [spec.md](spec.md) (UX-1–UX-n). Prototype: [prototype/index.html](protot
 
 ### tasks.md
 
-The section numbers (§1–§6) and card fields are fixed; fill the `<…>` parts from the repo and the approved artifacts. `[P]` = may run at the same time as the cards named in its card, in another session and another worktree. Sizes: S, M, L (split every L). Ids: `T0nn` planned cards, `T0nnA` planned splits, `T0nnB`… backlog cards, `CP0`/`CPA`…/`CPEND` checkpoints.
+The section numbers (§1–§6) and card fields are fixed; fill the `<…>` parts from the repo and the approved artifacts. `[P]` = may run at the same time as the cards named in its card, in another session and another worktree. Sizes: S, M, L (split every L). Ids: `T0nn` planned cards, `T0nnA` planned splits, `T0nnB`… backlog cards, `CP0`/`CPA`…/`CPEND` checkpoints, `B1`, `B2`… batches (numbered across the file: the stages' first, then §5's).
 
 ````markdown
 # Tasks: <feature name>
@@ -324,15 +343,16 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
 
 ## 1. Session protocol (every card follows it)
 
-1. **One card or one batch per session.** Open a fresh session for each card, or for each batch of §5's
-   batch list (its cards in the listed order, each committed on its own). Never continue into another
+1. **One card or one batch per session.** Open a fresh session for each card, or for each batch (a
+   stage's batch table, or §5's; its cards in the listed order, each committed on its own). While a
+   card's batch is unfinished, the card runs with its batch, not alone. Never continue into another
    card or batch in the same session, even if there is room left. First action: rename the session to `<NNN> T0nn <card title>` (for a batch, T0nn is the batch's id and the title its name, e.g. `004 B2 Search and export`) (desktop: `set_session_title`; CLI: `/rename`).
 2. **Where things live.** State: `specs/NNN-slug/state/RESUME.md` and `state/handoff/T0nn.md`
    <git-ignored folders are read and written by absolute path from worktrees>. Code work happens in
    <the integration worktree `<path>`, branch `<branch>`, created by T001>; a `[P]` card works in
    `<path>-t0nn`, branch `<branch>-t0nn-<slug>`, and merges back at the end of the card — only while no
-   card without `[P]` is `doing` in RESUME; otherwise the branch waits for the next checkpoint. A batch
-   the owner starts beside another works in `<path>-b<n>`, branch `batch/b<n>`, dev server on its own
+   card without `[P]` is `doing` in RESUME; otherwise the branch waits for the next checkpoint. A `[P]`
+   batch started beside another works in `<path>-b<n>`, branch `batch/b<n>`, dev server on its own
    port, and merges back at the batch's end (main merged in first, then the full check). Never `git
    stash` while another session works in the repo (the stash is shared by every worktree); save a patch
    with `git diff` instead.
@@ -356,10 +376,10 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
 5. **Stay in scope; one fix, no follow-up cards; checks are fixed.** Do only your card (or your
    batch's cards). Each gets one fix; whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line
    in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes.
-   Don't add §5 cards: the owner reviews design-review.md in one go and decides which lines become
-   cards (checkpoint reviews still add §5 cards). Never edit your card's Verify or Done when, a pinning
-   test, or any other check to obtain a pass, and never waive one yourself: only the owner waives (a
-   RESUME decision).
+   Don't add §5 cards: the owner reviews design-review.md in one go, decides which lines become
+   cards and batches them (§5's Batches) in the same step (checkpoint reviews still add §5 cards).
+   Never edit your card's Verify or Done when, a pinning test, or any other check to obtain a pass,
+   and never waive one yourself: only the owner waives (a RESUME decision).
 6. **Context budget.** Keep raw logs, query results and big files out of the conversation (scratch
    files; read summaries). If the session gets heavy before the card is done, write the hand-off with
    what is finished, what is left and what you tried that did not work, add the remainder as a new §5
@@ -376,14 +396,15 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
    code, …).
 9. **Finish.** (In a batch: steps 1–4 for each card with the card's own tests and <the fast checks,
    e.g. typecheck> instead of the full check, then at the batch's end <the full check command> and one
-   browser walk-through over every card's screens, fixes for what they find, and step 5.)
+   browser walk-through over every card's screens, fixes for what they find, the batch's line ticked
+   (`[x]`, in §4's checklist or §5's), and step 5.)
    1. Run the card's Verify and <the full check command>; everything green, a waiver the owner
       granted in RESUME, or a check recorded as `fail` in the Checks table with its design-review.md
-      line (item 5). Fill the hand-off's Checks table: one row per Done when criterion, with its
+      line (the scope item). Fill the hand-off's Checks table: one row per Done when criterion, with its
       evidence; write a `|` inside a cell as `\|`. An interface card's screenshots are in `state/screens/T0nn/`; when the browser window won't shrink to
       phone width, load the page in a phone-wide iframe and say so in the hand-off.
    2. Commit on the card's branch (conventional message, nothing else in the commit); merge back if the
-      card is `[P]` (item 2's rule).
+      card is `[P]` (the rule under "Where things live").
    3. Write the hand-off note from §2's template.
    4. Tick the card here (`[x]`) and update its row in RESUME (status, branch, commit, date UTC).
    5. Stop. Tell the owner which cards are now unblocked.
@@ -476,17 +497,26 @@ Checklist (ticked by the session that finishes the card):
 - [ ] CP0 The owner's open questions
 - [ ] T002 <title> — fulfills FR-1
 - [ ] T003 [P] <title> — fulfills FR-2, NFR-1
+- [ ] T004 <title> — fulfills FR-3
+- [ ] B1 <batch name>
 - [ ] CPA <stage> merged and pinned
 - [ ] …
 - [ ] T0nn Close: results against the success criteria
 - [ ] CPEND Feature done
 
-**Who may run beside whom:** Stage 2: T002 ∥ T003; …
+**Who may run beside whom:** Stage 2: B1 ∥ T003; …
 
 Each card: **fulfills · after · size · effort · kind** (`backend`, `frontend`, `fullstack`, `owner`; then
 `· model <name>` when the card needs a particular model), **Start with** (paste as the session's first message),
 **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** (files, to see which cards
 may run side by side), and **Never** where a card has its own.
+
+**Batches** (`B1`, `B2`, …; chosen by the rules under §5's Batches): cards that run in one session, in
+the listed order. A stage's batches are in a table under the stage's heading (batch | name | cards, in
+order | effort | Start with), and each has a line `- [ ] B<n> <name>` in the checklist above, after its
+last card, ticked when the batch is done (`[P]` on that line when it may run beside others). A batched card
+keeps its full card and may be run alone by hand; while its batch is unfinished the supervisor and the
+autopilot offer only the batch.
 
 **Checkpoint routine** (CPA, CPB, …; each checkpoint card adds its own items):
 1. Merge each `[P]` branch still open into the integration branch.
@@ -505,8 +535,11 @@ may run side by side), and **Never** where a card has its own.
    against `ux.md`, the prototype and the constitution's UX standard (hierarchy, spacing, states,
    copy, accessibility, phone width) <with the design skill the project has>. Each confirmed finding
    becomes a §5 `kind frontend` card.
-8. RESUME: the checkpoint's commit, the pins, the findings. The owner reviews the stage on the
-   dashboard before the next one starts (when the autopilot holds stages).
+8. Batch the backlog: group §5's open small cards (this checkpoint's findings and any left over) into
+   batches by the rules under §5's Batches, and write each in §5's batch table with its checklist
+   line. When the findings changed the next stage's cards, re-batch that stage's table the same way.
+9. RESUME: the checkpoint's commit, the pins, the findings, the batches. The owner reviews the stage
+   on the dashboard before the next one starts (when the autopilot holds stages).
 
 ### Stage 1 — Re-verify and baseline
 
@@ -540,6 +573,10 @@ the owner answers there or on the dashboard, and each card waits only for its ow
 
 ### Stage 2 — <user scenario> (end to end: storage, API, screens)
 
+| batch | name | cards, in order | effort | Start with |
+| --- | --- | --- | --- | --- |
+| B1 | <batch name> | T002, T004 | high | `<Feature> · B1. Follow <absolute path>/tasks.md §1, then the cards of batch B1 (Stage 2's batch table) in order.` |
+
 #### T002 — <title>
 fulfills FR-1 · after: CP0 · M · effort high · kind backend
 
@@ -565,13 +602,23 @@ save screenshots at 390 px and 1280 px wide to `state/screens/T003/`; browser co
 **Hand-off extras:** the screenshot list; what differs from the prototype and why.
 **Touches:** `<files>`.
 
+#### T004 — <title>
+fulfills FR-3 · after: T002 · S · effort medium · kind backend
+
+**Start with:** `<Feature> · T004. Follow <absolute path>/tasks.md §1, then card T004.`
+**Read:** spec §<n>; plan <section>; hand-off T002. Code by symbol: `<symbol>` (`<file>`), ….
+**Do:** <the steps>.
+**Done when:** <observable criteria>.
+**Verify:** `<exact commands>`.
+**Touches:** `<files, mostly T002's>`.
+
 #### CPA — <stage> merged and pinned
-after: T002–T00n · S · effort high · kind fullstack
+after: T002–T004 · S · effort high · kind fullstack
 
 **Start with:** `<Feature> · CPA. Follow <absolute path>/tasks.md §1, then card CPA.`
 **Read:** RESUME; the hand-offs' "next card must know" lines; plan <checkpoint>.
 **Do:** The checkpoint routine. Pins: <rules>. Review against spec §<n>; design review of <screens>.
-**Done when:** green; the pins listed; the findings recorded as §5 cards.
+**Done when:** green; the pins listed; the findings recorded as §5 cards and batched.
 
 ### Stage N — Rollout
 
@@ -603,14 +650,25 @@ that came back, checks that were hard to evidence). Tell the owner what comes ne
 ## 5. Backlog (cards added during execution)
 
 ### Batches
-(small backlog cards grouped by screen or files, one session per batch, §1 items 1 and 9; the session
-ticks its batch's line when the batch is done)
+(one session per batch, as §1's first item and its Finish item say; the session ticks the batch's line
+when the batch is done. Ids continue after the stages' batches. A checkpoint (routine step 8) and the
+owner, when turning design-review.md lines into cards, batch the new small cards here. The rules, for
+these and for a stage's batches:
+- together: cards of one stage (here, of §5) that share Touches or a screen, or form a chain (B waits
+  only on A), in dependency order;
+- size: S = 1, M = 2, at most 4 per batch, never an L; efforts at most one tier apart, the batch runs
+  at the highest;
+- never in a batch: T001, a checkpoint, the Results card, an owner's card, a card waiting for an
+  owner's decision, a card whose Do needs the owner's yes (deploy, production write, paid step), a
+  walk-through;
+- no card outside the batch waits on one of its cards while another of its cards waits on it;
+- `[P]` on the batch's line only when none of its cards' Touches overlaps those it runs beside.)
 
-- [ ] B1 <batch name>
+- [ ] B2 <batch name>
 
 | batch | name | cards, in order | effort | Start with |
 | --- | --- | --- | --- | --- |
-| B1 | <name> | T0nnB, T0mmC | high | `<Feature> · B1. Follow <absolute path>/tasks.md §1, then the cards of batch B1 (§5, Batches) in order.` |
+| B2 | <name> | T0nnB, T0mmC | high | `<Feature> · B2. Follow <absolute path>/tasks.md §1, then the cards of batch B2 (§5, Batches) in order.` |
 
 Add cards here in the same format, numbered `T0nnB`, `T0nnC` after the card they split from (`A` is
 taken by planned splits), with a one-line reason and a meta line `added by T0nn · after: T0nn ·

@@ -44,8 +44,15 @@ SECTION_RE = re.compile(r"^#{2,3} (.+?)\s*$", re.M)
 COND_RE = re.compile(r"\(([^)]*\bif\b[^)]*)\)")  # "(T036 if German)": a dependency under a condition
 BEFORE_RE = re.compile(rf"\bbefore:?\s+({ID})")
 HEAD_RE = re.compile(rf"^#{{3,4}} ({ID})((?: \[P\])?) — (.+?)\s*$", re.M)
-BATCH = r"B\d+"  # §5's batches of small cards: B1, B2, … (not cards: they are never in order or progress)
-BATCH_CHECK_RE = re.compile(rf"^- \[([ xX])\] ({BATCH})\b(?: (.+?))?\s*$", re.M)
+BATCH = r"B\d+"  # batches of small cards (a stage's, §5's): B1, B2, … (not cards: never in order or progress)
+BATCH_CHECK_RE = re.compile(rf"^- \[([ xX])\] ({BATCH})\b((?: \[P\])?)(?: (.+?))?\s*$", re.M)
+TOUCHES_RE = re.compile(r"\*\*Touches:?\*\*:?(.*?)(?=\s\*\*\w[^*\n]*\*\*|\n[ \t]*\n|\Z)", re.S)
+DO_RE = re.compile(r"\*\*Do:?\*\*:?(.*?)(?=\n[ \t]*\*\*\w[^*\n]*:\*\*|\Z)", re.S)
+# a card that always runs alone: one whose Do asks for the owner's yes, or a walk-through (title)
+OWNER_STEP_RE = re.compile(r"owner['’]s yes|ask first|\bpaid\b|\bdeploy|production", re.I)
+WALK_RE = re.compile(r"walk[- ]?through", re.I)
+SIZE_COST = {"S": 1, "M": 2}  # a batch fits one session: its cards' sizes add up to at most BATCH_BUDGET
+BATCH_BUDGET = 4
 EFFORT_RANK = ["low", "medium", "high", "xhigh", "max"]
 FINISHED = {"done", "waived"}
 STATUSES = {"todo", "doing", "done", "blocked", "waived"}
@@ -164,10 +171,17 @@ def parse_tasks(text: str) -> tuple[dict, list]:
             cards[cid] = {
                 "id": cid, "title": "", "parallel": False, "ticked": False, "after": [],
                 "after_text": "", "blocks_text": "", "size": "", "effort": "", "start_with": "", "stage": "",
-                "kind": "", "model": "",
+                "kind": "", "model": "", "touches": [], "asks_owner": False,
             }
             order.append(cid)
         return cards[cid]
+
+    stages = [(m.start(), m.group(1)) for m in SECTION_RE.finditer(text)]
+
+    def stage_at(pos: int) -> str:
+        """The stage (or section) a card stands in: the nearest heading above it, "Batches" aside."""
+        name = next((n for at, n in reversed(stages) if at < pos and not n.lower().startswith("batches")), "")
+        return re.sub(r"\s*\(.*\)$", "", re.sub(r"^\d+\.\s*", "", name))
 
     inline = {}
     for m in CHECK_RE.finditer(text):
@@ -178,10 +192,9 @@ def parse_tasks(text: str) -> tuple[dict, list]:
         # a §5 card written inline: its meta line and fields indented under the checklist line
         block = re.match(r"(?:\n[ \t]+\S[^\n]*)+", text[m.end():])
         if block:
-            inline[m.group(2)] = block.group(0)
+            inline[m.group(2)] = (block.group(0), m.start())
 
     heads = list(HEAD_RE.finditer(text))
-    stages = [(m.start(), m.group(1)) for m in SECTION_RE.finditer(text)]
     for i, m in enumerate(heads):
         body = text[m.end(): heads[i + 1].start() if i + 1 < len(heads) else len(text)]
         stop = re.search(r"^#{1,3} ", body, re.M)
@@ -189,12 +202,12 @@ def parse_tasks(text: str) -> tuple[dict, list]:
         c = card(m.group(1))
         c["title"] = m.group(3).strip()  # the heading beats a checklist line like "T004B done …"
         c["parallel"] |= bool(m.group(2))
-        stage = next((name for pos, name in reversed(stages) if pos < m.start()), "")
-        c["stage"] = re.sub(r"\s*\(.*\)$", "", re.sub(r"^\d+\.\s*", "", stage))
+        c["stage"] = stage_at(m.start())
         read_meta(c, body)
         c["headed"] = True
-    for cid, body in inline.items():
+    for cid, (body, at) in inline.items():
         if not cards[cid].get("headed"):
+            cards[cid]["stage"] = stage_at(at)
             read_meta(cards[cid], body)
 
     for c in cards.values():
@@ -236,13 +249,45 @@ def read_meta(c: dict, body: str) -> None:
         c["model"] = found.group(1)
     if found := re.search(r"\*\*Start with:\*\*\s*`([^`]+)`", body):
         c["start_with"] = found.group(1)
+    if found := TOUCHES_RE.search(body):
+        c["touches"] = touch_paths(found.group(1))
+    if found := DO_RE.search(body):
+        c["asks_owner"] = bool(OWNER_STEP_RE.search(found.group(1)))
+
+
+def touch_paths(text: str) -> list:
+    """The files and folders a card's Touches names: backticked paths (`a/{b,c}.ts` is two), else
+    bare words with a slash. Placeholders (`<files>`) and prose name none."""
+    quoted = re.findall(r"`([^`]+)`", text)
+    out = []
+    for token in quoted or re.split(r"[\s,;]+", text):
+        token = re.sub(r"\s*\([^()]*\)", "", token).strip().strip(".,;:()").split("::", 1)[0]  # "x.ts (+ .de.ts)"
+        if not token or "<" in token or " " in token:
+            continue
+        for path in expand_braces(token):
+            path = re.sub(r"^\./", "", path).rstrip("/")
+            if "/" in path or (quoted and re.search(r"\w\.[A-Za-z]\w{0,5}$", path)):
+                out.append(path)
+    return list(dict.fromkeys(out))
+
+
+def expand_braces(token: str) -> list:
+    """`app/{a.ts,b/c.ts}` -> app/a.ts, app/b/c.ts (one level of braces at a time)."""
+    found = re.search(r"\{([^{}]*)\}", token)
+    if not found:
+        return [token]
+    out = []
+    for part in found.group(1).split(","):
+        out += expand_braces(token[: found.start()] + part.strip() + token[found.end():])
+    return out
 
 
 def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
-    """§5's batches: every table whose header has a "batch…" and a "cards…" column, one row per batch
-    (id, name, its cards in order, effort, the backticked Start with), ticked by its "- [x] B1 …" line.
-    Returns the batches in order and the drift they show (unknown cards, a card in two batches, no
-    Start with)."""
+    """The batches, a stage's (under its heading in §4) and §5's: every table whose header has a
+    "batch…" and a "cards…" column, one row per batch (id, name, its cards in order, effort, the
+    backticked Start with), ticked by its "- [x] B1 …" line (§4's checklist or §5's), which may say
+    `[P]`. Returns the batches in order and the drift they show (unknown cards, a card in two batches,
+    no Start with)."""
     found: dict = {}
     for _, lines in table_blocks(text):
         rows = [{head_cell(k): v for k, v in row.items()} for row in table(lines)]
@@ -259,12 +304,14 @@ def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
                 "id": bid.group(0), "name": re.sub(r"[`*]", "", column(row, "name")).strip(),
                 "named": ids_in(column(row, "cards"), order), "effort": effort[0] if effort else "",
                 "start_with": start.group(1).strip() if start else "", "ticked": False, "row": True,
+                "parallel": False,
             }
     for m in BATCH_CHECK_RE.finditer(text):
         b = found.setdefault(m.group(2), {"id": m.group(2), "name": "", "named": [], "effort": "",
-                                          "start_with": "", "ticked": False, "row": False})
+                                          "start_with": "", "ticked": False, "row": False, "parallel": False})
         b["ticked"] |= m.group(1).lower() == "x"
-        b["name"] = b["name"] or (m.group(3) or "").strip()
+        b["parallel"] |= bool(m.group(3))
+        b["name"] = b["name"] or (m.group(4) or "").strip()
     drift, owner = [], {}
     batches = []
     for b in found.values():
@@ -285,6 +332,142 @@ def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
             drift.append(f"batch {b['id']} has no Start with line (a backticked line in its table row)")
         batches.append(b)
     return batches, drift
+
+
+def alone(cid: str, c: dict) -> str:
+    """Why a card may never be in a batch (T001, a checkpoint, an owner's card); "" when it may."""
+    if cid == "T001":
+        return "the first card"
+    if cid.startswith("CP"):
+        return "a checkpoint"
+    return "an owner's card" if c["kind"] == "owner" else ""
+
+
+def batch_rules(batches: list, cards: dict, status: dict) -> list:
+    """Drift for unfinished batches that break the batching rules: a card that always runs alone, an L
+    card or more than BATCH_BUDGET by size (S = 1, M = 2), and a card outside the batch that waits on
+    one of its cards while another of its cards waits on it (the batch could never run)."""
+    waiters: dict = {}
+    for cid, c in cards.items():
+        for dep in c["after"]:
+            waiters.setdefault(dep, []).append(cid)
+    out = []
+    for b in batches:
+        if b["done"] or not b["cards"]:
+            continue
+        mine = b["cards"]
+        for cid in mine:
+            if why := alone(cid, cards[cid]):
+                out.append(f"batch {b['id']} holds {cid}, {why}: it runs on its own, never in a batch")
+        large = [c for c in mine if cards[c]["size"] == "L"]
+        out += [f"batch {b['id']} holds {c}, an L card: split it before it goes in a batch" for c in large]
+        sized = [c for c in mine if cards[c]["size"] in SIZE_COST]
+        cost = sum(SIZE_COST[cards[c]["size"]] for c in sized)
+        if not large and cost > BATCH_BUDGET:
+            out.append(f"batch {b['id']} is too big for one session: "
+                       + " + ".join(f"{c} {cards[c]['size']}" for c in sized)
+                       + f" = {cost} (at most {BATCH_BUDGET}, counting S as 1 and M as 2)")
+        # walk from the batch's open cards to the open cards outside it that wait on them
+        reached: dict = {}
+        queue = [(c, c, []) for c in b["open"]]
+        while queue:
+            at, origin, path = queue.pop(0)
+            for w in waiters.get(at, []):
+                if w in mine or w in reached or status.get(w) in FINISHED:
+                    continue
+                reached[w] = (origin, path + [w])
+                queue.append((w, origin, path + [w]))
+        for cid in b["open"]:
+            for dep in cards[cid]["after"]:
+                if dep in reached:
+                    origin, path = reached[dep]
+                    through = f" (through {', '.join(path[:-1])})" if len(path) > 1 else ""
+                    out.append(f"batch {b['id']} can never run: {dep}, outside it, waits for {origin}{through}"
+                               f" while {cid} waits for {dep}; put {dep} in the batch or take {cid} out")
+    return out
+
+
+def unbatched(cards: dict, order: list, status: dict, doing: list, batch_of: dict, decisions: list,
+              backlog: set) -> list:
+    """A quiet heads-up: open small (S) cards in no batch that could share one session, grouped by the
+    files their Touches share (or a chain: one waits on another), by stage when Touches can't be read.
+    Given only when such groups hold 3 cards or more. Cards that always run alone are left out: T001,
+    checkpoints, owner's cards, the Results card, a card waiting for an owner's decision, one whose Do
+    asks for the owner's yes, a walk-through."""
+    waiting_on = {c for d in decisions for c in d["before"]}
+    open_n = {str(d["n"]).strip() for d in decisions}
+
+    def never(cid: str) -> bool:
+        c = cards[cid]
+        named = set(re.findall(r"\bdecisions?\s+(\d+)", c["after_text"], re.I))
+        return bool(alone(cid, c) or c["asks_owner"] or WALK_RE.search(c["title"]) or "§5" in c["after_text"]
+                    or re.match(r"(results|close)\b", c["title"], re.I) or cid in waiting_on or named & open_n)
+
+    picked = [c for c in order if cards[c]["size"] == "S" and status[c] not in FINISHED and c not in doing
+              and c not in batch_of and not never(c)]
+    if len(picked) < 3:
+        return []
+    key = {c: (c in backlog, cards[c]["stage"]) for c in picked}  # batches never cross a stage
+
+    def folders(c: str) -> set:
+        return {p.rsplit("/", 1)[0] if re.search(r"\.\w+$", p.rsplit("/", 1)[-1]) else p
+                for p in cards[c]["touches"] if "/" in p or not re.search(r"\.\w+$", p)}
+
+    def shared(x: str, y: str) -> str:
+        """What two cards share: a file, a folder (`ui/tasks/…`), a chain; "" when nothing."""
+        if y in cards[x]["after"] or x in cards[y]["after"]:
+            return "a chain (one waits on the other)"
+        if files := sorted(set(cards[x]["touches"]) & set(cards[y]["touches"])):
+            return f"`{files[0]}`"
+        for a in sorted(folders(x)):
+            for b in sorted(folders(y)):
+                short = min(a, b, key=len)
+                if a == b or ("/" in short and (a.startswith(b + "/") or b.startswith(a + "/"))):
+                    return f"`{short}/…`"
+        return ""
+
+    parent = {c: c for c in picked}
+
+    def root(c: str) -> str:
+        while parent[c] != c:
+            c = parent[c]
+        return c
+
+    labels: dict = {}
+    for i, x in enumerate(picked):
+        for y in picked[i + 1:]:
+            if key[x] != key[y]:
+                continue
+            why = shared(x, y)
+            if not why and not cards[x]["touches"] and not cards[y]["touches"]:
+                why = f"a stage, {cards[x]['stage'] or '§5'}; their Touches name no files"
+            if why:
+                rx, ry = root(x), root(y)
+                if rx != ry:
+                    parent[ry] = rx
+                labels.setdefault((x, y), why)
+    groups: dict = {}
+    for c in picked:
+        groups.setdefault(root(c), []).append(c)
+    found = [g for g in groups.values() if len(g) > 1]
+    if sum(len(g) for g in found) < 3:
+        return []
+    out = []
+    for g in found:
+        said = [why for (x, y), why in labels.items() if x in g and y in g]
+        share = max(dict.fromkeys(said), key=said.count)
+        if all(cards[c]["touches"] for c in g):  # what all of them share, when something is
+            files = set.intersection(*(set(cards[c]["touches"]) for c in g))
+            try:
+                common = os.path.commonpath(sorted(set().union(*(folders(c) for c in g))))
+            except ValueError:
+                common = ""
+            share = f"`{sorted(files)[0]}`" if files else f"`{common}/…`" if common else share
+        where = "§5" if key[g[0]][0] else f"the batch table under {cards[g[0]]['stage'] or 'their stage'}"
+        out.append({"cards": g, "share": share, "where": where,
+                    "text": f"{len(g)} small cards are in no batch: {', '.join(g)} (they share {share});"
+                            f" batch them ({where})"})
+    return out
 
 
 def runs_as(text: str) -> dict:
@@ -769,9 +952,12 @@ def build(tasks: str, stale_hours: float) -> dict:
         elif everything and not b["ticked"]:
             batch_drift.append(f"every card of batch {b['id']} is finished but its line in tasks.md is not ticked")
         b["done"] = everything or b["ticked"]
+        stages = [cards[c]["stage"] for c in b["cards"] if cards[c]["stage"]]
+        b["stage"] = max(dict.fromkeys(stages), key=stages.count) if stages else ""
         mine = [r for r in registry.get("runs", []) if r.get("batch") == b["id"]]
         b["run_card"] = (batch_runs.get(b["id"]) or (mine[-1] if mine else {})).get("card", "")
     open_batch = {b["id"]: b for b in batches if not b["done"]}
+    batch_drift += batch_rules(batches, cards, status)
     live_cards = [c for c in order if status[c] not in FINISHED and any(
         r.get("card") == c for r in live_runs)]
     # a live batch session works on its batch's first open card, whichever card it was started on
@@ -862,9 +1048,15 @@ def build(tasks: str, stale_hours: float) -> dict:
     if re.search(r"\|\s*criterion\s*\|\s*verdict\s*\|", text, re.I):
         drift += pin_drift(tasks, cards, resume["status"], pinned_tests(text), resume["pins_reviewed"])
         review = read(os.path.join(state_dir, "design-review.md")).splitlines()
+        # a feature upgraded mid-way names the day Checks began: cards finished before it are exempt
+        since = re.search(r"\*\*Checks from:\*\*\s*(\d{4}-\d{2}-\d{2})", text)
         for cid in order:
             if status[cid] != "done" or cid not in handoffs:
                 continue
+            if since:
+                day = re.search(r"\d{4}-\d{2}-\d{2}", resume["status"].get(cid, {}).get("date", ""))
+                if not day or day.group(0) < since.group(1):
+                    continue
             checks = handoff_checks(read(os.path.join(handoff_dir, f"{cid}.md")))
             if not checks:
                 drift.append(f"{cid} is done but its hand-off has no Checks table (criterion | verdict | evidence)")
@@ -941,6 +1133,11 @@ def build(tasks: str, stale_hours: float) -> dict:
             if files:
                 screens[name] = files
 
+    at = re.search(r"^## 5\.", text, re.M)
+    planned = {m.group(2) for m in CHECK_RE.finditer(text) if not at or m.start() < at.start()}
+    backlog = {c for c in order if c not in planned}
+    loose = unbatched(cards, order, status, doing, batch_of, open_decisions, backlog)
+
     done = [c for c in order if status[c] == "done"]
     waived = [c for c in order if status[c] == "waived"]
     last_handoff = max(handoffs.items(), key=lambda kv: kv[1]) if handoffs else None
@@ -983,6 +1180,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         "yours": yours,
         "balance": balance,
         "lopsided": lopsided,
+        "unbatched": loose,
         "screens": screens,
         "autopilot": {
             "used": settings["exists"],
@@ -1072,7 +1270,7 @@ def render(s: dict) -> str:
         if s["unblocks"].get(cid):
             lines.append(f"    finishing it unblocks {', '.join(s['unblocks'][cid])}")
     for b in s["ready_batches"]:
-        lines.append(f"  {b['id']} {b['name']} · batch of {len(b['cards'])} ({', '.join(b['cards'])})"
+        lines.append(f"  {b['id']}{' [P]' if b.get('parallel') else ''} {b['name']} · batch of {len(b['cards'])} ({', '.join(b['cards'])})"
                      + (f" · effort {b['effort']}" if b["effort"] else ""))
         if b["start_with"]:
             lines.append(f"    Start with: {b['start_with']}")
@@ -1126,6 +1324,10 @@ def render(s: dict) -> str:
     lines += [f"  {n}" for n in needs] or ["  nothing"]
     if s["lock"] and s["lock"].lower() != "free":
         lines.append(f"Deploy lock: {s['lock']}")
+    if s.get("unbatched"):
+        lines.append("")
+        lines.append("Heads-up:")
+        lines += [f"  {u['text']}" for u in s["unbatched"]]
     if s["drift"]:
         lines.append("")
         lines.append("Drift (files disagree):")

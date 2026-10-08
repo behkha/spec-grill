@@ -2,12 +2,12 @@
 """A stand-in for `claude -p` in the autopilot tests: it acts out one scripted card session.
 
 FAKE_SCRIPT (a JSON file) maps a card to the behaviour of each of its sessions, in order:
-"done" finishes the card the way §1 item 9 says (RESUME row done, ticked, hand-off written),
+"done" finishes the card the way §1's Finish item says (RESUME row done, ticked, hand-off written),
 "doing" marks it doing and stops, "work" acts out a realistic session (to-dos, tools, pauses) and finishes, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
 records a blocker, "apierror" fails the way an expired login does, "budget" hits the dollar
 cap, "sleep" stays alive until killed. Every call is appended to FAKE_CALLS as one JSON line.
 
-A batch session (SPEC_GRILL_CARD is a §5 batch id such as B1) reads its cards from the batch table:
+A batch session (SPEC_GRILL_CARD is a batch id such as B1) reads its cards from the batch table:
 "done" finishes every open card of the batch in order and ticks the batch's line; "doing" finishes
 only the first open card and marks the next one doing (a batch interrupted half way).
 """
@@ -56,7 +56,7 @@ def set_status(status: str, cid: str = card) -> None:
 
 
 def finish(cid: str) -> None:
-    """Finish a card the way §1 item 9 says: RESUME row done, ticked, hand-off written, committed."""
+    """Finish a card the way §1's Finish item says: RESUME row done, ticked, hand-off written, committed."""
     set_status("done", cid)
     text = open(tasks).read()
     with open(tasks, "w") as handle:
@@ -64,7 +64,7 @@ def finish(cid: str) -> None:
     os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
     with open(os.path.join(os.path.dirname(resume), "handoff", f"{cid}.md"), "w") as handle:
         handle.write(f"# {cid}\n")
-    if os.environ.get("FAKE_COMMIT"):  # commit the way a card session does at §1 item 9
+    if os.environ.get("FAKE_COMMIT"):  # commit the way a card session does at §1's Finish item
         import subprocess
         who = {"GIT_AUTHOR_NAME": "card", "GIT_AUTHOR_EMAIL": "card@example.invalid",
                "GIT_COMMITTER_NAME": "card", "GIT_COMMITTER_EMAIL": "card@example.invalid"}
@@ -110,7 +110,7 @@ if behaviour == "work":  # a realistic session: a to-do list, tool calls with re
     behaviour = "done"
 
 emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})
-if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):  # a §5 batch
+if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):  # a batch
     todo = batch_cards()
     for cid in todo if behaviour == "done" else todo[:1]:
         finish(cid)

@@ -795,6 +795,7 @@ function headsUp(s) {
   s.blockers.filter((b) => !b.cards.length).forEach((b) => out.push(`Blocker: ${rich(b.text)} <button type="button" class="link" data-act="resolve-blocker" data-text="${esc(b.text)}">Resolved</button>`));
   s.stalled.forEach((x) => out.push(`<b>${esc(x.card)}</b> is doing but quiet for ${esc(x.quiet.replace(/ ago$/, ""))}: check its session.`));
   if (s.lopsided) out.push(`Balance: ${rich(s.lopsided.replace(/^./, (c) => c.toUpperCase()))}.`);
+  (s.unbatched || []).forEach((u) => out.push(`Batching: ${rich(u.text)}.`));
   if (a.used && a.unkinded?.length) out.push(`No kind on ${a.unkinded.map(esc).join(", ")}: the autopilot starts only cards whose meta line says <code>kind backend</code>, <code>frontend</code>, <code>fullstack</code> or <code>owner</code>.`);
   if (s.lock && s.lock.toLowerCase() !== "free") out.push(`Deploy lock: ${rich(s.lock)}`);
   return out;
@@ -1053,7 +1054,7 @@ function renderBoard(s) {
   const batches = s.batches || [];
   $("#board-batches").hidden = !batches.length;
   $("#board-batches").innerHTML = batches.length ? `<span>Batches</span>` + batches.map((b) =>
-    `<span><span class="mono">${esc(b.id)}</span> ${rich(b.name)} <b>${progress(b)}</b>${b.status === "done" ? "" : ` · ${esc({ running: "running", ready: "ready", waiting: "waiting" }[b.status] || b.status)}`}</span>`).join("") : "";
+    `<span><span class="mono">${esc(b.id)}</span>${b.parallel ? " [P]" : ""} ${rich(b.name)}${b.stage ? ` <span class="hint">(${rich(b.stage)})</span>` : ""} <b>${progress(b)}</b>${b.status === "done" ? "" : ` · ${esc({ running: "running", ready: "ready", waiting: "waiting" }[b.status] || b.status)}`}</span>`).join("") : "";
   const before = {};
   if (!REDUCE.matches && view === "board") $("#board").querySelectorAll(".tile[data-open]").forEach((t) => (before[t.dataset.open] = t.getBoundingClientRect()));
   $("#board").innerHTML = Object.entries(cols).map(([k, ids]) => {
