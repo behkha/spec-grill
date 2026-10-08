@@ -364,6 +364,33 @@ def last_commit(repo: str, branch: str) -> float | None:
         return None
 
 
+def recent_commits(folder: str, cards: dict, rows: dict, limit: int = 25) -> list:
+    """The newest commits on every branch of the repository holding the feature, each matched to the
+    card it belongs to (a card id in its subject, else the commit recorded in RESUME's status row)."""
+    try:
+        root = subprocess.run(["git", "-C", folder, "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+        out = subprocess.run(["git", "-C", root or folder, "log", "--all", "--date-order", f"-n{limit}",
+                              "--format=%H%x1f%ct%x1f%s%x1f%D"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    recorded = {}
+    for cid, row in rows.items():
+        commit = re.sub(r"[^0-9a-f]", "", (row.get("commit") or "").lower())
+        if len(commit) >= 7:
+            recorded[commit[:7]] = cid
+    items = []
+    for line in out.splitlines():
+        parts = (line.split("\x1f") + ["", "", "", ""])[:4]
+        sha, stamp, subject, refs = parts
+        if not sha:
+            continue
+        card = next((x for x in ID_RE.findall(subject) if x in cards), "") or recorded.get(sha[:7], "")
+        branch = next((r.strip().replace("HEAD -> ", "") for r in refs.split(",") if r.strip() and "tag:" not in r), "")
+        items.append({"hash": sha[:10], "ts": int(stamp or 0), "subject": subject[:240], "branch": branch, "card": card})
+    return items
+
+
 def ago(seconds: float) -> str:
     minutes = int(seconds // 60)
     if minutes < 60:
@@ -498,6 +525,8 @@ def build(tasks: str, stale_hours: float) -> dict:
             "result": run.get("result", ""), "error": run.get("error", ""),
         })
     attention = registry.get("attention", {})
+    runs_file = os.path.join(state_dir, "runs.json")
+    beat = os.path.getmtime(runs_file) if os.path.exists(runs_file) else None
     pending = [a for a in resume["approvals"] if a["status"] == "pending"]
     answered = [a for a in resume["approvals"] if a["status"] in ("approved", "rejected")]
     yours = [c for c in order if cards[c]["kind"] == "owner" and status[c] not in FINISHED and not waits[c]]
@@ -553,6 +582,8 @@ def build(tasks: str, stale_hours: float) -> dict:
         "status": status,
         "cards": {c: cards[c] for c in order},
         "rows": resume["status"],
+        "commits": recent_commits(folder, cards, resume["status"]),
+        "now": stamp,
         "approvals": pending,
         "approvals_answered": answered,
         "gates": gates_open,
@@ -569,6 +600,7 @@ def build(tasks: str, stale_hours: float) -> dict:
             "attention": attention,
             "manual": registry.get("manual", []),
             "unkinded": [c for c in order if not cards[c]["kind"] and status[c] not in FINISHED],
+            "beat": beat,
             "spent_usd": round(sum(r["cost"] for r in runs.values()), 2),
             "deny": unattended_deny(text),
         },
@@ -606,6 +638,10 @@ def render(s: dict) -> str:
         state = ("on" if auto["settings"]["auto"] else "paused") if auto["dispatcher"] else "not running"
         lines.append(f"Autopilot: {state} · sessions live: {', '.join(auto['live']) or 'none'}"
                      f" · spent ${auto['spent_usd']:.2f}")
+    if s["commits"]:
+        c = s["commits"][0]
+        lines.append(f"Latest commit: {c['hash'][:7]} {c['subject']} ({ago(s['now'] - c['ts'])}"
+                     + (f", {c['card']}" if c["card"] else "") + ")")
     if s["balance"]:
         lines.append("Balance: " + ", ".join(f"{k} {v['done']}/{v['total']}" for k, v in s["balance"].items()))
 
@@ -702,6 +738,7 @@ def snapshot(s: dict) -> dict:
         "gates": s["gates"],
         "attention": sorted(s["autopilot"]["attention"]),
         "paused": s["autopilot"]["settings"]["paused_reason"],
+        "commits": [f"{c['hash'][:7]} {c['subject']}" for c in s["commits"][:10]],
     }
 
 
@@ -727,6 +764,7 @@ def changes(old: dict, new: dict) -> list:
     out += [f"approval needed: {a}" for a in new.get("approvals", []) if a not in old.get("approvals", [])]
     out += [f"stage {g} finished and waits for your review" for g in new.get("gates", []) if g not in old.get("gates", [])]
     out += [f"{c} needs you" for c in new.get("attention", []) if c not in old.get("attention", [])]
+    out += [f"new commit {c}" for c in new.get("commits", []) if c not in old.get("commits", [])][:5]
     if new.get("paused") and new.get("paused") != old.get("paused"):
         out.append(f"autopilot paused: {new['paused']}")
     return out

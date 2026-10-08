@@ -227,6 +227,23 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 @keyframes beat { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--doing) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
 @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } .toast { transition: none; } }
 
+/* commits and the autopilot's status */
+.commit-line { margin-top: 6px; font-size: 12.5px; color: var(--muted); display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.commit-line .subject { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.commit-line .mono, .commits .mono { color: var(--doing-ink); }
+.commit-line.fresh { animation: fresh 2s ease-out; border-radius: 6px; }
+@keyframes fresh { from { background: color-mix(in srgb, var(--done) 22%, transparent); } }
+.ap-status { font-size: 12.5px; color: var(--muted); margin: -2px 0 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
+.ap-status b { color: var(--text); font-weight: 600; }
+.ap-status .warn { font-size: 12.5px; }
+.commits { list-style: none; margin: 0; padding: 0; }
+.commits li { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 2px 10px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.commits li:first-child { border-top: 0; }
+.commits time { color: var(--faint); font-size: 11.5px; font-family: var(--mono); padding-top: 2px; }
+.commits .subject { overflow-wrap: anywhere; }
+.commits .meta { grid-column: 2; }
+.commits li.fresh { animation: fresh 2s ease-out; }
+
 /* live sessions */
 .cols.solo { grid-template-columns: minmax(0, 1fr); }
 .cols.solo #running { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 0 10px; }
@@ -376,6 +393,7 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
       <div class="progress-line"><span class="big" id="pct">0%</span><span class="sub" id="pct-sub"></span><span class="sub" id="last-handoff"></span></div>
       <div class="meter" id="meter" aria-hidden="true"></div>
       <div class="counts" id="counts"></div>
+      <div class="commit-line" id="commit-line" hidden></div>
     </div>
     <div class="auto" id="auto" hidden></div>
   </div>
@@ -389,7 +407,7 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
 
   <section aria-labelledby="h-sessions">
     <div class="cols">
-      <div><div class="head"><h2 id="h-sessions">Running<span class="n" id="run-n"></span></h2></div><div id="running"></div></div>
+      <div><div class="head"><h2 id="h-sessions">Running<span class="n" id="run-n"></span></h2></div><div class="ap-status" id="ap-status" hidden></div><div id="running"></div></div>
       <div><div class="head"><h2>Ready to start<span class="n" id="ready-n"></span></h2><span class="hint" id="next-hint"></span></div><div id="next"></div></div>
     </div>
   </section>
@@ -419,8 +437,11 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border-
   </div>
   <div id="v-activity" role="tabpanel" data-view="activity">
   <div class="cols">
-    <section aria-labelledby="h-feed"><div class="head"><h2 id="h-feed">Activity</h2></div><ol class="feed" id="feed"></ol></section>
-    <section aria-labelledby="h-drift"><div class="head"><h2 id="h-drift">Drift</h2><span class="hint">Where the files disagree</span></div><div id="drift"></div></section>
+    <section aria-labelledby="h-commits"><div class="head"><h2 id="h-commits">Commits</h2><span class="hint">Every branch, newest first</span></div><ol class="commits" id="commits"></ol></section>
+    <div>
+      <section aria-labelledby="h-feed"><div class="head"><h2 id="h-feed">Activity</h2></div><ol class="feed" id="feed"></ol></section>
+      <section aria-labelledby="h-drift"><div class="head"><h2 id="h-drift">Drift</h2><span class="hint">Where the files disagree</span></div><div id="drift"></div></section>
+    </div>
   </div>
   </div>
 </div>
@@ -583,6 +604,8 @@ function render(s) {
   tabN("#t-screens", shotsN);
   tabN("#t-activity", s.drift.length ? `${s.drift.length} drift` : "", "bad");
   inkTo(document.querySelector(`[data-tab="${view}"]`));
+  if (s.now) skew = s.now - Date.now() / 1000;
+  renderCommits(s);
   renderAuto(s);
   renderInbox(s);
   renderSessions(s);
@@ -743,8 +766,50 @@ function renderInbox(s) {
 
 /* ---------- sessions ---------- */
 
+function commitText(c) {
+  return `<span class="mono">${esc(c.hash.slice(0, 7))}</span> <span class="subject">${esc(c.subject)}</span>`;
+}
+
+function renderCommits(s) {
+  const list = s.commits || [], c = list[0], line = $("#commit-line");
+  line.hidden = !c;
+  if (c) {
+    const fresh = line.dataset.hash && line.dataset.hash !== c.hash;
+    line.dataset.hash = c.hash;
+    line.innerHTML = `<span>Latest commit</span><span data-ago="${c.ts}">${ago(s.now - c.ts)}</span><span>ago${c.card ? ` · <button type="button" class="link" data-open="${esc(c.card)}">${esc(c.card)}</button>` : ""} ·</span>${commitText(c)}`;
+    if (fresh) { line.classList.remove("fresh"); void line.offsetWidth; line.classList.add("fresh"); }
+  }
+  const seen = new Set([...document.querySelectorAll("#commits li[data-hash]")].map((li) => li.dataset.hash));
+  $("#commits").innerHTML = list.length ? list.map((x) => `<li data-hash="${esc(x.hash)}"${seen.size && !seen.has(x.hash) ? ' class="fresh"' : ""}><time data-ago="${x.ts}">${ago(s.now - x.ts)}</time>
+      <span>${commitText(x)}</span><span class="meta">${x.card ? `<button type="button" class="link" data-open="${esc(x.card)}">${esc(x.card)}</button>` : ""}${x.branch ? `<span class="tag">${esc(x.branch)}</span>` : ""}</span></li>`).join("")
+    : `<li class="empty">No commits yet.</li>`;
+}
+
+function apStatus(s) {
+  const a = s.autopilot;
+  if (!a.used) return "";
+  const checked = a.beat ? s.now - a.beat : null;
+  const beat = checked != null ? ` · checked <span data-ago="${a.beat}">${ago(checked)}</span> ago` : "";
+  const last = s.commits?.[0];
+  const lastTxt = last ? ` · last commit <span data-ago="${last.ts}">${ago(s.now - last.ts)}</span> ago${last.card ? ` (${esc(last.card)})` : ""}` : "";
+  if (!a.dispatcher) return `<b>Autopilot not running.</b> Start <code>supervisor.py … --serve --autopilot</code> to dispatch${lastTxt}.`;
+  if (a.settings.auto && checked != null && checked > 60) return `<span class="warn">The dispatcher has not checked in for <span data-ago="${a.beat}">${ago(checked)}</span>: is supervisor.py still running?</span>`;
+  if (!a.settings.auto) return `<b>Paused.</b> ${a.settings.paused_reason ? rich(a.settings.paused_reason) : "Press Resume to continue."}${lastTxt}`;
+  if (a.live.length) return `<b>Working</b> on ${a.live.map(esc).join(", ")}${beat}${lastTxt}`;
+  if (s.done.length + s.waived.length === s.total) return `<b>Feature done.</b>${lastTxt}`;
+  const next = s.ready.find((id) => s.cards[id].kind && s.cards[id].kind !== "owner" && !(a.manual || []).includes(id) && !a.attention[id]);
+  if (next) return `<b>Between cards.</b> ${esc(next)} starts on the next check${beat}${lastTxt}`;
+  const n = inboxCount(s);
+  if (n) return `<b>Waiting for you:</b> ${n} item${n > 1 ? "s" : ""} in Needs you${beat}${lastTxt}`;
+  const open = Object.keys(s.cards).find((id) => !finished(s, id) && (s.waiting[id] || []).length);
+  return `<b>Idle.</b> Nothing is ready${open ? `; ${esc(open)} ${esc(why(s, open))}` : ""}${beat}${lastTxt}`;
+}
+
 function renderSessions(s) {
   const a = s.autopilot;
+  const status = apStatus(s);
+  $("#ap-status").hidden = !status;
+  $("#ap-status").innerHTML = status;
   const running = Object.keys(s.cards).filter((id) => cardState(s, id) === "running");
   $("#run-n").textContent = running.length || "";
   $("#running").closest(".cols").classList.toggle("solo", running.length > 1 && !s.ready.length);
@@ -822,6 +887,7 @@ async function pollLive() {
 
 function tickClocks() {
   const now = Date.now() / 1000 + skew;
+  document.querySelectorAll("[data-ago]").forEach((el) => (el.textContent = ago(Math.max(0, now - Number(el.dataset.ago)))));
   document.querySelectorAll("[data-tick-elapsed]").forEach((el) => { const v = live[el.dataset.tickElapsed]; if (v?.run) el.textContent = ago(now - v.run.started_ts); });
   document.querySelectorAll("[data-tick-quiet]").forEach((el) => { const v = live[el.dataset.tickQuiet]; if (v?.last_output_ts) el.textContent = ago(now - v.last_output_ts); });
 }
@@ -1052,6 +1118,7 @@ async function openDrawer(id, fresh = true) {
       ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : r.kind === "gate" ? `your review of stage ${link(r.on)}` : r.kind === "owner" ? `your answer: ${rich(r.on)}` : `blocker: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
       <dt>After</dt><dd>${c.after.length ? c.after.map(link).join("<br>") : `<span class="hint">${esc(c.after_text || "nothing")}</span>`}</dd>
       <dt>Needed by</dt><dd>${needed.length ? needed.map(link).join("<br>") : '<span class="hint">no card waits for it</span>'}</dd>
+      ${(s.commits || []).some((x) => x.card === id) ? `<dt>Commits</dt><dd><ol class="commits">${s.commits.filter((x) => x.card === id).map((x) => `<li><time data-ago="${x.ts}">${ago(s.now - x.ts)}</time><span>${commitText(x)}</span></li>`).join("")}</ol></dd>` : ""}
       ${!gate && pairs.length ? `<dt>Screens</dt><dd>${shots(pairs, true)}</dd>` : ""}
       ${row.status || !blank(row.branch) || !blank(row.commit) ? `<dt>RESUME row</dt><dd class="mono">${[row.status, row.branch, row.commit, row.date].filter((x) => !blank(x)).map(esc).join(" · ")}</dd>` : ""}
       ${done ? "" : handoffBlock}
@@ -1180,6 +1247,10 @@ function runAction(el) {
 
 function diff(a, b) {
   const out = [], label = (s, id) => STATES[cardState(s, id)].label;
+  const known = new Set((a.commits || []).map((c) => c.hash));
+  const fresh = (b.commits || []).filter((c) => !known.has(c.hash) && c.ts >= ((a.commits || [])[0]?.ts || 0));
+  fresh.slice(0, 5).reverse().forEach((c) => out.push(`Committed ${c.hash.slice(0, 7)}${c.card ? ` (${c.card})` : ""}: ${c.subject}`));
+  if (fresh.length) toast(`${fresh[0].card ? fresh[0].card + " committed" : "New commit"}: ${fresh[0].subject.slice(0, 90)}`);
   Object.keys(b.cards).forEach((id) => {
     if (!(id in a.cards)) out.push(`New card ${id}`);
     else if (label(a, id) !== label(b, id)) out.push(`${id}: ${label(a, id)} → ${label(b, id)}`);
@@ -1212,7 +1283,7 @@ async function tick() {
     const text = await r.text();
     setLive(true);
     const s = JSON.parse(text);
-    const key = (x) => JSON.stringify({ ...x, checked_at: 0, last_handoff: 0, recent_handoffs: 0, stalled: x.stalled.map((y) => y.card) });
+    const key = (x) => JSON.stringify({ ...x, checked_at: 0, now: 0, last_handoff: 0, recent_handoffs: 0, stalled: x.stalled.map((y) => y.card), autopilot: { ...x.autopilot, beat: 0 } });
     if (!state || key(s) !== stateText) {
       const old = state;
       if (old) diff(old, s);
@@ -1222,6 +1293,9 @@ async function tick() {
                          s.ready.filter((id) => !old.ready.includes(id)));
     } else {
       state = s;
+      if (s.now) skew = s.now - Date.now() / 1000;
+      const status = apStatus(s);
+      if ($("#ap-status").innerHTML !== status) $("#ap-status").innerHTML = status;
     }
   } catch {
     setLive(false);

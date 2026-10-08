@@ -80,6 +80,12 @@ if behaviour == "done":
     open(tasks, "w").write(re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
     os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
     open(os.path.join(os.path.dirname(resume), "handoff", f"{card}.md"), "w").write(f"# {card}\n")
+    if os.environ.get("FAKE_COMMIT"):  # commit the way a card session does at §1 item 9
+        import subprocess
+        who = {"GIT_AUTHOR_NAME": "card", "GIT_AUTHOR_EMAIL": "card@example.invalid",
+               "GIT_COMMITTER_NAME": "card", "GIT_COMMITTER_EMAIL": "card@example.invalid"}
+        subprocess.run(["git", "commit", "--allow-empty", "-qm", f"feat: finish the card's work ({card})"],
+                       env={**os.environ, **who}, capture_output=True)
     if "answered approval" in args[-1] and "approved" in args[-1]:
         text = open(resume).read()
         open(resume, "w").write(re.sub(r"\| approved \|", "| done |", text))

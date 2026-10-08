@@ -230,6 +230,7 @@ It opens `http://127.0.0.1:8765` (local only, no dependencies) and refreshes eve
 - **Live sessions** — with the autopilot, each running session shows its elapsed time, time since its last output, its to-do progress, the step it is on and its latest lines, refreshed every 2 seconds; its drawer follows the whole transcript as it grows.
 - **Board** — running, ready, waiting, blocked and done columns.
 - **Who waits for whom** — the dependency map; click a card to trace what it waits for and what waits for it, and open its details (RESUME row, hand-off note, the log of its session).
+- **Commits and the autopilot's status** — the latest commit (with its card) under the progress bar, a toast when a card commits, the commit list on every branch, and a line saying what the autopilot is doing right now: working on which cards, between cards and what starts next, waiting for you, paused, or a dispatcher that has stopped checking in.
 - **Activity** and **Drift** — what changed since you opened the page, and where the files disagree.
 
 A picker switches between every feature in `specs/`. The supervisor session offers to start it for you; just say "show the dashboard."

@@ -462,6 +462,23 @@ class Feature(unittest.TestCase):
         self.assertTrue(later and all("--chrome" in c["args"] for c in later))
         self.assertIn("Claude in Chrome", later[0]["args"][later[0]["args"].index("--append-system-prompt") + 1])
 
+    def test_commits_are_matched_to_their_cards(self):
+        os.environ["FAKE_COMMIT"] = "1"
+        self.script_for({"T001": ["done"]})
+        autopilot.change_settings(self.tasks, max_parallel=1)
+        for _ in range(40):
+            autopilot.step(self.tasks)
+            if self.state()["status"]["T001"] == "done":
+                break
+            time.sleep(0.15)
+        os.environ.pop("FAKE_COMMIT")
+        s = self.state()
+        mine = [c for c in s["commits"] if c["card"] == "T001"]
+        self.assertEqual(len(mine), 1)
+        self.assertIn("(T001)", mine[0]["subject"])
+        self.assertIn("Latest commit:", sv.render(s))
+        self.assertTrue(any(c.startswith("new commit") for c in sv.changes({**sv.snapshot(s), "commits": []}, sv.snapshot(s))))
+
     def test_report_without_autopilot_has_no_gates(self):
         os.remove(os.path.join(os.path.dirname(self.tasks), "state", "autopilot.json"))
         s = self.state()
