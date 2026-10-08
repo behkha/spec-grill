@@ -599,6 +599,7 @@ def build(tasks: str, stale_hours: float) -> dict:
             "live": [c for c, r in runs.items() if r["live"]],
             "attention": attention,
             "manual": registry.get("manual", []),
+            "queued": [c for c in registry.get("queued", []) if c in cards and status[c] not in FINISHED],
             "unkinded": [c for c in order if not cards[c]["kind"] and status[c] not in FINISHED],
             "beat": beat,
             "spent_usd": round(sum(r["cost"] for r in runs.values()), 2),

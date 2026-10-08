@@ -536,6 +536,7 @@ function cardState(s, id) {
   if (st === "done" || st === "waived") return st;
   if (a.live.includes(id)) return "running";
   if (a.attention[id]) return "stuck";
+  if ((a.queued || []).includes(id)) return "ready";
   if (s.approvals.some((x) => x.card === id)) return "yours";
   if (st === "blocked" || w.some((r) => r.kind === "blocker")) return "blocked";
   if (w.some((r) => r.kind === "owner" || r.kind === "gate") || s.yours.includes(id)) return "yours";
@@ -547,6 +548,7 @@ function cardState(s, id) {
 function why(s, id) {
   const a = s.autopilot, cat = cardState(s, id);
   if (cat === "stuck") return "stuck: " + humanStuck(a.attention[id]).replace(/^./, (c) => c.toLowerCase());
+  if ((a.queued || []).includes(id) && !a.live.includes(id)) return "queued: starts when a slot frees up";
   const approval = s.approvals.find((x) => x.card === id);
   if (approval) return `asks you to approve ${approval.n}`;
   if (s.yours.includes(id)) return "your card";
@@ -797,7 +799,7 @@ function apStatus(s) {
   if (!a.settings.auto) return `<b>Paused.</b> ${a.settings.paused_reason ? rich(a.settings.paused_reason) : "Press Resume to continue."}${lastTxt}`;
   if (a.live.length) return `<b>Working</b> on ${a.live.map(esc).join(", ")}${beat}${lastTxt}`;
   if (s.done.length + s.waived.length === s.total) return `<b>Feature done.</b>${lastTxt}`;
-  const next = s.ready.find((id) => s.cards[id].kind && s.cards[id].kind !== "owner" && !(a.manual || []).includes(id) && !a.attention[id]);
+  const next = [...(a.queued || []), ...s.ready].find((id) => !a.live.includes(id) && s.cards[id].kind && s.cards[id].kind !== "owner" && !(a.manual || []).includes(id) && !a.attention[id]);
   if (next) return `<b>Between cards.</b> ${esc(next)} starts on the next check${beat}${lastTxt}`;
   const n = inboxCount(s);
   if (n) return `<b>Waiting for you:</b> ${n} item${n > 1 ? "s" : ""} in Needs you${beat}${lastTxt}`;
@@ -822,14 +824,17 @@ function renderSessions(s) {
 
   const auto = a.dispatcher && a.settings.auto;
   $("#next-hint").textContent = auto ? "The autopilot starts these as room frees up" : a.dispatcher ? "Autopilot paused: start them yourself" : DISPATCH ? "" : "Paste a line into a fresh session";
-  $("#ready-n").textContent = s.ready.length || "";
-  if (!s.ready.length) {
+  const queued = (a.queued || []).filter((id) => !a.live.includes(id));
+  const readyIds = [...queued, ...s.ready.filter((id) => !queued.includes(id))];
+  $("#ready-n").textContent = readyIds.length || "";
+  if (!readyIds.length) {
     $("#next").innerHTML = `<div class="empty">Nothing is ready${s.doing.length ? `; waiting for ${s.doing.map(esc).join(", ")}` : ""}.</div>`;
     return;
   }
-  $("#next").innerHTML = s.ready.map((id) => {
+  $("#next").innerHTML = readyIds.map((id) => {
     const c = s.cards[id], opens = s.unblocks[id] || [];
-    const act = c.kind === "owner" ? '<span class="note" style="margin:0">Your card</span>'
+    const act = queued.includes(id) ? `<span class="tag p">queued${a.settings.auto ? "" : " · resume to start"}</span>`
+      : c.kind === "owner" ? '<span class="note" style="margin:0">Your card</span>'
       : DISPATCH && a.dispatcher ? `<button type="button" data-act="start" data-card="${esc(id)}" data-fkey="start-${esc(id)}">Start now</button>`
       : c.start_with ? `<button type="button" data-copy="${esc(c.start_with)}" data-label="Copy line">Copy line</button>` : "";
     return `<div class="row"><button type="button" class="what" data-open="${esc(id)}"><span class="mono">${esc(id)}</span> ${rich(c.title)}</button>

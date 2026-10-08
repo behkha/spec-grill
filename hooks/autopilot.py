@@ -147,7 +147,8 @@ def write_text(path: str, text: str) -> None:
 def registry(tasks: str) -> dict:
     found = sv.read_json(os.path.join(state_dir(tasks), "runs.json"), {})
     found = found if isinstance(found, dict) else {}
-    for key, empty in (("runs", []), ("attention", {}), ("handled", []), ("manual", []), ("notified", [])):
+    for key, empty in (("runs", []), ("attention", {}), ("handled", []), ("manual", []), ("notified", []),
+                       ("queued", []), ("granted", {})):
         found.setdefault(key, empty)
     return found
 
@@ -435,6 +436,7 @@ def step(tasks: str) -> list:
 
         save_registry(tasks, reg)
         s = sv.build(tasks, 4)
+        reg["queued"] = [c for c in reg["queued"] if c in s["cards"] and s["status"][c] not in sv.FINISHED]
         if cfg["auto"] and not s["autopilot"]["deny"]:
             cfg = change_settings(tasks, auto=False, paused_reason=(
                 "tasks.md §6 has no **Never unattended:** line; add one (for example `Bash(git push:*)`) "
@@ -487,7 +489,7 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         # sessions that stopped to wait for the owner, or never reached the API, are not failed tries
         tries = sum(1 for r in reg["runs"] if r["card"] == cid and not r.get("api_error")
                     and not r["reason"].startswith("answer") and not WAITED.search(r.get("result") or ""))
-        if tries >= cfg["max_attempts"]:
+        if tries >= cfg["max_attempts"] + int(reg["granted"].get(cid, 0)):
             reg["attention"][cid] = (f"{tries} sessions ended without finishing it"
                                      + (f"; the last said: {last['result'][-200:]}" if last["result"] else ""))
             continue
@@ -495,6 +497,8 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
             out.append((cid, "continue", CONTINUE.format(card=cid, status=s["status"][cid]), worked["session"], "", None))
         elif cid in s["ready"]:
             out.append((cid, "start", start_line(s, cid), "", "", None))
+    queue = reg["queued"]
+    out.sort(key=lambda item: queue.index(item[0]) if item[0] in queue else len(queue))
     return out
 
 
@@ -531,6 +535,8 @@ def dispatch(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
                 break
             continue
         run = spawn(tasks, s, reg, cid, reason, prompt, session, approval, deny)
+        if cid in reg["queued"] and not run["error"]:
+            reg["queued"].remove(cid)
         tier = s["cards"][cid]["effort"] or "default"
         events.append(f"{cid}: {reason} · effort {tier}" + (f" · failed: {run['error']}" if run["error"] else ""))
     return events
@@ -624,11 +630,18 @@ def act(tasks: str, action: str, data: dict) -> str:
             if any(a["card"] == cid for a in s["approvals"]):
                 raise Refused(f"{cid} waits for your answer to its approval")
             why = room(s, reg, cfg, cid)
-            if why:
-                raise Refused(f"not now: {why}")
-            reg["attention"].pop(cid, None)
+            was_stuck = reg["attention"].pop(cid, None) is not None
             if cid in reg["manual"]:
                 reg["manual"].remove(cid)
+            if why:
+                # no room now: queue it ahead of the other ready cards; a retry is worth one more session
+                if cid not in reg["queued"]:
+                    reg["queued"].append(cid)
+                    if was_stuck or latest(reg, cid):
+                        reg["granted"][cid] = int(reg["granted"].get(cid, 0)) + 1
+                save_registry(tasks, reg)
+                when = "when a session slot frees up" if cfg["auto"] else "once you press Resume (or Start it when a slot is free)"
+                return f"{cid} queued: it starts {when}. ({why})"
             worked = latest_worked(reg, cid)
             if worked:
                 run = spawn(tasks, s, reg, cid, "continue (owner)", CONTINUE.format(card=cid, status=s["status"][cid]),

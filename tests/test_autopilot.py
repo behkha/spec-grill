@@ -14,6 +14,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "hooks"))
@@ -364,8 +365,8 @@ class Feature(unittest.TestCase):
             if self.state()["status"]["T001"] == "done" and autopilot.live(autopilot.registry(self.tasks)):
                 break
             time.sleep(0.15)
-        with self.assertRaises(autopilot.Refused):
-            autopilot.act(self.tasks, "start", {"card": "T003"})  # the limit is 1
+        self.assertIn("queued", autopilot.act(self.tasks, "start", {"card": "T003"}))  # the limit is 1: it waits its turn
+        self.assertEqual(self.state()["autopilot"]["queued"], ["T003"])
         with self.assertRaises(autopilot.Refused):
             autopilot.act(self.tasks, "retry", {"card": "T001"})  # already done
         with self.assertRaises(autopilot.Refused):
@@ -478,6 +479,30 @@ class Feature(unittest.TestCase):
         self.assertIn("(T001)", mine[0]["subject"])
         self.assertIn("Latest commit:", sv.render(s))
         self.assertTrue(any(c.startswith("new commit") for c in sv.changes({**sv.snapshot(s), "commits": []}, sv.snapshot(s))))
+
+    def test_retry_with_no_room_queues_the_card(self):
+        self.script_for({"T001": ["doing", "doing", "done"]})
+        self.settle()
+        self.assertIn("T001", self.state()["autopilot"]["attention"])
+        autopilot.change_settings(self.tasks, max_parallel=1)
+        blocker = str(uuid.uuid4())  # a live session that fills the only slot
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", blocker])
+        reg = autopilot.registry(self.tasks)
+        reg["runs"].append({"card": "T002", "session": blocker, "attempt": 1, "reason": "start", "pid": proc.pid,
+                            "started": autopilot.stamp(), "ended": "", "exit": None, "cost": 0, "result": "",
+                            "error": "", "log": "runs/none.jsonl"})
+        autopilot.save_registry(self.tasks, reg)
+        message = autopilot.act(self.tasks, "retry", {"card": "T001"})
+        self.assertIn("queued", message)
+        s = self.state()
+        self.assertEqual(s["autopilot"]["queued"], ["T001"])
+        self.assertNotIn("T001", s["autopilot"]["attention"])
+        self.assertEqual(len(self.launched()), 2, "nothing starts while the slot is taken")
+        proc.kill(); proc.wait()
+        self.settle()
+        self.assertEqual(len([c for c in self.launched() if c["card"] == "T001"]), 3, "the queued retry got its session")
+        self.assertEqual(self.state()["status"]["T001"], "done")
+        self.assertEqual(self.state()["autopilot"]["queued"], [])
 
     def test_report_without_autopilot_has_no_gates(self):
         os.remove(os.path.join(os.path.dirname(self.tasks), "state", "autopilot.json"))
