@@ -253,7 +253,10 @@ class Feature(unittest.TestCase):
         self.wait_calls(1)
         run = autopilot.registry(self.tasks)["runs"][0]
         self.assertTrue(sv.pid_alive(run["pid"]))
+        autopilot.set_row(sv.build(self.tasks, 4), "status", {"card": "T001"}, {"status": "doing"})
         autopilot.act(self.tasks, "stop", {"card": "T001"})
+        self.assertEqual(sv.build(self.tasks, 4)["status"]["T001"], "todo",
+                         "a stopped card gives the integration worktree back")
         for _ in range(30):
             autopilot.step(self.tasks)
             if autopilot.registry(self.tasks)["runs"][0]["ended"]:
@@ -659,6 +662,19 @@ after: T002B2 · S · effort low · kind backend
         self.assertFalse(s["autopilot"]["used"])
         self.assertEqual(s["gates"], [])
         self.assertIn("Balance: backend 0/3, frontend 0/2", sv.render(s))
+
+
+class CloseWaits(unittest.TestCase):
+    def test_after_section_5_waits_for_every_backlog_card(self):
+        text = (
+            "# Tasks: X\n\n## 4. Cards\n\n- [x] T001 One\n- [ ] T009 Results\n\n"
+            "#### T009 — Results\nafter: T001, §5 · M · effort medium · kind fullstack\n\n"
+            "## 5. Backlog\n\n- [ ] T001B Fix one\n  after: T001 · S · effort low · kind frontend\n"
+            "- [ ] T001C Fix two\n  after: T001 · S · effort low · kind frontend\n"
+        )
+        cards, _ = sv.parse_tasks(text)
+        self.assertEqual(cards["T009"]["after"], ["T001", "T001B", "T001C"])
+        self.assertEqual(cards["T001B"]["after"], ["T001"])
 
 
 class Template(unittest.TestCase):

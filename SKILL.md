@@ -30,6 +30,7 @@ specs/
     └── state/                   # written during implementation, not by spec-grill
         ├── RESUME.md
         ├── handoff/T0nn.md
+        ├── design-review.md     # leftovers and guesses for the owner to review in one go
         ├── screens/T0nn/*.png   # what each interface card's screens look like
         ├── autopilot.json       # the autopilot's settings (the dashboard changes them)
         ├── runs.json            # the sessions the autopilot started
@@ -128,6 +129,10 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
 8. **Interface cards prove themselves visually.** A `kind frontend` or `kind fullstack` card's **Verify** runs the app, drives its screens in a browser through every state the card builds, saves screenshots at phone and desktop width to `state/screens/T0nn/` (names like `login-error-phone.png`), checks the browser console is clean and an accessibility check passes, and compares the result with `ux.md` and the prototype. Its **Done when** includes the screenshots; its **Read** includes the `ux.md` sections and the prototype screens it builds. Give interface cards effort high: they are judged by how they look and behave, which tests do not catch.
 9. **Owner actions.** Any step the constitution or spec reserves for the owner (deploys, production writes, paid runs, new dependencies, outward messages) is a protocol rule: the session asks in that session, then runs it after a yes — or hands over the exact commands when it can't. A session the autopilot started asks through RESUME's Approvals table and stops until the answer comes. List such steps' commands on §6's **Never unattended** line so the autopilot's sessions cannot run them on their own.
 10. **Diverging from the plan.** When a card splits, merges or reorders plan items, list each change and its reason in the header's "Where the cards differ from plan.md".
+11. **Batch the small cards.** One session per card pays the start-up cost (reading §1–§3, RESUME and the code) every time. Once the backlog holds several small (S) cards, group them into **batches** by screen or files, a handful of cards each, and run one session per batch: it reads once, commits each card on its own, and runs the full check and the browser walk-through once at the batch's end. §5 lists the batches (template below), each with its cards in order, its effort (the highest of its cards) and a **Start with** line. Walk-throughs, checkpoints and the close stay one card per session.
+12. **No follow-up cards from a card.** A card gets one fix. Whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes. The owner reviews that list in one go and decides which lines become cards. Only checkpoint reviews and the owner add §5 cards; this keeps the backlog from growing faster than it shrinks.
+13. **Parallel batches.** Batches whose cards' Touches don't overlap may run side by side: each beside the first works in its own worktree on a short-lived branch (`batch/b<n>`), with its own dev-server port so the app's data stays apart, and merges into the main branch at its end after the full check. `git stash` is shared by every worktree of a repo, so sessions never use it while another batch runs; they save a patch with `git diff` instead. When the constitution says one branch, this needs the owner's amendment first (Phase 0).
+14. **The close waits for everything.** The results card's `after:` names the last checkpoint and `§5` (every backlog card and batch), so the success criteria are measured once, on the finished feature, not while fixes are still open.
 
 ### Checks before presenting
 
@@ -315,13 +320,18 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
 
 ## 1. Session protocol (every card follows it)
 
-1. **One card per session.** Open a fresh session for each card. Never continue into the next card in
-   the same session, even if there is room left. First action: rename the session to `<NNN> T0nn <card title>` (desktop: `set_session_title`; CLI: `/rename`).
+1. **One card or one batch per session.** Open a fresh session for each card, or for each batch of §5's
+   batch list (its cards in the listed order, each committed on its own). Never continue into another
+   card or batch in the same session, even if there is room left. First action: rename the session to `<NNN> T0nn <card title>` (for a batch, T0nn is the batch's id and the title its name, e.g. `004 B2 Search and export`) (desktop: `set_session_title`; CLI: `/rename`).
 2. **Where things live.** State: `specs/NNN-slug/state/RESUME.md` and `state/handoff/T0nn.md`
    <git-ignored folders are read and written by absolute path from worktrees>. Code work happens in
    <the integration worktree `<path>`, branch `<branch>`, created by T001>; a `[P]` card works in
    `<path>-t0nn`, branch `<branch>-t0nn-<slug>`, and merges back at the end of the card — only while no
-   card without `[P]` is `doing` in RESUME; otherwise the branch waits for the next checkpoint.
+   card without `[P]` is `doing` in RESUME; otherwise the branch waits for the next checkpoint. A batch
+   the owner starts beside another works in `<path>-b<n>`, branch `batch/b<n>`, dev server on its own
+   port, and merges back at the batch's end (main merged in first, then the full check). Never `git
+   stash` while another session works in the repo (the stash is shared by every worktree); save a patch
+   with `git diff` instead.
 3. **Start.** Read, in this order and only these:
    1. this file's §1–§3 and your card;
    2. RESUME (status, decisions, locks, blockers);
@@ -337,8 +347,11 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
    (an owner's answer recorded in RESUME's decisions). If not, write it in RESUME's blockers (naming
    your card) and stop. If they hold, set your row in RESUME to `doing` with the date (UTC) and the
    branch before any other work, so the supervisor sees the card running.
-5. **Stay in scope.** Do only your card. Work that belongs elsewhere becomes a new card in §5 with a
-   one-line reason and a note in RESUME; do not do it.
+5. **Stay in scope; one fix, no follow-up cards.** Do only your card (or your batch's cards). Each gets
+   one fix; whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line
+   in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes.
+   Don't add §5 cards: the owner reviews design-review.md in one go and decides which lines become
+   cards (checkpoint reviews still add §5 cards).
 6. **Context budget.** Keep raw logs, query results and big files out of the conversation (scratch
    files; read summaries). If the session gets heavy before the card is done, write the hand-off with
    what is finished and what is left, add the remainder as a new §5 card, and stop.
@@ -350,9 +363,12 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
    RESUME's deploy lock deploys; take it before, release it after.>
 8. **<Project rules from the constitution>** (data handling, secrets, words that must never appear in
    code, …).
-9. **Finish.**
+9. **Finish.** (In a batch: steps 1–4 for each card with the card's own tests and <the fast checks,
+   e.g. typecheck> instead of the full check, then at the batch's end <the full check command> and one
+   browser walk-through over every card's screens, fixes for what they find, and step 5.)
    1. Run the card's Verify and <the full check command>; everything green (or a waiver recorded). An
-      interface card's screenshots are in `state/screens/T0nn/`.
+      interface card's screenshots are in `state/screens/T0nn/`; when the browser window won't shrink to
+      phone width, load the page in a phone-wide iframe and say so in the hand-off.
    2. Commit on the card's branch (conventional message, nothing else in the commit); merge back if the
       card is `[P]` (item 2's rule).
    3. Write the hand-off note from §2's template.
@@ -536,7 +552,7 @@ verify on the deployed system, the rollback path.>
 ### Close
 
 #### T0nn — Results
-after: <last rollout card> · M · effort medium · kind fullstack
+after: <last rollout card>, §5 · M · effort medium · kind fullstack
 
 **Do:** every success criterion with its measured number and source<; the project's phase report>.
 **Done when:** every SC has its number.
@@ -550,6 +566,16 @@ owner what comes next.
 ---
 
 ## 5. Backlog (cards added during execution)
+
+### Batches
+(small backlog cards grouped by screen or files, one session per batch, §1 items 1 and 9; the session
+ticks its batch's line when the batch is done)
+
+- [ ] B1 <batch name>
+
+| batch | name | cards, in order | effort | Start with |
+| --- | --- | --- | --- | --- |
+| B1 | <name> | T0nnB, T0mmC | high | `<Feature> · B1. Follow <absolute path>/tasks.md §1, then the cards of batch B1 (§5, Batches) in order.` |
 
 Add cards here in the same format, numbered `T0nnB`, `T0nnC` after the card they split from (`A` is
 taken by planned splits), with a one-line reason and a meta line `added by T0nn · after: T0nn ·

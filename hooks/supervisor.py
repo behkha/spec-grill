@@ -197,6 +197,14 @@ def parse_tasks(text: str) -> tuple[dict, list]:
         c["conditional"] = [x for x in ids_in(" ".join(COND_RE.findall(c["after_text"])), order)
                             if x not in c["after"]]
         c["after"] += c["conditional"]  # the condition cannot be read here; waiting is the safe side
+    # "after: CPF, §5": the card waits for every backlog card too (the close waits for everything)
+    backlog_at = re.search(r"^## 5\.", text, re.M)
+    if backlog_at:
+        backlog = [m.group(2) for m in CHECK_RE.finditer(text) if m.start() > backlog_at.start()]
+        backlog += [m.group(1) for m in HEAD_RE.finditer(text) if m.start() > backlog_at.start()]
+        for c in cards.values():
+            if "§5" in c["after_text"]:
+                c["after"] += [x for x in dict.fromkeys(backlog) if x != c["id"] and x not in c["after"]]
     for c in cards.values():  # "blocks: T009" on a backlog card makes T009 wait for it
         for target in ids_in(c["blocks_text"], order):
             if target in cards and c["id"] not in cards[target]["after"]:

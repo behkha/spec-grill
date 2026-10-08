@@ -79,6 +79,10 @@ only channel to the owner.
 - Blocked (§1 item 4): record the blocker as §1 says, then end with `AUTOPILOT: BLOCKED`.
 - Context running out (§1 item 6): hand off and add the remainder card as §1 says, then end with
   `AUTOPILOT: SPLIT`.
+- Helper agents (the Agent tool) run in the foreground only (`run_in_background: false`): this session
+  ends when your turn ends, and background agents end with it, before they report.
+- Never `git stash`: the stash is shared by every worktree, and another session may be working in the
+  repo. Save a patch with `git diff` instead.
 - Finished (§1 item 9): end with `AUTOPILOT: DONE`. Never start another card.
 """
 
@@ -819,6 +823,10 @@ def act(tasks: str, action: str, data: dict) -> str:
                 kill(run)
             reg["attention"][cid] = "you stopped its session"
             save_registry(tasks, reg)
+            if s["status"][cid] == "doing" and cid in s["rows"]:
+                # a stopped card no longer holds the integration worktree: the other cards may go on
+                with contextlib.suppress(Refused):
+                    set_row(s, "status", {"card": cid}, {"status": "todo"})
             return f"{cid} stopped"
         if action == "takeover":  # the owner runs the card by hand; the autopilot leaves it alone
             if any(r["card"] == cid for r in live(reg)):
