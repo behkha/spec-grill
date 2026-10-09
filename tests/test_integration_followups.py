@@ -401,6 +401,44 @@ class Lessons(Scratch):
         self.assertNotIn("inf", text.lower())
 
 
+class OneWriter(Scratch):
+    """Item 5e: one atomic writer (supervisor.save) for the supervisor's and the autopilot's state files."""
+
+    def test_the_autopilot_writes_its_files_with_the_supervisors_writer(self):
+        self.assertFalse(hasattr(autopilot, "save_json"), "no second copy of the writer")
+        with mock.patch.object(sv, "save", wraps=sv.save) as save:
+            autopilot.change_settings(self.tasks, notify=True)
+            autopilot.save_registry(self.tasks, autopilot.registry(self.tasks))
+        written = [(os.path.basename(c.args[0]), c.kwargs.get("backup", False)) for c in save.call_args_list]
+        self.assertEqual(written, [("autopilot.json", False), ("runs.json", True)])
+
+    def test_every_write_is_flushed_to_disk_and_renamed_whole(self):
+        path = os.path.join(self.root, "state", "x.json")
+        with mock.patch.object(sv.os, "fsync", wraps=os.fsync) as fsync:
+            sv.save(path, {"a": "é"})
+        self.assertEqual(fsync.call_count, 2, "the file, then its folder (the rename)")
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"a": "é"})
+        self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["x.json"])
+
+    def test_runs_json_keeps_its_last_good_copy(self):
+        path = os.path.join(self.root, "state", "runs.json")
+        sv.save(path, {"runs": [1]}, backup=True)
+        self.assertFalse(os.path.exists(path + ".bak"), "nothing to keep yet")
+        sv.save(path, {"runs": [2]}, backup=True)
+        self.assertEqual(sv.read_json(path + ".bak", None), {"runs": [1]})
+        with open(path, "w") as handle:
+            handle.write("{half")
+        sv.save(path, {"runs": [3]}, backup=True)
+        self.assertEqual(sv.read_json(path + ".bak", None), {"runs": [1]}, "a corrupt file never replaces the .bak")
+        self.assertEqual(sv.read_json(path, None), {"runs": [3]})
+        with mock.patch.object(sv.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                sv.save(path, {"runs": [4]}, backup=True)
+        self.assertEqual(sv.read_json(path, None), {"runs": [3]})
+        self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["runs.json", "runs.json.bak"], "no temporary file left")
+
+
 class Pids(unittest.TestCase):
     """Item 5c: a pid of another account is alive; one no pid_t holds is no pid, never an OverflowError."""
 

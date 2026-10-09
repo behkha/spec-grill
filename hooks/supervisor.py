@@ -123,6 +123,16 @@ def read_json(path: str, default):
         return default
 
 
+def read_json_strict(path: str, default):
+    """Like read_json, but only a missing file gives default: one that exists and does not parse raises
+    (OSError or ValueError), for files where starting over from empty would do harm (runs.json)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+
+
 def load_settings(state_dir: str) -> dict:
     """The autopilot's settings; "exists" says whether the feature uses the autopilot at all."""
     found = read_json(os.path.join(state_dir, "autopilot.json"), None)
@@ -2462,17 +2472,41 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
             worker.join(timeout=10)
 
 
-def save(path: str, data: dict) -> None:
-    """Write JSON whole: into a file beside path, then renamed over it, so no reader sees half of it."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def save(path: str, data, backup: bool = False) -> None:
+    """Write JSON whole and durably; the one writer of the state files, the supervisor's (the --wait
+    snapshot, a new autopilot.json) and the autopilot's (autopilot.json, runs.json). Into a file beside
+    path, flushed to disk, then renamed over it, and the rename flushed too: no reader sees half of it, and
+    a crash leaves the old file or the new one. A failed write leaves the old file and no temporary one.
+    With backup (runs.json), the file it replaces is kept as <path>.bak first, by a second name for the
+    same file, but only while it still parses: a corrupt one never replaces a good .bak."""
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=1)
+            json.dump(data, handle, indent=1, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if backup:
+            try:
+                read_json_strict(path, None)
+                os.link(path, tmp + ".bak")  # the old file itself, under a second name: no copy
+                os.replace(tmp + ".bak", path + ".bak")
+            except (OSError, ValueError):
+                pass  # no old file, or a corrupt one: the .bak stays as it is
         os.replace(tmp, path)
     finally:
-        if os.path.exists(tmp):  # the write failed
-            os.remove(tmp)
+        for left in (tmp, tmp + ".bak"):
+            if os.path.exists(left):  # the write failed half way
+                os.remove(left)
+    try:  # make the rename itself survive a crash
+        handle = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

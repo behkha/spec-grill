@@ -227,41 +227,6 @@ def guard(tasks: str):
                 LOCAL.handle.close()
 
 
-def save_json(path: str, data, backup: bool = False) -> None:
-    """Write a JSON file atomically and durably (fsync before the rename); with backup, the file it
-    replaces becomes <path>.bak first, if that file still parses (a corrupt one never replaces a good .bak)."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1, ensure_ascii=False)
-        handle.flush()
-        os.fsync(handle.fileno())
-    if backup:
-        try:
-            read_json_strict(path, None)
-            os.link(path, tmp + ".bak")  # the old file itself, under a second name: no copy
-            os.replace(tmp + ".bak", path + ".bak")
-        except (OSError, ValueError):
-            pass
-    os.replace(tmp, path)
-    with contextlib.suppress(OSError):  # make the rename itself survive a crash
-        folder = os.open(os.path.dirname(path), os.O_RDONLY)
-        try:
-            os.fsync(folder)
-        finally:
-            os.close(folder)
-
-
-def read_json_strict(path: str, default):
-    """Like sv.read_json, but only a missing file gives default: one that exists and does not parse
-    raises (OSError or ValueError), for files where starting over from empty would do harm."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except FileNotFoundError:
-        return default
-
-
 def signature(path: str):
     """What changes when anyone writes a file: inode (a rename over it), mtime, size; None when missing."""
     try:
@@ -300,12 +265,12 @@ def registry(tasks: str) -> dict:
     never writes it, so the attempts, live sessions and answered approvals are not lost to an empty start."""
     path = os.path.join(state_dir(tasks), "runs.json")
     try:
-        found = read_json_strict(path, {})
+        found = sv.read_json_strict(path, {})
         if not isinstance(found, dict):
             raise ValueError("not a JSON object")
     except (OSError, ValueError) as error:
         try:
-            found = read_json_strict(path + ".bak", None)
+            found = sv.read_json_strict(path + ".bak", None)
             if not isinstance(found, dict):
                 raise ValueError("not a JSON object")
             found["recovered"] = f"state/runs.json did not parse ({error}); read state/runs.json.bak instead"
@@ -318,8 +283,8 @@ def registry(tasks: str) -> dict:
 def save_registry(tasks: str, reg: dict) -> None:
     if reg.get("corrupt"):
         return  # never replace a registry that could not be read with an empty one
-    save_json(os.path.join(state_dir(tasks), "runs.json"), {k: v for k, v in reg.items() if k != "recovered"},
-              backup=True)
+    sv.save(os.path.join(state_dir(tasks), "runs.json"), {k: v for k, v in reg.items() if k != "recovered"},
+            backup=True)  # the previous good copy stays as runs.json.bak
 
 
 def settings(tasks: str) -> dict:
@@ -335,7 +300,7 @@ def change_settings(tasks: str, **changes) -> dict:
                 current[key] = value
         if "auto" in changes and "resume_after" not in changes:
             current["resume_after"] = 0  # the owner's Resume or Pause, or another pause, ends a usage limit's wait
-        save_json(os.path.join(state_dir(tasks), "autopilot.json"), current)
+        sv.save(os.path.join(state_dir(tasks), "autopilot.json"), current)
         if tasks in TRUSTED:  # this process changed them (the owner's dashboard): no confirmation needed
             TRUSTED[tasks].update({k: current[k] for k in changes if k in GUARDED and k in sv.SETTINGS})
         return current
