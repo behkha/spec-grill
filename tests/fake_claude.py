@@ -20,6 +20,10 @@ import sys
 import time
 
 args = sys.argv[1:]
+if os.environ.get("FAKE_ENV"):  # which variables each call got (names only), for the tests of session_env
+    with open(os.environ["FAKE_ENV"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"card": os.environ.get("SPEC_GRILL_CARD"), "args": args[:2],
+                                 "env": sorted(os.environ)}) + "\n")
 if args[:2] == ["auth", "status"]:  # who the CLI is logged in as
     print(json.dumps({"loggedIn": True, "email": os.environ.get("FAKE_EMAIL", "owner@example.com")}))
     sys.exit(0)
