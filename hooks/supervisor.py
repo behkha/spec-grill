@@ -1197,6 +1197,49 @@ def number(value) -> float:
     return out if math.isfinite(out) else 0.0
 
 
+# runs.json: its tables and lists, and the fields of a run that are text or numbers
+REGISTRY_FIELDS = (("runs", list), ("attention", dict), ("handled", list), ("manual", list), ("notified", list),
+                   ("queued", list), ("granted", dict), ("blocked_on", dict))
+RUN_TEXT = ("card", "session", "batch", "reason", "approval", "started", "ended", "result", "error", "log")
+RUN_NUMBERS = ("cost", "started_ts", "kill_sent_ts", "killed_ts", "leftovers_ts")
+
+
+def registry_of(found) -> dict:
+    """runs.json as everything that reads it expects it (build(), lessons(), autopilot.registry()): each
+    table and list of its type, the ids in them as text, every run an object whose text fields are text
+    ("" when missing) and whose costs and times are finite numbers (0 for "n/a", null, NaN or infinity),
+    a run's port slot a whole number. A hand-edited or half-broken file must take down neither the
+    report, the dashboard nor the dispatcher. Changes found in place and returns it."""
+    reg = found if isinstance(found, dict) else {}
+    for key, kind in REGISTRY_FIELDS:
+        if not isinstance(reg.get(key), kind):
+            reg[key] = kind()
+    for key in ("handled", "manual", "notified", "queued"):
+        reg[key] = [x for x in reg[key] if isinstance(x, str)]
+    reg["attention"] = {str(k): "" if v is None else str(v) for k, v in reg["attention"].items()}
+    reg["granted"] = {str(k): max(0, int(number(v))) for k, v in reg["granted"].items()}
+    reg["blocked_on"] = {str(k): [str(x) for x in v] if isinstance(v, list) else []
+                         for k, v in reg["blocked_on"].items()}
+    runs = []
+    for run in reg["runs"]:
+        if not isinstance(run, dict):
+            continue
+        for key in RUN_TEXT:
+            value = run.get(key)
+            run[key] = value if isinstance(value, str) else "" if value in (None, False) else str(value)
+        for key in RUN_NUMBERS:
+            if key in run:
+                run[key] = number(run[key])
+        if "slot" in run:
+            run["slot"] = max(0, int(number(run["slot"])))
+        runs.append(run)
+    reg["runs"] = runs
+    for key in ("account", "chrome_check"):  # read with .get(): an object, or nothing
+        if key in reg and not isinstance(reg[key], dict):
+            reg[key] = None
+    return reg
+
+
 def mtime(path: str) -> float | None:
     try:
         return os.path.getmtime(path)
@@ -1365,12 +1408,7 @@ def build(tasks: str, stale_hours: float) -> dict:
             reasons.append({"kind": "blocker", "on": "marked blocked in RESUME"})
         waits[cid] = reasons
 
-    registry = read_json(os.path.join(state_dir, "runs.json"), {})
-    registry = registry if isinstance(registry, dict) else {}
-    for key, empty in (("runs", []), ("attention", {}), ("manual", []), ("queued", []), ("blocked_on", {})):
-        if not isinstance(registry.get(key, empty), type(empty)):
-            registry[key] = empty  # a hand-edited runs.json must not take every view down
-    registry["runs"] = [r for r in registry.get("runs", []) if isinstance(r, dict)]
+    registry = registry_of(read_json(os.path.join(state_dir, "runs.json"), {}))  # a hand-edited one too
     alive = {id(r): run_alive(r) for r in registry.get("runs", []) if not r.get("ended")}
     live_runs = [r for r in registry.get("runs", []) if alive.get(id(r))]
     batch_runs = {r["batch"]: r for r in live_runs if r.get("batch")}

@@ -303,5 +303,80 @@ class HugeNumbers(Scratch):
         self.assertEqual(len(autopilot.live(autopilot.registry(self.tasks))), 1, "the session runs on")
 
 
+HAND_EDITED = {  # runs.json after a careless hand edit
+    "runs": [1, "x", None,
+             {"card": "T001", "session": "s1", "cost": "n/a", "started": "2026-01-01 00:00Z", "ended": "2026-01-01 00:10Z",
+              "log": "runs/T001-1.jsonl", "result": None, "error": 7, "slot": "x"},
+             {"card": "T001", "session": "s1", "cost": float("nan"), "ended": "2026-01-01 00:20Z", "started_ts": "soon"},
+             {"card": "T003", "session": "s2", "cost": float("inf"), "ended": True},
+             {"card": "T004", "session": "s3", "cost": 1.5, "ended": "2026-01-01 00:30Z", "kill_sent_ts": [], "slot": 2.0},
+             {"session": "s4", "cost": 10 ** 400, "ended": "2026-01-01 00:40Z"}],
+    "attention": ["T001"], "queued": "T001", "manual": [{"card": "T002"}, "T005"], "handled": None,
+    "granted": {"T001": "x", "T002": -3, "T003": 2}, "blocked_on": {"T001": "x", "T002": ["a", 1]},
+    "notified": {}, "account": [], "chrome_check": "running",
+}
+
+
+class HandEditedRegistry(Scratch):
+    """Item 5b: the dispatcher reads runs.json through the normalizer build() uses (sv.registry_of)."""
+
+    def write_registry(self, data) -> None:
+        with open(os.path.join(autopilot.state_dir(self.tasks), "runs.json"), "w") as handle:
+            json.dump(data, handle)  # NaN and Infinity as Python's json writes them
+
+    def test_the_dispatcher_and_the_report_read_one_normalized_registry(self):
+        self.write_registry(HAND_EDITED)
+        reg = autopilot.registry(self.tasks)
+        self.assertEqual([r["card"] for r in reg["runs"]], ["T001", "T001", "T003", "T004", ""])
+        self.assertEqual([r["cost"] for r in reg["runs"]], [0.0, 0.0, 0.0, 1.5, 0.0])
+        first = reg["runs"][0]
+        self.assertEqual((first["result"], first["error"], first["slot"], first["batch"]), ("", "7", 0, ""))
+        self.assertEqual(reg["runs"][1]["started_ts"], 0.0)
+        self.assertEqual((reg["runs"][3]["kill_sent_ts"], reg["runs"][3]["slot"]), (0.0, 2))
+        self.assertEqual((reg["attention"], reg["queued"], reg["manual"], reg["handled"], reg["notified"]),
+                         ({}, [], ["T005"], [], []))
+        self.assertEqual(reg["granted"], {"T001": 0, "T002": 0, "T003": 2})
+        self.assertEqual(reg["blocked_on"], {"T001": [], "T002": ["a", "1"]})
+        self.assertEqual((reg["account"], reg["chrome_check"]), (None, None))
+        self.assertEqual(autopilot.spent(reg), 1.5)
+        s = self.state()
+        self.assertEqual(s["autopilot"]["spent_usd"], 1.5)
+        json.dumps(s, allow_nan=False)  # the dashboard's JSON.parse takes it
+        self.assertEqual(json.loads(json.dumps(sv.registry_of(json.loads(json.dumps(HAND_EDITED))))), reg)
+
+    def test_a_pass_over_a_hand_edited_registry_runs(self):
+        self.write_registry(HAND_EDITED)
+        autopilot.step(self.tasks)  # no KeyError, TypeError or ValueError on the odd entries
+        # "blocked_on": {"T001": "x"} reads as a blocker it did not name: it waits for the owner's Unblock
+        self.assertEqual(autopilot.registry(self.tasks)["blocked_on"].get("T001"), [])
+        self.assertEqual(self.launched_cards(), [])
+        self.assertIn("T001 unblocked", autopilot.act(self.tasks, "unblock", {"card": "T001"}))
+        self.settle()
+        self.assertEqual(self.launched_cards()[0], "T001")
+        self.assertEqual(self.status("T001"), "done")
+
+    def test_a_live_run_with_odd_fields_is_watched_not_tripped_over(self):
+        self.script_for({"T001": ["sleep"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        reg = autopilot.registry(self.tasks)
+        reg["runs"][0].update(started="yesterday", started_ts=None, slot="first", cost="n/a")
+        autopilot.save_registry(self.tasks, reg)
+        autopilot.step(self.tasks)
+        view = autopilot.live_view(self.tasks, "T001", events=False)
+        self.assertTrue(view["run"]["live"])
+        self.assertEqual(autopilot.port_slot(self.state(), autopilot.registry(self.tasks), "T002"), 1)
+
+    def test_a_result_line_that_is_not_an_object_is_no_result(self):
+        log = os.path.join(self.root, "x.jsonl")
+        with open(log, "w") as handle:
+            handle.write('["\\"type\\":\\"result\\""]\n{"type": "result", "result": "ok", "total_cost_usd": "n/a"}\n')
+        found = autopilot.result_of(log)
+        self.assertEqual(found["result"]["result"], "ok")
+        with open(log, "w") as handle:
+            handle.write('["\\"type\\":\\"result\\""]\n')
+        self.assertIsNone(autopilot.result_of(log)["result"])
+
+
 if __name__ == "__main__":
     unittest.main()

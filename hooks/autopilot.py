@@ -295,7 +295,7 @@ def edit_text(path: str, change, tries: int = 8) -> None:
 
 
 def registry(tasks: str) -> dict:
-    """runs.json with its defaults. One that does not parse (a crash mid-write) falls back to
+    """runs.json with its defaults, normalized (sv.registry_of). One that does not parse (a crash mid-write) falls back to
     runs.json.bak ("recovered" says so); with no good .bak, "corrupt" says why, and save_registry
     never writes it, so the attempts, live sessions and answered approvals are not lost to an empty start."""
     path = os.path.join(state_dir(tasks), "runs.json")
@@ -312,10 +312,7 @@ def registry(tasks: str) -> dict:
         except (OSError, ValueError):
             found = {"corrupt": (f"state/runs.json does not parse ({str(error)[:120]}) and there is no good "
                                  "runs.json.bak; fix or remove it, then press Resume")}
-    for key, empty in (("runs", []), ("attention", {}), ("handled", []), ("manual", []), ("notified", []),
-                       ("queued", []), ("granted", {}), ("blocked_on", {})):
-        found.setdefault(key, empty)
-    return found
+    return sv.registry_of(found)  # as build() reads it: a hand-edited entry never trips a pass
 
 
 def save_registry(tasks: str, reg: dict) -> None:
@@ -909,9 +906,11 @@ def result_of(path: str) -> dict:
                     out["stray"] = (out["stray"] + " " + line.strip()).strip()[-300:]
                 elif '"type":"result"' in flat:
                     try:
-                        out["result"] = json.loads(line)
+                        found = json.loads(line)
                     except ValueError:
-                        pass
+                        continue
+                    if isinstance(found, dict):  # stderr shares the log: any JSON line may hold those words
+                        out["result"] = found
                 elif '"is_api_error_message":true' in flat:
                     with contextlib.suppress(ValueError, AttributeError, TypeError):
                         words = [b.get("text", "") for b in json.loads(line)["message"]["content"] if isinstance(b, dict)]
@@ -940,7 +939,7 @@ def reap(tasks: str, reg: dict) -> list:
         found = result_of(os.path.join(state_dir(tasks), run["log"]))
         result = found["result"] or {}
         text = str(result.get("result") or "")
-        run.update(ended=stamp(), exit=code, cost=float(result.get("total_cost_usd") or 0),
+        run.update(ended=stamp(), exit=code, cost=sv.number(result.get("total_cost_usd")),
                    result=text[-600:], worked=found["worked"])
         if not result:
             run["error"] = run["error"] or (f"the session exited ({code}) without a result"
@@ -1151,7 +1150,7 @@ def spent(reg: dict) -> float:
     most: dict = {}
     for r in reg["runs"]:
         key = r.get("session") or id(r)
-        most[key] = max(most.get(key, 0.0), float(r.get("cost") or 0))
+        most[key] = max(most.get(key, 0.0), sv.number(r.get("cost")))
     return sum(most.values())
 
 
@@ -1328,8 +1327,8 @@ def step(tasks: str) -> list:
         for run in live(reg):
             path = os.path.join(state_dir(tasks), run["log"])
             quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
-            started = dt.datetime.strptime(run["started"], "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc)
-            long = now - started.timestamp() > setting(cfg, "max_run_hours") * 3600
+            started = run.get("started_ts") or sv.row_time(run["started"]) or now  # a hand-edited time: not long
+            long = now - started > setting(cfg, "max_run_hours") * 3600
             if ((quiet > setting(cfg, "quiet_minutes") * 60 or long) and run_unit(run) not in reg["attention"]
                     and not run.get("kill_sent_ts")):
                 why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {setting(cfg, 'max_run_hours'):g} h"
@@ -2027,7 +2026,7 @@ def log_tail(tasks: str, cid: str, lines: int = 60) -> str:
                     hint = arg.get("command") or arg.get("file_path") or arg.get("pattern") or arg.get("description") or ""
                     out.append(f"  {block.get('name')}: {str(hint)[:160]}")
         elif event.get("type") == "result":
-            out.append(f"Result ({event.get('subtype')}, ${float(event.get('total_cost_usd') or 0):.2f}): "
+            out.append(f"Result ({event.get('subtype')}, ${sv.number(event.get('total_cost_usd')):.2f}): "
                        + str(event.get("result") or "")[:600])
     return "\n".join(out[:1] + out[1:][-lines:])
 
@@ -2061,9 +2060,9 @@ def absorb(view: dict, event: dict) -> None:
         message = event.get("message", {})
         usage = message.get("usage") or {}
         if usage:
-            view["output_tokens"] += int(usage.get("output_tokens") or 0)
-            view["context"] = int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0) \
-                + int(usage.get("cache_creation_input_tokens") or 0)
+            view["output_tokens"] += int(sv.number(usage.get("output_tokens")))
+            view["context"] = int(sv.number(usage.get("input_tokens")) + sv.number(usage.get("cache_read_input_tokens"))
+                                  + sv.number(usage.get("cache_creation_input_tokens")))
         for block in message.get("content", []) or []:
             if block.get("type") == "text" and block.get("text", "").strip():
                 text = block["text"].strip()
@@ -2098,7 +2097,7 @@ def absorb(view: dict, event: dict) -> None:
                     view["todos"][at]["id"] = found.group(1)
                 add({"kind": "result", "id": tool_id, "error": bool(block.get("is_error")), "text": text[:3000]})
     elif kind == "result":
-        view["final"] = {"error": bool(event.get("is_error")), "cost": float(event.get("total_cost_usd") or 0),
+        view["final"] = {"error": bool(event.get("is_error")), "cost": sv.number(event.get("total_cost_usd")),
                          "text": str(event.get("result") or "")[:2000]}
         add({"kind": "final", "error": bool(event.get("is_error")), "text": str(event.get("result") or "")[:2000]})
     overflow = len(view["events"]) - 400
@@ -2141,8 +2140,8 @@ def live_view(tasks: str, cid: str, after: int = 0, events: bool = True) -> dict
         except OSError:
             last = None
         todos = view["todos"]
-        started = run.get("started_ts") or dt.datetime.strptime(run["started"], "%Y-%m-%d %H:%MZ").replace(
-            tzinfo=dt.timezone.utc).timestamp()
+        # (a run with no readable start, hand-edited: shown as starting now rather than failing the view)
+        started = run.get("started_ts") or sv.row_time(run["started"]) or time.time()
         out = {
             "card": cid,
             "run": {"session": run["session"], "reason": run["reason"], "started_ts": started,
