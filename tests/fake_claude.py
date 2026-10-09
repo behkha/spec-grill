@@ -5,7 +5,8 @@ FAKE_SCRIPT (a JSON file) maps a card to the behaviour of each of its sessions, 
 "done" finishes the card the way §1's Finish item says (RESUME row done, ticked, hand-off written),
 "doing" marks it doing and stops, "work" acts out a realistic session (to-dos, tools, pauses) and finishes, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
 records a blocker, "apierror" fails the way an expired login does, "budget" hits the dollar
-cap, "sleep" stays alive until killed. Every call is appended to FAKE_CALLS as one JSON line.
+cap, "sleep" stays alive until killed (a batch too). Every call is appended to FAKE_CALLS as one JSON
+line: the unit, the arguments, the working folder and $SPEC_GRILL_PORT_OFFSET.
 
 A batch session (SPEC_GRILL_CARD is a batch id such as B1) reads its cards from the batch table:
 "done" finishes every open card of the batch in order and ticks the batch's line; "doing" finishes
@@ -32,7 +33,8 @@ resume = os.path.join(os.path.dirname(tasks), "state", "RESUME.md")
 session = args[args.index("--resume") + 1] if "--resume" in args else args[args.index("--session-id") + 1]
 
 with open(os.environ["FAKE_CALLS"], "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"card": card, "args": args, "cwd": os.getcwd()}) + "\n")
+    handle.write(json.dumps({"card": card, "args": args, "cwd": os.getcwd(),
+                             "port_offset": os.environ.get("SPEC_GRILL_PORT_OFFSET")}) + "\n")
 with open(os.environ["FAKE_SCRIPT"], encoding="utf-8") as handle:
     script = json.load(handle)
 counter = os.environ["FAKE_SCRIPT"] + ".count"

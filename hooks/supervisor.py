@@ -44,12 +44,15 @@ SECTION_RE = re.compile(r"^#{2,3} (.+?)\s*$", re.M)
 COND_RE = re.compile(r"\(([^)]*\bif\b[^)]*)\)")  # "(T036 if German)": a dependency under a condition
 BEFORE_RE = re.compile(rf"\bbefore:?\s+({ID})")
 HEAD_RE = re.compile(rf"^#{{3,4}} ({ID})((?: \[P\])?) — (.+?)\s*$", re.M)
+# "phase 11's T034", "Phase 10's T042A and T043", "phase 11's T021–T023": another feature's cards
+PHASE_RE = re.compile(rf"\b(?i:phase)\s+(\d+)['’]s\s+({ID}(?:\s*(?:[–-]|\band\b|\bor\b|&)\s*{ID})*)\b")
 BATCH = r"B\d+"  # batches of small cards (a stage's, §5's): B1, B2, … (not cards: never in order or progress)
 BATCH_CHECK_RE = re.compile(rf"^- \[([ xX])\] ({BATCH})\b((?: \[P\])?)(?: (.+?))?\s*$", re.M)
 TOUCHES_RE = re.compile(r"\*\*Touches:?\*\*:?(.*?)(?=\s\*\*\w[^*\n]*\*\*|\n[ \t]*\n|\Z)", re.S)
 DO_RE = re.compile(r"\*\*Do:?\*\*:?(.*?)(?=\n[ \t]*\*\*\w[^*\n]*:\*\*|\Z)", re.S)
 # a card that always runs alone: one whose Do asks for the owner's yes, or a walk-through (title)
-OWNER_STEP_RE = re.compile(r"owner['’]s yes|ask first|\bpaid\b|\bdeploy|production", re.I)
+# (a heuristic: "reproduction" is not production, and "not paid for" / "unpaid" is not a paid step)
+OWNER_STEP_RE = re.compile(r"owner['’]s yes|ask first|(?<!\bnot )\bpaid\b|\bdeploy|\bproduction\b", re.I)
 WALK_RE = re.compile(r"walk[- ]?through", re.I)
 SIZE_COST = {"S": 1, "M": 2}  # a batch fits one session: its cards' sizes add up to at most BATCH_BUDGET
 BATCH_BUDGET = 4
@@ -61,7 +64,7 @@ PIPE_RE = re.compile(r"(?<!\\)\|")  # a cell separator: a pipe not escaped as \|
 IMAGE_RE = re.compile(r"^[\w.-]+\.(?:png|jpe?g|webp|gif)$", re.I)
 SETTINGS = {  # state/autopilot.json; the dashboard changes them, autopilot.py acts on them
     "auto": False,               # start ready cards on its own (off: only the owner's Start buttons)
-    "max_parallel": 3,           # sessions at the same time, at most one of them a card without [P]
+    "max_parallel": 3,           # sessions at the same time, at most one of them a card or batch without [P]
     "gate_checkpoints": True,    # after a checkpoint, hold the next stage until the owner approves it
     "approved_gates": [],
     "budget_per_card_usd": 20,   # --max-budget-usd for each session
@@ -141,6 +144,23 @@ def dispatcher_alive(state_dir: str) -> bool:
         return True
 
 
+MERGE_LOCK = "merge.lock"  # state/merge.lock: a [P] session merges only while it holds it (autopilot RULES)
+
+
+def merge_lock(state_dir: str) -> dict | None:
+    """The merge lock, when some session holds it: the folder `state/merge.lock` (`mkdir` takes it,
+    atomically) and its `holder` file, "<unit> <time>"; None when it is free."""
+    path = os.path.join(state_dir, MERGE_LOCK)
+    if not os.path.isdir(path):
+        return None
+    said = read(os.path.join(path, "holder")).strip().split(None, 1)
+    try:
+        ts = os.path.getmtime(path)
+    except OSError:
+        ts = None
+    return {"holder": said[0] if said else "", "since": said[1].strip() if len(said) > 1 else "", "ts": ts}
+
+
 def is_gate(cid: str) -> bool:
     """A build checkpoint (CPA, CPB, …): the stage after it waits for the owner's review."""
     return cid.startswith("CP") and cid not in ("CP0", "CPEND")
@@ -171,7 +191,7 @@ def parse_tasks(text: str) -> tuple[dict, list]:
             cards[cid] = {
                 "id": cid, "title": "", "parallel": False, "ticked": False, "after": [],
                 "after_text": "", "blocks_text": "", "size": "", "effort": "", "start_with": "", "stage": "",
-                "kind": "", "model": "", "touches": [], "asks_owner": False,
+                "kind": "", "model": "", "touches": [], "asks_owner": False, "external": [],
             }
             order.append(cid)
         return cards[cid]
@@ -212,10 +232,13 @@ def parse_tasks(text: str) -> tuple[dict, list]:
 
     for c in cards.values():
         c.pop("headed", None)
-        c["after"] = ids_in(c["after_text"], order)
-        c["conditional"] = [x for x in ids_in(" ".join(COND_RE.findall(c["after_text"])), order)
+        # "phase 11's T034" names a card of another feature: never one of this file's
+        local = PHASE_RE.sub(" ", c["after_text"])
+        c["after"] = ids_in(local, order)
+        c["conditional"] = [x for x in ids_in(" ".join(COND_RE.findall(local)), order)
                             if x not in c["after"]]
         c["after"] += c["conditional"]  # the condition cannot be read here; waiting is the safe side
+        c["external"] = external_deps(c["after_text"])
     # "after: CPF, §5": the card waits for every backlog card too (the close waits for everything)
     backlog_at = re.search(r"^## 5\.", text, re.M)
     if backlog_at:
@@ -225,10 +248,34 @@ def parse_tasks(text: str) -> tuple[dict, list]:
             if "§5" in c["after_text"]:
                 c["after"] += [x for x in dict.fromkeys(backlog) if x != c["id"] and x not in c["after"]]
     for c in cards.values():  # "blocks: T009" on a backlog card makes T009 wait for it
-        for target in ids_in(c["blocks_text"], order):
+        for target in ids_in(PHASE_RE.sub(" ", c["blocks_text"]), order):
             if target in cards and c["id"] not in cards[target]["after"]:
                 cards[target]["after"].append(c["id"])
     return cards, order
+
+
+def external_deps(text: str) -> list:
+    """The other features' cards an `after:` names: "phase 11's T034" -> {"phase": "11", "card": "T034"};
+    a range "phase 11's T021–T023" keeps its end as "through" (build() expands it with that feature's
+    cards). Like ids_in, a mention in brackets is no dependency unless it names a condition, "(… if …)":
+    then it is one, marked conditional."""
+    out: list = []
+
+    def take(part: str, conditional: bool) -> None:
+        for m in PHASE_RE.finditer(part):
+            for piece in re.split(r"\s*(?:\band\b|\bor\b|&)\s*", m.group(2)):
+                ends = ID_RE.findall(piece)
+                if not ends:
+                    continue
+                dep = {"phase": m.group(1), "card": ends[0], "conditional": conditional}
+                if len(ends) > 1:
+                    dep["through"] = ends[-1]
+                if not any(d["phase"] == dep["phase"] and d["card"] == dep["card"] for d in out):
+                    out.append(dep)
+
+    take(re.sub(r"\([^)]*\)", " ", text), False)
+    take(" ".join(COND_RE.findall(text)), True)
+    return out
 
 
 def read_meta(c: dict, body: str) -> None:
@@ -269,6 +316,34 @@ def touch_paths(text: str) -> list:
             if "/" in path or (quoted and re.search(r"\w\.[A-Za-z]\w{0,5}$", path)):
                 out.append(path)
     return list(dict.fromkeys(out))
+
+
+def touch_root(path: str) -> str:
+    """A Touches path as a plain path prefix: a glob is cut back to the folder before its first wildcard
+    (`src/**/*.ts` -> `src`; `**/*.ts` -> "", the whole repo)."""
+    found = re.search(r"[*?\[]", path)
+    if not found:
+        return path.rstrip("/")
+    return path[: found.start()].rsplit("/", 1)[0].rstrip("/") if "/" in path[: found.start()] else ""
+
+
+def touches_clash(mine: list | None, theirs: list | None) -> str | None:
+    """What two units' Touches share: "" when nothing, else the path (`api/x.ts`) or the folder that holds
+    the other's path (`packages/x/…`). None when either unit has a card whose Touches name nothing: such
+    a unit is taken to touch everything, so it never runs beside another."""
+    if mine is None or theirs is None:
+        return None
+    for a in mine:
+        for b in theirs:
+            ra, rb = touch_root(a), touch_root(b)
+            if not ra or not rb:
+                return f"{a if not ra else b} (everything)"
+            if ra == rb:
+                return ra if a.rstrip("/") == b.rstrip("/") else f"{ra}/…"
+            short, long = sorted((ra, rb), key=len)
+            if long.startswith(short + "/"):
+                return f"{short}/…"
+    return ""
 
 
 def expand_braces(token: str) -> list:
@@ -876,6 +951,45 @@ def ago(seconds: float) -> str:
     return f"{minutes // 1440}d ago"
 
 
+def card_status(cards: dict, order: list, resume: dict) -> dict:
+    """Each card's status: its RESUME row when that says one, else its tick in tasks.md."""
+    status = {}
+    for cid in order:
+        row = resume["status"].get(cid)
+        if row and row["status"] in STATUSES:
+            status[cid] = row["status"]
+        else:
+            status[cid] = "done" if cards[cid]["ticked"] else "todo"
+    return status
+
+
+def phase_cards(folder: str, phase: str, cache: dict) -> dict:
+    """Another feature's cards and their status, for "phase 11's T034": the sibling folder of this
+    feature's folder whose name starts with the phase number (`11-…`, `011-…`), read like build() reads
+    its own (tasks.md ticks, state/RESUME.md rows). Empty when no such feature or tasks.md is found: its
+    cards are then "unknown" and wait, the safe side."""
+    if phase in cache:
+        return cache[phase]
+    parent = os.path.dirname(os.path.abspath(folder))
+    found = {"folder": "", "order": [], "status": {}}
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError:
+        names = []
+    for name in names:
+        number = re.match(r"0*(\d+)(?![\d])", name)
+        path = os.path.join(parent, name, "tasks.md")
+        if number and int(number.group(1)) == int(phase) and name[number.end():][:1] in ("-", "_", " ", ".", "") \
+                and os.path.isfile(path):
+            cards, order = parse_tasks(read(path))
+            resume = parse_resume(read(os.path.join(parent, name, "state", "RESUME.md")))
+            found = {"folder": os.path.join(parent, name), "order": order,
+                     "status": card_status(cards, order, resume)}
+            break
+    cache[phase] = found
+    return found
+
+
 def build(tasks: str, stale_hours: float) -> dict:
     text = read(tasks)
     cards, order = parse_tasks(text)
@@ -891,13 +1005,8 @@ def build(tasks: str, stale_hours: float) -> dict:
     for path in glob.glob(os.path.join(handoff_dir, "*.md")):
         handoffs[os.path.basename(path)[:-3]] = os.path.getmtime(path)
 
-    status = {}
-    for cid in order:
-        row = resume["status"].get(cid)
-        if row and row["status"] in STATUSES:
-            status[cid] = row["status"]
-        else:
-            status[cid] = "done" if cards[cid]["ticked"] else "todo"
+    status = card_status(cards, order, resume)
+    phases: dict = {}  # the other features this one's cards wait on, read once per build
 
     settings = load_settings(state_dir)
     # a finished checkpoint holds the next stage until the owner has looked at it (autopilot only)
@@ -918,6 +1027,14 @@ def build(tasks: str, stale_hours: float) -> dict:
             if status.get(dep) not in FINISHED:
                 reasons.append({"kind": "card", "on": dep, "status": status.get(dep, "unknown"),
                                 "conditional": dep in cards[cid]["conditional"]})
+        for dep in cards[cid]["external"]:  # another feature's card: read from that feature's files
+            other = phase_cards(folder, dep["phase"], phases)
+            named = ids_in(f"{dep['card']}–{dep['through']}", other["order"]) if dep.get("through") else [dep["card"]]
+            for x in named:
+                said = other["status"].get(x, "unknown")
+                if said not in FINISHED:
+                    reasons.append({"kind": "phase", "on": f"phase {dep['phase']}'s {x}", "status": said,
+                                    "conditional": dep["conditional"]})
         for d in open_decisions:
             if cid in d["before"]:
                 reasons.append({"kind": "owner", "on": f"decision {d['n']}: {d['question']}"})
@@ -964,12 +1081,36 @@ def build(tasks: str, stale_hours: float) -> dict:
     live_cards += [b["current"] for b in open_batch.values() if b["live"] and b["current"] not in live_cards]
     # a session the autopilot started is running even before it marks its row doing
     doing = [c for c in order if status[c] == "doing" or c in live_cards]
-    serial_doing = [c for c in doing if not cards[c]["parallel"]]
+
+    # a unit is what one session runs: a card, or the unfinished batch the card belongs to
+    def unit_for(c: str) -> str:
+        return batch_of[c] if batch_of.get(c) in open_batch else c
+
+    def unit_parallel(u: str) -> bool:  # a batch is [P] by its checklist line, whatever its cards say
+        return open_batch[u]["parallel"] if u in open_batch else cards[u]["parallel"]
+
+    def unit_touches(u: str) -> list | None:
+        mine = open_batch[u]["cards"] if u in open_batch else [u]
+        return [p for c in mine for p in cards[c]["touches"]] if all(cards[c]["touches"] for c in mine) else None
+
+    serial_doing = [c for c in doing if not unit_parallel(unit_for(c))]
     for b in open_batch.values():
         b["running"] = b["live"] or any(c in doing for c in b["cards"])
-        if b["running"] and not any(c in serial_doing for c in b["cards"]):
-            # a batch is serial: it holds the integration worktree whatever its cards say
+        if b["running"] and not b["parallel"] and not any(c in serial_doing for c in b["cards"]):
+            # a batch without [P] holds the integration worktree whatever its cards say
             serial_doing.append(next((c for c in b["cards"] if c in doing), b["current"]))
+    running_units = list(dict.fromkeys(unit_for(c) for c in doing))
+
+    def touch_wait(u: str) -> dict | None:
+        """A running unit whose Touches overlap u's (or can't be read): u waits for it to finish."""
+        for other in running_units:
+            if other == u:
+                continue
+            shared = touches_clash(unit_touches(u), unit_touches(other))
+            if shared != "":
+                return {"kind": "touches", "on": other, "status": "running", "shares": shared or ""}
+        return None
+
     ready = []
     for cid in order:
         if status[cid] != "todo" or waits[cid] or cid in live_cards or batch_of.get(cid) in open_batch:
@@ -977,6 +1118,9 @@ def build(tasks: str, stale_hours: float) -> dict:
         if not cards[cid]["parallel"] and serial_doing:
             # cards without [P] share the integration worktree: one at a time
             waits[cid].append({"kind": "worktree", "on": serial_doing[0], "status": "doing"})
+            continue
+        if clash := touch_wait(cid):  # never beside a running card or batch whose Touches overlap
+            waits[cid].append(clash)
             continue
         ready.append(cid)
     for b in batches:
@@ -994,8 +1138,10 @@ def build(tasks: str, stale_hours: float) -> dict:
             b["status"] = "running"
         else:
             held = [c for c in serial_doing if c not in b["cards"]]
-            if not b["waits"] and held:
+            if not b["waits"] and held and not b["parallel"]:
                 b["waits"].append({"kind": "worktree", "on": held[0], "status": "doing"})
+            if not b["waits"] and (clash := touch_wait(b["id"])):
+                b["waits"].append(clash)
             b["status"] = "waiting" if b["waits"] else "ready"
     ready_batches = [b for b in batches if b["status"] == "ready"]
 
@@ -1083,6 +1229,13 @@ def build(tasks: str, stale_hours: float) -> dict:
     holder = ID_RE.search(lock or "")
     if holder and status.get(holder.group(0)) in FINISHED:
         drift.append(f"the deploy lock is still held by {holder.group(0)}, which is {status[holder.group(0)]}")
+    merging = merge_lock(state_dir)
+    if merging and merging["holder"]:
+        who = merging["holder"]
+        b = next((x for x in batches if x["id"] == who), None)
+        over = "done" if b and b["done"] else status.get(who) if status.get(who) in FINISHED else ""
+        if over:
+            drift.append(f"the merge lock (state/{MERGE_LOCK}) is still held by {who}, which is {over}")
 
     runs: dict = {}
     # a resumed session reports its running total, so a session costs the most any of its runs reported
@@ -1160,6 +1313,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         "open_decisions": open_decisions,
         "blockers": active_blockers,
         "lock": lock,
+        "merge_lock": merging,
         "stalled": stalled,
         "drift": drift,
         "open_checks": open_checks,
@@ -1216,6 +1370,29 @@ def bar(done: int, total: int) -> str:
 def label(s: dict, cid: str) -> str:
     c = s["cards"][cid]
     return f"{cid}{' [P]' if c['parallel'] else ''} {c['title']}".strip()
+
+
+def wait_text(reasons: list) -> str:
+    """What a card or batch waits for, in words."""
+    parts = []
+    for r in reasons:
+        if r["kind"] == "card":
+            parts.append(f"{r['on']} ({r['status']}{', conditional' if r.get('conditional') else ''})")
+        elif r["kind"] == "phase":  # another feature's card
+            said = "not found" if r["status"] == "unknown" else r["status"]
+            parts.append(f"{r['on']} ({said}{', conditional' if r.get('conditional') else ''})")
+        elif r["kind"] == "worktree":
+            parts.append(f"the integration worktree ({r['on']} is doing)")
+        elif r["kind"] == "touches":
+            parts.append(f"{r['on']} to finish (running; "
+                         + (f"their Touches overlap: {r['shares']})" if r["shares"] else "Touches not readable on both)"))
+        elif r["kind"] == "owner":
+            parts.append(f"you: {r['on']}")
+        elif r["kind"] == "gate":
+            parts.append(f"your review of stage checkpoint {r['on']}")
+        else:
+            parts.append(f"blocker: {r['on']}")
+    return "; ".join(parts)
 
 
 def render(s: dict) -> str:
@@ -1279,27 +1456,21 @@ def render(s: dict) -> str:
     if not s["ready"] and not s["ready_batches"]:
         lines.append("  nothing" + (" until a running card finishes" if s["doing"] else ""))
     parallel = [c for c in s["ready"] if s["cards"][c]["parallel"]]
-    if len(s["ready"]) > 1 and parallel:
+    parallel += [b["id"] for b in s["ready_batches"] if b.get("parallel")]
+    if len(s["ready"]) + len(s["ready_batches"]) > 1 and parallel:
         lines.append(f"  May run side by side, each in its own worktree: {', '.join(parallel)}"
-                     " (plus at most one card without [P])")
+                     " (plus at most one card or batch without [P]; never two whose Touches overlap)")
 
     lines.append("")
     lines.append("Waiting:")
     for cid, reasons in s["waiting"].items():
-        parts = []
-        for r in reasons:
-            if r["kind"] == "card":
-                parts.append(f"{r['on']} ({r['status']}{', conditional' if r.get('conditional') else ''})")
-            elif r["kind"] == "worktree":
-                parts.append(f"the integration worktree ({r['on']} is doing)")
-            elif r["kind"] == "owner":
-                parts.append(f"you: {r['on']}")
-            elif r["kind"] == "gate":
-                parts.append(f"your review of stage checkpoint {r['on']}")
-            else:
-                parts.append(f"blocker: {r['on']}")
-        lines.append(f"  {label(s, cid)} waits for {'; '.join(parts)}")
-    if not s["waiting"]:
+        lines.append(f"  {label(s, cid)} waits for {wait_text(reasons)}")
+    # a batch's waits outside its cards' own: the integration worktree, a running unit's Touches
+    held = [b for b in s["batches"] if b["status"] == "waiting" and b["cards"]
+            and any(w["kind"] in ("worktree", "touches") for w in b["waits"])]
+    for b in held:
+        lines.append(f"  {b['id']}{' [P]' if b.get('parallel') else ''} {b['name']} (batch) waits for {wait_text(b['waits'])}")
+    if not s["waiting"] and not held:
         lines.append("  nobody")
 
     auto = s["autopilot"]
@@ -1324,6 +1495,10 @@ def render(s: dict) -> str:
     lines += [f"  {n}" for n in needs] or ["  nothing"]
     if s["lock"] and s["lock"].lower() != "free":
         lines.append(f"Deploy lock: {s['lock']}")
+    if s.get("merge_lock"):
+        m = s["merge_lock"]
+        lines.append(f"Merge lock: held by {m['holder'] or 'a session that has not said who it is'}"
+                     + (f" since {m['since']}" if m["since"] else ""))
     if s.get("unbatched"):
         lines.append("")
         lines.append("Heads-up:")

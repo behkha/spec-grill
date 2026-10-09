@@ -569,17 +569,24 @@ function why(s, id) {
   const approval = s.approvals.find((x) => x.card === id);
   if (approval) return `asks you to approve ${approval.n}`;
   if (s.yours.includes(id)) return "your card";
-  const w = s.waiting[id] || [];
+  const w = (s.waiting[id] || []).length ? s.waiting[id] : (b && b.status === "waiting" ? b.waits : []);
   if (!w.length) {
     if (cat === "waiting" && s.status[id] === "doing") return "between sessions";
     const opens = s.unblocks[id] || [];
     return opens.length ? `unblocks ${opens.join(", ")}` : "";
   }
   return "waits for " + w.map((r) => r.kind === "card" ? r.on
+    : r.kind === "phase" ? phaseWait(r)
     : r.kind === "worktree" ? `the worktree (${r.on})`
+    : r.kind === "touches" ? `${r.on} (${r.shares ? `shares ${r.shares}` : "Touches unknown"})`
     : r.kind === "owner" ? "your answer to " + r.on.replace(/:.*/, "")
     : r.kind === "gate" ? `your review of ${r.on}`
     : "a blocker").join(", ");
+}
+
+// another feature's card ("phase 11's T034"), read from that feature's files
+function phaseWait(r) {
+  return `${r.on} (${r.status === "unknown" ? "not found" : r.status})`;
 }
 
 function humanStuck(text) {
@@ -666,6 +673,7 @@ function renderAuto(s) {
     ${a.dispatcher ? `<button type="button" data-act="settings" data-auto="${on ? 0 : 1}" data-fkey="auto-toggle"${on ? "" : ' class="primary"'}>${on ? "Pause" : "Resume"}</button>` : ""}
     ${account(a)}
     <span>${a.live.length ? `<b>${a.live.length}</b> running` : "none running"} · <b>$${a.spent_usd.toFixed(2)}</b> spent${a.settings.budget_total_usd ? ` of $${esc(a.settings.budget_total_usd)}` : ""}</span>
+    ${s.merge_lock ? `<span title="state/merge.lock: a [P] session merges into the integration branch only while it holds it">merge lock: <b>${esc(s.merge_lock.holder || "being taken")}</b></span>` : ""}
     <details class="settings"${open || confirming ? " open" : ""}><summary>${icon("gear")}Settings</summary><div class="settings-body">
       ${!a.dispatcher ? `<p class="note">To start sessions, run <code>supervisor.py … --serve --autopilot</code>.</p>` : ""}
       <label>Sessions at the same time <select id="set-par">${[1, 2, 3, 4, 5, 6].map((n) => `<option${n === a.settings.max_parallel ? " selected" : ""}>${n}</option>`).join("")}</select></label>
@@ -914,7 +922,7 @@ function renderSessions(s) {
     if (b) {  // one row for the whole batch: one session runs its cards in order
       const act = queued.includes(id) ? queuedTag : startOrCopy(id, b.start_with);
       return `<div class="row"><button type="button" class="what" data-open="${esc(b.current || b.cards[0])}"><span class="mono">${esc(id)}</span> ${rich(b.name)}</button>
-        <span class="meta"><span class="tag">batch · ${b.cards.length} card${b.cards.length === 1 ? "" : "s"}</span>${b.effort ? `<span class="tag">effort ${esc(b.effort)}</span>` : ""}${act}</span>
+        <span class="meta">${b.parallel ? '<span class="tag p">[P]</span>' : ""}<span class="tag">batch · ${b.cards.length} card${b.cards.length === 1 ? "" : "s"}</span>${b.effort ? `<span class="tag">effort ${esc(b.effort)}</span>` : ""}${act}</span>
         <span class="note" style="flex-basis:100%;margin:0"><span class="mono">${b.cards.map(esc).join(" → ")}</span>${b.finished ? ` · ${progress(b)} finished` : ""}</span>${unblocks}</div>`;
     }
     const c = s.cards[id];
@@ -1215,7 +1223,7 @@ async function openDrawer(id, fresh = true) {
       ${inBatch ? `<dt>Batch</dt><dd><span class="mono">${esc(inBatch.id)}</span> ${rich(inBatch.name)} · ${progress(inBatch)} finished${inBatch.effort ? ` · effort ${esc(inBatch.effort)}` : ""}<br>${inBatch.cards.map((x) => x === id ? `<span class="mono">${esc(x)}</span> <span class="hint">this card</span>` : link(x)).join("<br>")}${ob ? `<div class="note">One session runs these cards in order; start the batch, not the card.</div>` : ""}</dd>` : ""}
       ${ob && ob.start_with ? `<dt>Start with (batch ${esc(ob.id)})</dt><dd><div class="paste"><code>${esc(ob.start_with)}</code><button type="button" data-copy="${esc(ob.start_with)}" data-label="Copy">Copy</button></div></dd>`
         : !ob && !done && c.start_with ? `<dt>Start with</dt><dd><div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}" data-label="Copy">Copy</button></div></dd>` : ""}
-      ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : r.kind === "gate" ? `your review of stage ${link(r.on)}` : r.kind === "owner" ? `your answer: ${rich(r.on)}` : `blocker: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
+      ${reasons.length ? `<dt>Waiting for</dt><dd>${reasons.map((r) => r.kind === "card" ? link(r.on) : r.kind === "phase" ? esc(phaseWait(r)) : r.kind === "worktree" ? `the integration worktree (${link(r.on)})` : r.kind === "touches" ? `${link(r.on)} to finish (${esc(r.shares ? `shares ${r.shares}` : "Touches unknown")})` : r.kind === "gate" ? `your review of stage ${link(r.on)}` : r.kind === "owner" ? `your answer: ${rich(r.on)}` : `blocker: ${rich(r.on)}`).join("<br>")}</dd>` : ""}
       <dt>After</dt><dd>${c.after.length ? c.after.map(link).join("<br>") : `<span class="hint">${esc(c.after_text || "nothing")}</span>`}</dd>
       <dt>Needed by</dt><dd>${needed.length ? needed.map(link).join("<br>") : '<span class="hint">no card waits for it</span>'}</dd>
       ${(s.commits || []).some((x) => x.card === id) ? `<dt>Commits</dt><dd><ol class="commits">${s.commits.filter((x) => x.card === id).map((x) => `<li><time data-ago="${x.ts}">${ago(s.now - x.ts)}</time><span>${commitText(x)}</span></li>`).join("")}</ol></dd>` : ""}

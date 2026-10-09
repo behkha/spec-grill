@@ -171,7 +171,13 @@ class Feature(unittest.TestCase):
     def state(self) -> dict:
         return sv.build(self.tasks, 4)
 
+    def disjoint(self) -> None:
+        """Touches that don't overlap, so T002–T004 may run side by side (a card naming no Touches runs alone)."""
+        for cid, path in (("T002", "`api/orders.py`"), ("T003", "`ui/login.tsx`"), ("T004", "`db/store.py`")):
+            self.touches(cid, path)
+
     def test_runs_the_feature_through_approval_gate_and_owner_card(self):
+        self.disjoint()
         self.script_for({"T003": ["approval", "done"]})
         autopilot.step(self.tasks)
         first = self.wait_calls(1)
@@ -304,6 +310,7 @@ class Feature(unittest.TestCase):
         self.assertEqual(self.state()["status"]["T001"], "done")
 
     def test_approvals_with_the_same_number_stay_apart(self):
+        self.disjoint()
         self.script_for({"T002": ["approval#A1=git push", "done"], "T003": ["approval#A1=fly deploy", "done"],
                          "T004": ["done"]})
         self.settle()
@@ -1181,6 +1188,189 @@ after: T002B2 · S · effort low · kind backend
         self.assertEqual(self.state()["unbatched"], [], "T003 alone is no batch")
 
 
+    # --- [P] batches side by side: the Touches check, own worktrees and ports, the merge lock ---------
+
+    PARALLEL = """## 5. Backlog
+
+### Batches
+
+- [ ] B1 [P] Orders polish
+- [ ] B2 [P] Login polish
+
+| batch | name | cards, in order | effort | Start with |
+| --- | --- | --- | --- | --- |
+| B1 | Orders polish | T002B, T002C | | `Demo · B1. Follow {tasks} §1, then the cards of batch B1 (§5, Batches) in order.` |
+| B2 | Login polish | T003B, T003C | | `Demo · B2. Follow {tasks} §1, then the cards of batch B2 (§5, Batches) in order.` |
+
+- [ ] T002B Orders empty state
+  added by T002 · after: T001 · S · effort medium · kind backend
+  **Start with:** `Demo · T002B. Follow {tasks} §1, then card T002B.`
+  **Touches:** `api/orders/{list.py,empty.py}`.
+- [ ] T002C Orders row copy
+  added by T002 · after: T002B · S · effort medium · kind backend
+  **Start with:** `Demo · T002C. Follow {tasks} §1, then card T002C.`
+  **Touches:** `api/orders/rows.py`.
+- [ ] T003B Login empty state
+  added by T003 · after: T001 · S · effort medium · kind frontend
+  **Start with:** `Demo · T003B. Follow {tasks} §1, then card T003B.`
+  **Touches:** `ui/login/{form.tsx,copy.ts}`.
+- [ ] T003C Login focus ring
+  added by T003 · after: T003B · S · effort medium · kind frontend
+  **Start with:** `Demo · T003C. Follow {tasks} §1, then card T003C.`
+  **Touches:** `ui/login/focus.css`.
+
+"""
+    WHERE = ("2. **Where things live.** Code work happens in the integration worktree `../demo-wt`, branch"
+             " `feat/demo`; a `[P]` card works in `../demo-wt-t0nn`, branch `feat/demo-t0nn-<slug>`. A `[P]`\n"
+             "   batch started beside another works in `../demo-wt-b<n>`, branch `batch/b<n>`, dev server on its own\n"
+             "   port.\n\n")
+
+    def parallel_batches(self, edit=lambda text: text) -> None:
+        """Two [P] batches in §5 whose cards wait only on T001 (done); T002–T004 are the owner's to run."""
+        self.add_to_tasks("## 6. Supervisor", edit(self.PARALLEL.replace("{tasks}", self.tasks)))
+        self.add_to_tasks("## 4. Cards", self.WHERE)
+        open(self.state()["resume"], "a").write("".join(f"| {c} | x | todo | - | - | - |\n"
+                                                         for c in ("T002B", "T002C", "T003B", "T003C")))
+        self.finish("T001")
+        reg = autopilot.registry(self.tasks)
+        reg["manual"] = ["T002", "T003", "T004"]
+        autopilot.save_registry(self.tasks, reg)
+
+    def live_units(self) -> list:
+        return sorted(autopilot.run_unit(r) for r in autopilot.live(autopilot.registry(self.tasks)))
+
+    def steps(self, n: int = 4) -> None:
+        for _ in range(n):
+            autopilot.step(self.tasks)
+            time.sleep(0.1)
+
+    def test_touches_clash_reads_paths_folders_and_globs(self):
+        clash = sv.touches_clash
+        self.assertEqual(clash(["api/x.py"], ["ui/y.tsx"]), "")
+        self.assertEqual(clash(["api/x.py"], ["api/x.py"]), "api/x.py")
+        self.assertEqual(clash(["packages/x"], ["packages/x/a.ts"]), "packages/x/…")
+        self.assertEqual(clash(["packages/x/a.ts"], ["packages/x/"]), "packages/x/…")
+        self.assertEqual(clash(["api/orders"], ["api/orders2.py"]), "", "a prefix only on a folder boundary")
+        self.assertEqual(clash(["src/**/*.ts"], ["src/app/a.ts"]), "src/…")
+        self.assertEqual(clash(["**/*.ts"], ["ui/a.ts"]), "**/*.ts (everything)")
+        self.assertIsNone(clash(None, ["ui/a.ts"]))
+        self.assertIsNone(clash(["ui/a.ts"], None))
+
+    def test_parallel_batches_with_disjoint_touches_start_together(self):
+        self.parallel_batches()
+        self.script_for({"B1": ["sleep"], "B2": ["sleep"]})
+        s = self.state()
+        self.assertEqual([b["id"] for b in s["ready_batches"]], ["B1", "B2"])
+        self.assertIn("May run side by side, each in its own worktree: T002, T003, B1, B2 (plus", sv.render(s))
+        autopilot.step(self.tasks)
+        calls = self.wait_calls(2)
+        self.assertEqual([c["card"] for c in calls], ["B1", "B2"], "both start in the same pass")
+        self.assertEqual(self.live_units(), ["B1", "B2"])
+        s = self.state()
+        self.assertEqual([self.batch(s, b)["status"] for b in ("B1", "B2")], ["running", "running"])
+        first, second = calls[0], calls[1]
+        self.assertEqual((first["port_offset"], second["port_offset"]), ("1", "2"), "a dev-server port each")
+        self.assertEqual([r["slot"] for r in autopilot.registry(self.tasks)["runs"]], [1, 2])
+        rules = second["args"][second["args"].index("--append-system-prompt") + 1]
+        lock = os.path.join(os.path.dirname(self.tasks), "state", "merge.lock")
+        self.assertIn("running now: B1", rules)
+        self.assertIn("`../demo-wt-b2`, branch `batch/b2`", rules, "the worktree §1 names, for this batch")
+        self.assertIn(f"mkdir {lock}", rules)
+        self.assertIn(f"{lock}/holder", rules)
+        self.assertIn("default port plus 2", rules)
+        self.assertIn("$SPEC_GRILL_PORT_OFFSET", rules)
+        self.assertIn("Never `git stash`", rules)
+        self.assertIn("Never touch another session's worktree", rules)
+        self.assertIn("running now: none yet", first["args"][first["args"].index("--append-system-prompt") + 1])
+
+    def test_parallel_batches_whose_touches_overlap_wait(self):
+        self.parallel_batches(lambda text: text.replace("`ui/login/{form.tsx,copy.ts}`", "`api/orders`, `ui/login/form.tsx`"))
+        self.script_for({"B1": ["sleep"], "B2": ["sleep"]})
+        self.steps()
+        self.assertEqual(self.live_units(), ["B1"])
+        self.assertEqual([c["card"] for c in self.launched()], ["B1"])
+        s, reg, cfg = self.state(), autopilot.registry(self.tasks), autopilot.settings(self.tasks)
+        self.assertEqual(autopilot.room(s, reg, cfg, "B2"), "B2 shares api/orders/… with running B1")
+        self.assertEqual(self.batch(s, "B2")["waits"],
+                         [{"kind": "touches", "on": "B1", "status": "running", "shares": "api/orders/…"}])
+        self.assertEqual(self.batch(s, "B2")["status"], "waiting")
+        self.assertIn("  B2 [P] Login polish (batch) waits for B1 to finish (running; their Touches overlap: api/orders/…)",
+                      sv.render(s))
+        self.assertEqual(autopilot.act(self.tasks, "start", {"card": "B2"}),
+                         "B2 queued: it starts when a session slot frees up. (B2 shares api/orders/… with running B1)")
+        # B1 ends: B2 starts on the next pass
+        autopilot.act(self.tasks, "stop", {"card": "B1"})
+        for _ in range(30):
+            autopilot.step(self.tasks)
+            if "B2" in self.live_units():
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.live_units(), ["B2"])
+        # a card naming no Touches overlaps everything: it never runs beside another unit
+        text = open(self.tasks).read().replace("  **Touches:** `api/orders/rows.py`.\n", "")
+        open(self.tasks, "w").write(text)
+        s, reg = self.state(), autopilot.registry(self.tasks)
+        self.assertEqual(autopilot.room(s, reg, cfg, "B1"), "B1's cards name no Touches, so it runs alone (B2 is running)")
+        self.assertEqual(self.batch(s, "B1")["waits"][0]["kind"], "touches")
+
+    def test_a_serial_unit_runs_beside_a_parallel_one_but_not_beside_another_serial_one(self):
+        self.parallel_batches(lambda text: text.replace("- [ ] B2 [P] Login polish", "- [ ] B2 Login polish"))
+        self.touches("T004", "`db/store.py`")
+        reg = autopilot.registry(self.tasks)
+        reg["manual"] = ["T002", "T003"]
+        autopilot.save_registry(self.tasks, reg)
+        self.script_for({"B1": ["sleep"], "B2": ["sleep"], "T004": ["sleep"]})
+        self.steps()
+        self.assertEqual(self.live_units(), ["B1", "T004"], "serial T004 and [P] B1 run together")
+        s, reg, cfg = self.state(), autopilot.registry(self.tasks), autopilot.settings(self.tasks)
+        self.assertIn("T004 holds the integration worktree", autopilot.room(s, reg, cfg, "B2"))
+        self.assertEqual(self.batch(s, "B2")["waits"][0]["kind"], "worktree")
+        calls = {c["card"]: c for c in self.launched()}
+        self.assertEqual(calls["T004"]["port_offset"], "0", "the integration worktree keeps the default port")
+        self.assertNotIn("You are a [P]", calls["T004"]["args"][calls["T004"]["args"].index("--append-system-prompt") + 1])
+
+    def test_the_merge_lock_is_shown_and_cleared_when_its_holder_is_gone(self):
+        self.parallel_batches()
+        lock = os.path.join(os.path.dirname(self.tasks), "state", "merge.lock")
+        os.mkdir(lock)
+        open(os.path.join(lock, "holder"), "w").write("T001 2026-10-09T10:00Z\n")
+        s = self.state()
+        self.assertEqual(s["merge_lock"]["holder"], "T001")
+        self.assertIn("Merge lock: held by T001 since 2026-10-09T10:00Z", sv.render(s))
+        self.assertIn("the merge lock (state/merge.lock) is still held by T001, which is done", s["drift"])
+        self.script_for({"B1": ["sleep"], "B2": ["sleep"]})
+        events = autopilot.step(self.tasks)
+        self.assertIn("cleared the merge lock T001 held: no live session of it is left", events)
+        self.assertFalse(os.path.exists(lock))
+        self.assertIsNone(self.state()["merge_lock"])
+        # held by a live session: it stays, and the supervisor shows it
+        self.wait_calls(2)
+        os.mkdir(lock)
+        open(os.path.join(lock, "holder"), "w").write("B2 2026-10-09T10:05Z\n")
+        self.steps(2)
+        self.assertTrue(os.path.isdir(lock))
+        s = self.state()
+        self.assertEqual((s["merge_lock"]["holder"], s["merge_lock"]["since"]), ("B2", "2026-10-09T10:05Z"))
+        self.assertFalse([d for d in s["drift"] if "merge lock" in d])
+        # just taken, its holder line not written yet: it stays
+        shutil.rmtree(lock)
+        os.mkdir(lock)
+        self.steps(1)
+        self.assertTrue(os.path.isdir(lock))
+
+    def test_chrome_still_runs_one_parallel_batch_at_a_time(self):
+        self.parallel_batches()
+        self.script_for({"B1": ["sleep"], "B2": ["sleep"]})
+        autopilot.act(self.tasks, "settings", {"chrome": True})
+        for _ in range(40):
+            autopilot.step(self.tasks)
+            if autopilot.live(autopilot.registry(self.tasks)):
+                break
+            time.sleep(0.15)
+        self.steps(5)
+        self.assertEqual(len(autopilot.live(autopilot.registry(self.tasks))), 1, "one browser session at a time")
+
+
 class CloseWaits(unittest.TestCase):
     def test_after_section_5_waits_for_every_backlog_card(self):
         text = (
@@ -1192,6 +1382,104 @@ class CloseWaits(unittest.TestCase):
         cards, _ = sv.parse_tasks(text)
         self.assertEqual(cards["T009"]["after"], ["T001", "T001B", "T001C"])
         self.assertEqual(cards["T001B"]["after"], ["T001"])
+
+
+class CrossPhase(unittest.TestCase):
+    """"after: phase 1's T003" names a card of another feature (a sibling folder), never this file's T003."""
+
+    ONE = (
+        "# Tasks: One\n\n## 4. Cards\n\n- [x] T001 Base\n- [ ] T002 Middle\n- [ ] T003 Top\n\n"
+        "#### T001 — Base\nafter: — · M · effort high · kind backend\n\n"
+        "#### T002 — Middle\nafter: T001 · S · effort low · kind backend\n\n"
+        "#### T003 — Top\nafter: T002 · S · effort low · kind backend\n"
+    )
+    TWO = (
+        "# Tasks: Two\n\n## 4. Cards\n\n- [ ] T001 Start\n- [ ] T002 Next\n- [ ] T003 Last\n\n"
+        "### Stage 2 — Build\n\n| batch | name | cards, in order | effort | Start with |\n"
+        "| --- | --- | --- | --- | --- |\n| B1 | Pair | T002, T003 | | `Two · B1.` |\n\n- [ ] B1 Pair\n\n"
+        "#### T001 — Start\nafter: {after} · M · effort high · kind backend\n\n"
+        "#### T002 — Next\nafter: T001 · S · effort low · kind backend\n\n"
+        "#### T003 — Last\nafter: T002 · S · effort low · kind backend\n"
+    )
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="phases-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def feature(self, name: str, text: str, rows: dict | None = None) -> str:
+        folder = os.path.join(self.root, "spec", name)
+        os.makedirs(os.path.join(folder, "state"), exist_ok=True)
+        tasks = os.path.join(folder, "tasks.md")
+        with open(tasks, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        if rows is not None:
+            with open(os.path.join(folder, "state", "RESUME.md"), "w", encoding="utf-8") as handle:
+                handle.write("# resume\n\n## Status\n| card | title | status | branch | commit | date (UTC) |\n"
+                             "| --- | --- | --- | --- | --- | --- |\n"
+                             + "".join(f"| {c} | x | {st} | - | - | - |\n" for c, st in rows.items()))
+        return tasks
+
+    def test_parse_takes_other_phases_out_of_the_local_dependencies(self):
+        cards, _ = sv.parse_tasks(self.TWO.format(after="phase 1's T003 (phase 1 on `main`)"))
+        self.assertEqual(cards["T001"]["after"], [], "T003 here is another feature's")
+        self.assertEqual(cards["T001"]["external"], [{"phase": "1", "card": "T003", "conditional": False}])
+        cards, _ = sv.parse_tasks(self.TWO.format(
+            after="T002, Phase 10’s T041A and T042, phase 11's T021–T023, CPD (the owner's yes)"))
+        self.assertEqual(cards["T001"]["after"], ["T002", "CPD"])
+        self.assertEqual([(d["phase"], d["card"], d.get("through")) for d in cards["T001"]["external"]],
+                         [("10", "T041A", None), ("10", "T042", None), ("11", "T021", "T023")])
+        cards, _ = sv.parse_tasks(self.TWO.format(after="T002 (beside phase 3's T009), (phase 4's CP2 if German)"))
+        self.assertEqual(cards["T001"]["external"], [{"phase": "4", "card": "CP2", "conditional": True}],
+                         "a bracket is no dependency unless it names a condition")
+
+    def test_a_card_waits_for_another_phases_card_until_it_is_finished(self):
+        one = self.feature("01-one", self.ONE, {"T001": "done", "T002": "done", "T003": "todo"})
+        two = self.feature("2-two", self.TWO.format(after="phase 1's T003 (phase 1 on `main`)"),
+                           {"T001": "todo", "T002": "todo", "T003": "todo"})
+        s = sv.build(two, 4)
+        self.assertEqual(s["waiting"]["T001"], [{"kind": "phase", "on": "phase 1's T003", "status": "todo",
+                                                 "conditional": False}])
+        self.assertNotIn("T001", s["ready"])
+        self.assertIn("phase 1's T003 (todo)", sv.wait_text(s["waiting"]["T001"]))
+        self.assertEqual(s["cards"]["T003"]["after"], ["T002"])
+        self.assertEqual(s["drift"], [], "no loop through this file's T003, so no 'can never run'")
+        self.assertEqual(s["unblocks"], {}, "nothing runs, so nothing unblocks")
+        reg, cfg = autopilot.registry(two), autopilot.settings(two)
+        self.assertEqual(autopilot.plan(two, s, reg, cfg), [], "a phase wait is a real wait, not a room wait")
+        self.assertNotIn("phase", autopilot.ROOM_WAITS)
+        # ticked in tasks.md but still todo in feature 1's RESUME: RESUME wins, it still waits
+        open(one, "w").write(self.ONE.replace("- [ ] T003", "- [x] T003"))
+        self.assertEqual(sv.build(two, 4)["waiting"]["T001"][0]["status"], "todo")
+        self.feature("01-one", self.ONE.replace("- [ ] T002", "- [x] T002").replace("- [ ] T003", "- [x] T003"),
+                     {"T001": "done", "T002": "done", "T003": "done"})
+        s = sv.build(two, 4)
+        self.assertNotIn("T001", s["waiting"])
+        self.assertEqual(s["ready"], ["T001"])
+        self.assertEqual(s["unblocks"]["T001"], ["T002"], "unblocks reads this file's cards only")
+        self.assertEqual(s["drift"], [])
+
+    def test_a_missing_phase_or_card_waits_and_says_not_found(self):
+        self.feature("01-one", self.ONE, {"T001": "done", "T002": "done", "T003": "done"})
+        two = self.feature("02-two", self.TWO.format(after="phase 7's T003, phase 1's T099"))
+        s = sv.build(two, 4)
+        self.assertEqual([(w["kind"], w["on"], w["status"]) for w in s["waiting"]["T001"]],
+                         [("phase", "phase 7's T003", "unknown"), ("phase", "phase 1's T099", "unknown")])
+        self.assertEqual(sv.wait_text(s["waiting"]["T001"]),
+                         "phase 7's T003 (not found); phase 1's T099 (not found)")
+        self.assertNotIn("T001", s["ready"])
+        self.assertEqual(s["drift"], [])
+
+    def test_a_range_of_another_phase_expands_with_that_phases_cards(self):
+        self.feature("01-one", self.ONE, {"T001": "done", "T002": "todo", "T003": "todo"})
+        two = self.feature("02-two", self.TWO.format(after="phase 1's T001–T003"))
+        s = sv.build(two, 4)
+        self.assertEqual([w["on"] for w in s["waiting"]["T001"]], ["phase 1's T002", "phase 1's T003"])
+
+    def test_owner_step_heuristic_reads_whole_words(self):
+        for text in ("Write the reproduction test.", "The step is not paid for.", "Unpaid trial only."):
+            self.assertIsNone(sv.OWNER_STEP_RE.search(text), text)
+        for text in ("Switch it on in production.", "A paid API call.", "Deploy to staging.", "Ask first."):
+            self.assertIsNotNone(sv.OWNER_STEP_RE.search(text), text)
 
 
 class Template(unittest.TestCase):
@@ -1242,7 +1530,7 @@ class Template(unittest.TestCase):
                             ("Context budget.", "Context budget"), ("Owner's yes.", "Owner's yes"), ("Finish.", "Finish")):
             self.assertRegex(block, rf"\n\d+\. \*\*{re.escape(title)}")
             self.assertIn(f"§1's {name} item", autopilot.RULES)
-        prompts = [autopilot.RULES, autopilot.CHROME_RULES, autopilot.CONTINUE, autopilot.BATCH_CONTINUE,
+        prompts = [autopilot.RULES, autopilot.PARALLEL_RULES, autopilot.CHROME_RULES, autopilot.CONTINUE, autopilot.BATCH_CONTINUE,
                    autopilot.UNBLOCKED, autopilot.ANSWER, autopilot.APPROVED, autopilot.REJECTED]
         self.assertFalse([p for p in prompts if re.search(r"§1 items? \d|\bitems? \d", p)])
         self.assertFalse(re.search(r"§1 items? \d", skill), "SKILL.md names §1's items, not their numbers")
@@ -1275,6 +1563,18 @@ class Template(unittest.TestCase):
         self.assertEqual([b["id"] for b in s["ready_batches"]], ["B1"])
         self.assertIn("T003", s["ready"], "T003 runs beside B1")
         self.assertFalse({"T002", "T004"} & set(s["ready"]), "B1's cards are not ready alone")
+
+
+    def test_template_names_the_worktrees_and_the_merge_lock_of_parallel_units(self):
+        s = sv.build(self.template_feature(), 4)
+        self.assertEqual(autopilot.own_worktree(s, "B2"), "`<path>-b2`, branch `batch/b2` (§1's \"Where things live\")")
+        self.assertEqual(autopilot.own_worktree(s, "T003"),
+                         "`<path>-t003`, branch `<branch>-t003-<slug>` (§1's \"Where things live\")")
+        where = re.sub(r"\s+", " ", open(s["tasks"]).read().split("**Where things live.**", 1)[1].split("3. **Start.**", 1)[0])
+        self.assertIn("`mkdir state/merge.lock`", where)
+        self.assertIn("`rm -rf state/merge.lock`", where)
+        self.assertEqual(autopilot.own_worktree({**s, "tasks": os.devnull}, "B2"),
+                         "a worktree and branch of your own, as §1's \"Where things live\" says")
 
 
 class Server(unittest.TestCase):

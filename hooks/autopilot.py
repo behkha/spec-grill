@@ -10,7 +10,10 @@ Every few seconds the dispatcher reads the supervisor's picture of each feature 
 - starts each ready card in its own `claude -p` session: the card's Start with line as the prompt,
   its effort and model, the session named after the card, a dollar cap, the rules for running
   unattended, and §6's "Never unattended" tool patterns denied; at most `max_parallel` sessions,
-  and at most one of them a card without [P] (those share the integration worktree). A card with no
+  and at most one of them a card or batch without [P] (those share the integration worktree). A [P]
+  card or batch works in a worktree of its own, on a dev-server port of its own, and merges only while
+  it holds the merge lock (state/merge.lock); it never starts beside a running unit whose cards'
+  Touches overlap its own (a card with no Touches overlaps everything). A card with no
   `kind`, or `kind owner`, is never started on its own;
 - resumes a session when the owner answers the approval it asked for in RESUME's Approvals table;
 - resumes a session that stopped before its card was done, up to `max_attempts` sessions per card,
@@ -83,6 +86,10 @@ only channel to the owner.
   ends when your turn ends, and background agents end with it, before they report.
 - Never `git stash`: the stash is shared by every worktree, and another session may be working in the
   repo. Save a patch with `git diff` instead.
+- Merging any branch into the integration branch (a [P] card's or batch's at a checkpoint, too) happens
+  only while you hold the merge lock: `mkdir state/merge.lock` (next to tasks.md) takes it and fails
+  while another session holds it; write your card and the time into `state/merge.lock/holder`, merge,
+  then `rm -rf state/merge.lock` at once, also when a step failed.
 - Never edit a card's Verify or Done when, a pinning test, or any other check to obtain a pass, and
   never record a waiver yourself: only the owner waives. A check that still fails after the card's one
   fix goes to `state/design-review.md` (§1's scope item) and to your hand-off's Checks table as `fail`.
@@ -92,6 +99,22 @@ only channel to the owner.
   and why it failed, so the session that continues the {work} does not repeat it.
 - Finished (§1's Finish item): end with `AUTOPILOT: DONE`. Never start a card or batch beyond the one you were
   started for.
+"""
+
+PARALLEL_RULES = """
+You are a [P] {work}: other sessions may run beside you (running now: {beside}). So:
+- Work only in a worktree and branch of your own: {where}. Create it from the integration branch if it
+  does not exist yet. Never touch another session's worktree; enter the integration worktree only to
+  merge, as below.
+- Run the dev server on its default port plus {offset} (the offset is in $SPEC_GRILL_PORT_OFFSET), so
+  your app and its data stay apart from the other sessions'.
+- Never `git stash`.
+- Merge back (§1's "Where things live" says when) only while you hold the merge lock `{lock}`.
+  `mkdir {lock}` takes it, and fails while another session holds it: then wait a minute and try again
+  (after 30 minutes, record a blocker and stop). Once it is yours, run
+  `echo "{unit} $(date -u +%Y-%m-%dT%H:%MZ)" > {lock}/holder`; merge the integration branch into your
+  branch, run the full check, merge your branch into the integration branch, and `rm -rf {lock}` at
+  once, also when a step failed. Never remove the lock while another session holds it.
 """
 
 CHROME_RULES = """
@@ -331,6 +354,90 @@ def session_name(s: dict, cid: str) -> str:
     return re.sub(r"\s+", " ", name).strip()[:120]
 
 
+# --- running side by side: [P] units, their Touches, worktrees, ports and the merge lock --------------
+
+
+def unit_parallel(s: dict, unit: str) -> bool:
+    """A unit may run beside others: a batch by `[P]` on its checklist line (whatever its cards say), a
+    card by `[P]` on its own."""
+    b = batch(s, unit)
+    return bool(b.get("parallel")) if b else bool(s["cards"].get(unit, {}).get("parallel"))
+
+
+def unit_touches(s: dict, unit: str) -> list | None:
+    """The paths a unit's cards name under Touches; None when one of them names none (it touches
+    everything, as far as anyone can tell)."""
+    found = [s["cards"].get(c, {}).get("touches") or [] for c in members(s, unit)]
+    return [p for f in found for p in f] if found and all(found) else None
+
+
+def running_units(s: dict, reg: dict, unit: str) -> list:
+    """The other units running now: those with a live session, and those with a card `doing` in RESUME
+    (a session run by hand, or one between its sessions)."""
+    found = [run_unit(r) for r in live(reg)] + [unit_of(s, c) for c in s["doing"]]
+    mine = {unit, *members(s, unit)}
+    return [u for u in dict.fromkeys(found) if u not in mine]
+
+
+def own_worktree(s: dict, unit: str) -> str:
+    """Where a [P] unit works, as tasks.md §1's "Where things live" item names it: `<path>-b<n>`, branch
+    `batch/b<n>` for a batch, `<path>-t0nn`, branch `<branch>-t0nn-<slug>` for a card. Said generically
+    when §1 doesn't name them."""
+    flat = re.sub(r"\s+", " ", sv.read(s["tasks"]))
+    item = re.search(r"Where things live\.?\*\*(.*?)(?= \d+\. \*\*|$)", flat)
+    item = item.group(1) if item else ""
+    if batch(s, unit):
+        found = re.search(r"`([^`]*-b<n>)`,? (?:on )?branch `([^`]*b<n>[^`]*)`", item)
+        mark, value = "<n>", unit[1:]
+    else:
+        found = re.search(r"`([^`]*-t0nn)`,? (?:on )?branch `([^`]*t0nn[^`]*)`", item, re.I)
+        mark, value = "t0nn", unit.lower()
+    if not found:
+        return "a worktree and branch of your own, as §1's \"Where things live\" says"
+    path, branch = (re.sub(re.escape(mark), value, g, flags=re.I) for g in found.groups())
+    return f"`{path}`, branch `{branch}` (§1's \"Where things live\")"
+
+
+def port_slot(s: dict, reg: dict, unit: str) -> int:
+    """The dev-server port offset a session gets: 0 (the default port) for a unit without [P], which works
+    in the integration worktree; for a [P] unit the slot its last session had, when no live session
+    holds it, else the lowest slot from 1 up that none holds."""
+    if not unit_parallel(s, unit):
+        return 0
+    taken = {int(r.get("slot") or 0) for r in live(reg)}
+    last = unit_latest(reg, s, unit)
+    if last and int(last.get("slot") or 0) > 0 and int(last["slot"]) not in taken:
+        return int(last["slot"])
+    slot = 1
+    while slot in taken:
+        slot += 1
+    return slot
+
+
+def merge_lock_path(tasks: str) -> str:
+    return os.path.join(state_dir(tasks), sv.MERGE_LOCK)
+
+
+def clear_merge_lock(tasks: str, s: dict, reg: dict) -> str:
+    """Remove a merge lock its holder left behind ("" when it stays): one whose holder unit has no live
+    session. It stays while a just-taken lock has no holder line yet (2 minutes), and while the holder is a
+    unit the owner runs by hand (taken over, or never run by the autopilot and `doing`)."""
+    held = sv.merge_lock(state_dir(tasks))
+    if not held:
+        return ""
+    who = held["holder"]
+    if not who:
+        if held["ts"] and time.time() - held["ts"] < 120:
+            return ""
+    elif any(run_unit(r) == who or r["card"] == who for r in live(reg)):
+        return ""
+    elif who in reg["manual"] or (is_unit(s, who) and not unit_runs(reg, s, who)
+                                  and any(s["status"].get(c) == "doing" for c in members(s, who))):
+        return ""
+    shutil.rmtree(merge_lock_path(tasks), ignore_errors=True)
+    return f"cleared the merge lock {who or 'nobody'} held: no live session of it is left"
+
+
 def ending(run: dict) -> str:
     """How a session ended, in one line for the session that continues its card: an error from its
     start (reap keeps "<reason>: <the first 300 characters>"), a result from its end."""
@@ -369,7 +476,10 @@ def permitted(deny: list, step: str) -> list:
     return out
 
 
-def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: bool, deny: list) -> list:
+def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: bool, deny: list,
+            slot: int = 0, beside: list | None = None) -> list:
+    """The `claude -p` command line of a unit's session. A [P] unit's rules add PARALLEL_RULES: its own
+    worktree, its port offset (slot), the units running beside it, and the merge lock."""
     info = unit_info(s, cid)
     cmd = [launcher(cfg, s), "-p", "--output-format", "stream-json", "--verbose",
            "--permission-mode", str(cfg["permission_mode"]),
@@ -382,6 +492,10 @@ def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: boo
     if deny:
         cmd += ["--settings", json.dumps({"permissions": {"deny": deny}})]
     rules = RULES.format(what=info["what"], work=info["work"], handoff=info["handoff"], tasks=s["tasks"])
+    if unit_parallel(s, cid):
+        rules += PARALLEL_RULES.format(work=info["work"], beside=", ".join(beside or []) or "none yet",
+                                       where=own_worktree(s, cid), offset=slot, unit=cid,
+                                       lock=merge_lock_path(s["tasks"]))
     if cfg.get("chrome"):
         cmd.append("--chrome")
         rules += CHROME_RULES
@@ -407,11 +521,15 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
            "worked": False, "log": os.path.relpath(log, state_dir(tasks))}
     if b:
         run["batch"] = cid
-    env = {**os.environ, "SPEC_GRILL_AUTOPILOT": "1", "SPEC_GRILL_CARD": cid}
+    run["slot"] = port_slot(s, reg, cid)
+    beside = running_units(s, reg, cid)
+    env = {**os.environ, "SPEC_GRILL_AUTOPILOT": "1", "SPEC_GRILL_CARD": cid,
+           "SPEC_GRILL_PORT_OFFSET": str(run["slot"])}
     deny = s["autopilot"]["deny"] if deny is None else deny
     try:
         with open(log, "w", encoding="utf-8") as out:
-            proc = subprocess.Popen(command(cfg, s, cid, session, prompt, resume, deny), cwd=repo_root(tasks),
+            proc = subprocess.Popen(command(cfg, s, cid, session, prompt, resume, deny, run["slot"], beside),
+                                    cwd=repo_root(tasks),
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                     env=env, start_new_session=True)
         run["pid"] = proc.pid
@@ -669,6 +787,8 @@ def step(tasks: str) -> list:
 
         save_registry(tasks, reg)
         s = sv.build(tasks, 4)
+        if cleared := clear_merge_lock(tasks, s, reg):  # its holder's session ended without releasing it
+            events.append(cleared)
         reg["queued"] = [c for c in reg["queued"] if is_unit(s, c) and not unit_finished(s, c)]
         for run in ended:  # a session that stopped on a blocker it recorded waits for the blocker to clear
             cid = run_unit(run)
@@ -750,7 +870,7 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
                 continue  # a blocker still names it
             if not recorded and cid not in reg["queued"]:
                 continue  # it named no blocker we can watch: the owner unblocks it on the dashboard
-            if any(w["kind"] not in ("blocker", "worktree") for w in waiting_of(s, cid)):
+            if any(w["kind"] not in ("blocker", "worktree", "touches") for w in waiting_of(s, cid)):
                 continue
             how = "the owner unblocked it" if cid in reg["queued"] and not recorded else "its blocker is gone from RESUME"
             if worked:
@@ -771,8 +891,8 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         if any(a["card"] in mem for a in s["approvals"]):
             continue  # waiting for the owner's answer
         kinds = {w["kind"] for w in waiting_of(s, cid)}
-        if kinds - {"worktree"} or (kinds and not any(s["status"][c] == "doing" for c in mem)):
-            continue  # waits for a card, a decision, a blocker, a stage review or the worktree
+        if kinds - ROOM_WAITS or (kinds and not any(s["status"][c] == "doing" for c in mem)):
+            continue  # waits for a card, a decision, a blocker, a stage review, the worktree or a Touches overlap
         last = unit_latest(reg, s, cid)
         if not last:
             if is_ready(s, cid):
@@ -796,9 +916,14 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
     return out
 
 
+ROOM_WAITS = {"worktree", "touches"}  # waits that last only while another unit runs: room() decides them
+
+
 def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
     """Why a session for cid (a card or a batch) can't start now ("" when it can): the parallel limit,
-    the shared worktree, or the total budget (counting each live session at its full cap)."""
+    Chrome (one session at a time), the integration worktree (one unit without [P] at a time), a running
+    unit whose cards' Touches overlap cid's (either way round; a card with no Touches overlaps
+    everything), or the total budget (counting each live session at its full cap)."""
     running = live(reg)
     if len(running) >= cfg["max_parallel"]:
         return f"{len(running)} sessions are running (the limit is {cfg['max_parallel']})"
@@ -806,13 +931,20 @@ def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
         return "checking that the sessions' Chrome reaches the app signed in"
     if cfg.get("chrome") and running:
         return f"{len(running)} sessions are running (with Chrome, the limit is 1: they share one browser)"
-    if batch(s, cid) or not s["cards"][cid]["parallel"]:  # a batch is serial, whatever its cards say
-        serial = {run_unit(r) for r in running if r.get("batch") or not s["cards"].get(r["card"], {}).get("parallel")}
-        serial |= {unit_of(s, c) for c in s["doing"] if not s["cards"][c]["parallel"] or open_batch(s, c)}
-        serial -= {cid, *members(s, cid)}
+    others = running_units(s, reg, cid)
+    if not unit_parallel(s, cid):
+        serial = [u for u in others if not unit_parallel(s, u)]
         if serial:
-            return (f"{', '.join(sorted(serial))} holds the integration worktree (cards without [P], and batches,"
+            return (f"{', '.join(sorted(serial))} holds the integration worktree (cards and batches without [P]"
                     " run one at a time)")
+    mine = unit_touches(s, cid)
+    for other in others:
+        shared = sv.touches_clash(mine, unit_touches(s, other))
+        if shared:
+            return f"{cid} shares {shared} with running {other}"
+        if shared is None:
+            return (f"{cid}'s cards name no Touches, so it runs alone ({other} is running)" if mine is None
+                    else f"running {other}'s cards name no Touches, so {cid} waits for it")
     total = cfg["budget_total_usd"]
     if total and spent(reg) + (len(running) + 1) * cfg["budget_per_card_usd"] > total:
         return f"another session could take the spend past the ${total} budget"
@@ -933,7 +1065,7 @@ def act(tasks: str, action: str, data: dict) -> str:
             if any(s["cards"][c]["kind"] == "owner" for c in (b["open"] if b else mem)):
                 raise Refused(f"{cid} is your card: do it, then mark it done" if not b
                               else f"{cid} holds an owner's card: take it out of the batch, or run the batch by hand")
-            waits = [w for w in waiting_of(s, cid) if w["kind"] != "worktree"]
+            waits = [w for w in waiting_of(s, cid) if w["kind"] not in ROOM_WAITS]  # room() says those
             if waits:
                 raise Refused(f"{cid} still waits for {', '.join(w['on'] for w in waits)}")
             if any(a["card"] in mem for a in s["approvals"]):
