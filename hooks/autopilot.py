@@ -1039,7 +1039,7 @@ def kill(run: dict, sig: int = signal.SIGTERM) -> bool:
         return False
     try:
         os.killpg(int(run["pid"]), sig)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, OverflowError):
         return False
     if sig == signal.SIGTERM:
         run.setdefault("kill_sent_ts", time.time())

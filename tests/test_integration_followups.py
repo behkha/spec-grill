@@ -378,5 +378,32 @@ class HandEditedRegistry(Scratch):
         self.assertIsNone(autopilot.result_of(log)["result"])
 
 
+class Pids(unittest.TestCase):
+    """Item 5c: a pid of another account is alive; one no pid_t holds is no pid, never an OverflowError."""
+
+    def test_a_process_of_another_account_is_alive(self):
+        self.assertTrue(sv.pid_alive(os.getpid()))
+        if os.getuid() != 0:
+            self.assertTrue(sv.pid_alive(1), "pid 1 runs as root: os.kill answers EPERM")
+        with mock.patch.object(sv.os, "kill", side_effect=PermissionError(1, "Operation not permitted")):
+            self.assertTrue(sv.pid_alive(4242))
+        with mock.patch.object(sv.os, "kill", side_effect=ProcessLookupError(3, "No such process")):
+            self.assertFalse(sv.pid_alive(4242))
+
+    def test_what_is_no_pid_is_not_alive(self):
+        with mock.patch.object(sv.os, "kill") as kill:
+            for pid in (2 ** 31, 2 ** 40, 10 ** 400, 0, -1, True, None, "x", "", [], float("inf"), float("nan")):
+                self.assertFalse(sv.pid_alive(pid), repr(pid))
+            kill.assert_not_called()  # 0 and -1 would signal a whole process group, or everything
+        self.assertTrue(sv.pid_alive(str(os.getpid())), "a pid written as text")
+
+    def test_a_run_with_a_pid_past_pid_t_is_not_alive_and_is_never_signalled(self):
+        for pid in (2 ** 40, 10 ** 400):
+            run = {"pid": pid, "session": "abc", "ended": ""}
+            self.assertFalse(sv.run_alive(run))
+            self.assertFalse(autopilot.kill(run))
+            self.assertFalse(autopilot.kill(run, signal.SIGKILL))
+
+
 if __name__ == "__main__":
     unittest.main()

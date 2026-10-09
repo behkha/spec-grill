@@ -132,11 +132,24 @@ def load_settings(state_dir: str) -> dict:
 
 
 def pid_alive(pid) -> bool:
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
+    """A process with this pid exists (a zombie too), whoever runs it: EPERM says it is there under another
+    account. False for what is no pid: not a whole number, 0 or less (os.kill would signal a process group,
+    or every process), or past what a pid_t holds (os.kill would raise OverflowError)."""
+    if isinstance(pid, bool):
         return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not 0 < pid < 2 ** 31:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
 
 
 def run_alive(run: dict) -> bool:
