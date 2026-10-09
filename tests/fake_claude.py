@@ -46,6 +46,15 @@ steps = script.get(card, ["done"])
 behaviour = steps[min(n, len(steps) - 1)]
 
 
+def save(path: str, text: str) -> None:
+    """Write tasks.md or RESUME.md whole (a file beside it, then a rename), so the dispatcher and the
+    tests never read one half written."""
+    tmp = f"{path}.{os.getpid()}.fake"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
 def emit(event: dict) -> None:
     print(json.dumps({**event, "session_id": session}), flush=True)
 
@@ -53,16 +62,14 @@ def emit(event: dict) -> None:
 def set_status(status: str, cid: str = card) -> None:
     text = open(resume).read()
     text = re.sub(rf"^\| {cid} \|([^|]*)\| [a-z]+ \|", rf"| {cid} |\1| {status} |", text, flags=re.M)
-    with open(resume, "w") as handle:
-        handle.write(text)
+    save(resume, text)
 
 
 def finish(cid: str) -> None:
     """Finish a card the way §1's Finish item says: RESUME row done, ticked, hand-off written, committed."""
     set_status("done", cid)
     text = open(tasks).read()
-    with open(tasks, "w") as handle:
-        handle.write(re.sub(rf"^- \[ \] {cid}\b", f"- [x] {cid}", text, flags=re.M))
+    save(tasks, re.sub(rf"^- \[ \] {cid}\b", f"- [x] {cid}", text, flags=re.M))
     os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
     with open(os.path.join(os.path.dirname(resume), "handoff", f"{cid}.md"), "w") as handle:
         handle.write(f"# {cid}\n")
@@ -88,6 +95,13 @@ if behaviour == "apierror":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Failed"}]}, "is_api_error_message": True})
     emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
           "result": "Failed to authenticate: OAuth session expired", "total_cost_usd": 0})
+    sys.exit(1)
+if behaviour.startswith("limit"):  # a usage limit: "limit=<s>" names a reset <s> seconds ahead, "limit" no time
+    reset = behaviour.partition("=")[2]
+    text = f"Claude AI usage limit reached|{int(time.time() + float(reset))}" if reset else "You've hit your usage limit"
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}, "is_api_error_message": True})
+    emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+          "result": text, "total_cost_usd": 0})
     sys.exit(1)
 
 if behaviour == "work":  # a realistic session: a to-do list, tool calls with results, usage, pauses
@@ -118,8 +132,7 @@ if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):  # a batch
         finish(cid)
     if behaviour == "done":
         text = open(tasks).read()
-        with open(tasks, "w") as handle:
-            handle.write(re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
+        save(tasks, re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
     elif todo[1:]:
         set_status("doing", todo[1])
 elif behaviour == "sleep":
@@ -130,7 +143,7 @@ elif behaviour == "done":
     finish(card)
     if "answered approval" in args[-1] and "approved" in args[-1]:
         text = open(resume).read()
-        open(resume, "w").write(re.sub(r"\| approved \|", "| done |", text))
+        save(resume, re.sub(r"\| approved \|", "| done |", text))
 elif behaviour == "doing":
     set_status("doing")
 elif behaviour.startswith("approval"):  # "approval", "approval=<step>", "approval#A1=<step>"
@@ -142,20 +155,20 @@ elif behaviour.startswith("approval"):  # "approval", "approval=<step>", "approv
     step = (found.group(2) or "deploy to staging").replace("|", "\\|")
     row = f"| {number} | {card} | {step} | the card's verify step | pending | |\n"
     text = re.sub(r"(## Approvals\n(?:.*\n)*?\| --- .*\n)", lambda m: m.group(1) + row, text)
-    open(resume, "w").write(text)
+    save(resume, text)
 elif behaviour == "decision":
     set_status("doing")
     text = open(resume).read()
     text = text.replace("| 1 | Which payment provider? | Stripe | T006 | | |",
                         f"| 1 | Which payment provider? | Stripe | T006 | | |\n| 2 | Which layout? | B | {card} | | |")
-    open(resume, "w").write(text)
+    save(resume, text)
     emit({"type": "result", "subtype": "success", "is_error": False,
           "result": "AUTOPILOT: WAITING FOR DECISION 2", "total_cost_usd": 0.1})
     sys.exit(0)
 elif behaviour == "blocked":
     set_status("blocked")
     text = open(resume).read()
-    open(resume, "w").write(text.replace("## Blockers\n", f"## Blockers\n- {card}: needs a key\n"))
+    save(resume, text.replace("## Blockers\n", f"## Blockers\n- {card}: needs a key\n"))
 if behaviour == "hang":  # gives its final result, then never exits
     emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
           "result": "You've hit your session limit · resets 3:10pm", "total_cost_usd": 1.5})

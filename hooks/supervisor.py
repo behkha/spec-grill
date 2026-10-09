@@ -78,6 +78,7 @@ SETTINGS = {  # state/autopilot.json; the dashboard changes them, autopilot.py a
     "result_grace_s": 30,        # stop a session this long after its final result if it has not exited
     "claude": "claude",
     "paused_reason": "",
+    "resume_after": 0,           # a usage limit's pause: switch auto back on after this UTC epoch (0: wait for the owner)
 }
 
 
