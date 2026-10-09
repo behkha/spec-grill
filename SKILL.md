@@ -139,11 +139,11 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
     - *`[P]`:* a batch may run beside another batch or card only when none of its cards' Touches overlaps theirs; write `[P]` on the batch's checklist line and name whom it may run beside in "Who may run beside whom".
 
     Each stage lists its batches right under its heading, in a small table with §5's columns (batch | name | cards, in order | effort | Start with), and each batch gets a checklist line `- [ ] B<n> <name>` in §4's checklist, after its last card. Batch ids run across the whole file: B1, B2, … in the stages, then §5's batches continue the numbering. A batched card keeps its full card (Start with, Read, Do, Done when, Verify, Touches) and can still be run alone by hand, but while its batch is unfinished the supervisor and the autopilot offer only the batch. During execution the checkpoint routine and the owner's design-review triage batch the new §5 cards by the same rules (rule 12, template below).
-12. **No follow-up cards from a card.** A card gets one fix. Whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes. The owner reviews that list in one go and decides which lines become cards; the new small cards are batched in the same step (rule 11), in §5's batch table. Only checkpoint reviews and the owner add §5 cards; this keeps the backlog from growing faster than it shrinks.
-13. **Parallel batches.** Batches whose cards' Touches don't overlap may run side by side (`[P]` on the batch's line): each works in its own worktree on a short-lived branch (`batch/b<n>`), with its own dev-server port so the app's data stays apart, and merges into the integration branch at its end, after merging that branch in and running the full check, while it holds the merge lock (`state/merge.lock`), so two batches that finish together merge one after the other. Write Touches on every card of a `[P]` batch: a card without them overlaps everything, and the autopilot then runs its batch alone. `git stash` is shared by every worktree of a repo, so sessions never use it while another batch runs; they save a patch with `git diff` instead. When the constitution says one branch, this needs the owner's amendment first (Phase 0).
+12. **No follow-up cards from a card.** A card gets one fix. Whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line in the feature's `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes. The owner reviews that list in one go and decides which lines become cards; the new small cards are batched in the same step (rule 11), in §5's batch table. Only checkpoint reviews and the owner add §5 cards; this keeps the backlog from growing faster than it shrinks. The one exception is a **split**: a session that runs out of context before its card is done adds the rest of that same work as one §5 card whose `after:` names the original, then ticks the original and stops (§1's Context budget item; an autopilot session ends with `AUTOPILOT: SPLIT`). That is the card's own work, not a follow-up.
+13. **Parallel batches.** Batches whose cards' Touches don't overlap may run side by side (`[P]` on the batch's line): each works in its own worktree on a short-lived branch (`batch/b<n>`), with its own dev-server port so the app's data stays apart, and merges into the integration branch at its end, after merging that branch in and running the full check, while it holds the merge lock (`state/merge.lock` in the feature folder, by absolute path, never relative to the worktree), so two batches that finish together merge one after the other. Write Touches on every card of a `[P]` batch: a card without them overlaps everything, and the autopilot then runs its batch alone. `git stash` is shared by every worktree of a repo, so sessions never use it while another batch runs; they save a patch with `git diff` instead. When the constitution says one branch, this needs the owner's amendment first (Phase 0).
 14. **Checks are fixed, and every pass has evidence.** Each card's **Done when** is a list of observable criteria (a command and the output that counts as a pass, a file that exists, a screenshot), never "works" or "looks right". The session copies them into its hand-off's **Checks** table (criterion | verdict | evidence | correction), with `pass`, `fail` or `unresolved` and the evidence for each: the command and its decisive output line, a file path, a screenshot path. Missing evidence stays visible as `unresolved`. A session never edits a card's Verify or Done when, a pinning test, or any other check to obtain a pass, and never waives a check itself: only the owner waives (a RESUME decision). The supervisor shows as drift a done card without a Checks table, and a commit that changes a pinning test outside the card that writes it until a checkpoint has reviewed it (`Pins reviewed up to <commit>` in RESUME); it lists a row that is `fail` or `unresolved`, a pass without evidence, and a waiver the owner has not granted as **open checks** for the owner to decide.
 15. **Failed attempts are recorded.** A session that stops before its card is done (context, blocker, interruption) writes what it tried and why it failed on the hand-off's **Tried, did not work** line; the session that continues the card reads it first and does not repeat an approach listed there without a new reason. Before repeating a deploy, migration, paid call or message, it checks whether the earlier attempt already did it.
-16. **The close waits for everything.** The results card's `after:` names the last checkpoint and `§5` (every backlog card and batch), so the success criteria are measured once, on the finished feature, not while fixes are still open.
+16. **The close waits for everything.** The results card's `after:` names the last card before the close (the last rollout card, or the last checkpoint when there is no rollout stage) and `§5` (every backlog card and batch), so the success criteria are measured once, on the finished feature, not while fixes are still open.
 
 ### Checks before presenting
 
@@ -205,7 +205,7 @@ When the user asks to bring an existing `tasks.md` up to the current template (a
 
 `supervisor.py <tasks.md> --serve --autopilot` adds the **dispatcher** (`hooks/autopilot.py`, standard library only) to the dashboard. The owner starts it in their own terminal; it needs the `claude` CLI logged in and the project folder trusted. Every few seconds, while the feature's autopilot is on, it:
 
-- **starts each ready card, or ready batch,** in a headless session (`claude -p`) from the repository root. A batch (a stage's or §5's) runs as one session for all its cards in order (its **Start with** line, its effort or else the highest of its cards', the session named `<NNN> B1 <batch name>`); the batch's cards never start on their own, and attempts, approvals, blockers and resumes count per batch. A card: the card's **Start with** line as the prompt, `--effort` from the card's tier, `--model` when the card names one, the session named `<NNN> T0nn <title>` (`-n`), a dollar cap per session, `--permission-mode auto`, §6's **Never unattended** tool patterns denied, and rules appended to the system prompt for running unattended (below). At most "Parallel" sessions at once (3 by default), and at most one card or batch without `[P]`, since those share the integration worktree. `[P]` cards and batches (`[P]` on the batch's checklist line) run side by side: never two whose cards' Touches overlap (the same path, or a folder holding the other's path; a card with no Touches overlaps everything, so it runs alone), each in its own worktree and branch (§1's "Where things live"), on its own dev-server port (`$SPEC_GRILL_PORT_OFFSET`: 0 for the integration worktree, 1, 2, … for the `[P]` sessions), merging back only while it holds the merge lock (`mkdir state/merge.lock`; the dispatcher clears a lock whose holder has no live session, and the dashboard shows who holds it). The dashboard and the report say what a unit waits for ("B3 shares packages/x/… with running B2"). An owner's card (`kind owner`) is never started;
+- **starts each ready card, or ready batch,** in a headless session (`claude -p`) from the repository root. A batch (a stage's or §5's) runs as one session for all its cards in order (its **Start with** line, its effort or else the highest of its cards', the session named `<NNN> B1 <batch name>`); the batch's cards never start on their own, and attempts, approvals, blockers and resumes count per batch. A card: the card's **Start with** line as the prompt, `--effort` from the card's tier, `--model` when the card names one, the session named `<NNN> T0nn <title>` (`-n`), a dollar cap per session, `--permission-mode auto`, §6's **Never unattended** tool patterns denied, and rules appended to the system prompt for running unattended (below). At most "Parallel" sessions at once (3 by default), and at most one card or batch without `[P]`, since those share the integration worktree. `[P]` cards and batches (`[P]` on the batch's checklist line) run side by side: never two whose cards' Touches overlap (the same path, or a folder holding the other's path; a card with no Touches overlaps everything, so it runs alone), each in its own worktree and branch (§1's "Where things live"), on its own dev-server port (`$SPEC_GRILL_PORT_OFFSET`: 0 for the integration worktree, 1, 2, … for the `[P]` sessions), merging back only while it holds the merge lock (`mkdir <feature folder>/state/merge.lock`, the absolute path its rules name, so sessions in every worktree and the supervisor see the same lock; the dispatcher clears a lock whose holder has no live session, and the dashboard shows who holds it). The dashboard and the report say what a unit waits for ("B3 shares packages/x/… with running B2"). An owner's card (`kind owner`) is never started;
 - **turns the owner's yes into a button**: a session that reaches a step needing the owner (§1's Owner's yes item) adds a row to RESUME's **Approvals** table and ends its turn; the dashboard shows Approve / Reject with an optional note; on an answer the dispatcher resumes that same session (`--resume`) with it, and lifts the deny pattern the approved step needs for that resume only;
 - **turns the owner's choices into answers**: a session that needs a pick only the owner can make (a design option, an open question) adds a row to RESUME's **Decisions** table naming its card, keeps the card `doing` and stops; once the owner answers on the dashboard, the session is resumed. Waiting this way never counts as a failed try;
 - **holds each stage for review**: when a checkpoint card (CPA, CPB, …) is done, the cards after it wait until the owner presses "Approve stage" (after looking at its findings and the screens). The owner can switch this off ("Hold each stage for my review");
@@ -218,7 +218,15 @@ When the user asks to bring an existing `tasks.md` up to the current template (a
 - **notifies the owner** (a desktop notification) once for each new thing that needs them;
 - **gives sessions a browser when the owner allows it**: "Give sessions Chrome" in the dashboard's settings (off by default, confirmed once) starts every session with `--chrome`, so cards whose Verify walks the app or takes screenshots can do it unattended. It is the owner's real, signed-in Chrome, so sessions then run one at a time and are told to work in their own tab, use only the app under test and the pages their card names, and never sign in, change settings or submit forms elsewhere.
 
-The unattended rules the dispatcher appends tell each session: follow §1 and the card exactly; never run a step that needs the owner's yes, but ask through the Approvals table and stop; record blockers and splits as §1 says; end with `AUTOPILOT: DONE`, `WAITING FOR APPROVAL A<n>`, `BLOCKED` or `SPLIT`; never start a card or batch beyond the one it was started for. A `[P]` session also hears which sessions run beside it, its own worktree, branch and port, never to `git stash` or touch another session's worktree, and to merge only while holding the merge lock. The files stay the only channel: the dispatcher decides from RESUME, not from what a session says.
+The unattended rules the dispatcher appends tell each session: follow §1 and the card exactly; never run a step that needs the owner's yes, but ask through the Approvals table (each row numbered `<card>.<n>`: `T012.1`, `T012.2`, …, so two sessions never collide) and stop; ask the owner's choices through the Decisions table; record blockers and splits as §1 says; never start a card or batch beyond the one it was started for. Each session ends with exactly one of these lines:
+
+- `AUTOPILOT: DONE` — the card (or batch) is finished as §1's Finish item says;
+- `AUTOPILOT: WAITING FOR APPROVAL <card>.<n>` — an Approvals row waits for the owner (`T012.1`, the row's `#`); resumed with the answer;
+- `AUTOPILOT: WAITING FOR DECISION <n>` — a Decisions row waits for the owner; resumed once it is answered;
+- `AUTOPILOT: BLOCKED` — a blocker naming the card is in RESUME (§1's Preconditions item); resumed once it is cleared;
+- `AUTOPILOT: SPLIT` — the context ran out: the original card is ticked done (its hand-off says what was left) and the remainder is a new §5 card whose `after:` names it (§1's Context budget item). A split counts as finished; the remainder is dispatched like any other card. In a batch only the split card is finished: the batch's next session goes on with its cards not started.
+
+None of the waiting lines uses up an attempt. A `[P]` session also hears which sessions run beside it, its own worktree, branch and port, never to `git stash` or touch another session's worktree, and to merge only while holding the merge lock. The files stay the only channel: the dispatcher decides from RESUME, not from what a session says.
 
 Settings live in `state/autopilot.json` and change from the dashboard's autopilot bar (on/paused, parallel sessions, stage review); the rest (`budget_per_card_usd` 20, `budget_total_usd` 0 = none, `max_attempts`, `quiet_minutes`, `max_run_hours`, `permission_mode`, `notify`) are edited in the file. Running sessions keep going if the dispatcher stops; a new dispatcher picks them up from `state/runs.json`. Only one dispatcher works on a feature at a time (`state/.autopilot.lock`).
 
@@ -346,19 +354,28 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
 1. **One card or one batch per session.** Open a fresh session for each card, or for each batch (a
    stage's batch table, or §5's; its cards in the listed order, each committed on its own). While a
    card's batch is unfinished, the card runs with its batch, not alone. Never continue into another
-   card or batch in the same session, even if there is room left. First action: rename the session to `<NNN> T0nn <card title>` (for a batch, T0nn is the batch's id and the title its name, e.g. `004 B2 Search and export`) (desktop: `set_session_title`; CLI: `/rename`).
-2. **Where things live.** State: `specs/NNN-slug/state/RESUME.md` and `state/handoff/T0nn.md`
+   card or batch in the same session, even if there is room left. First action: rename the session to `<NNN> T0nn <card title>` (for a batch, T0nn is the batch's id and the title its name, e.g. `004 B2 Search and export`)
+   (desktop: `set_session_title`; CLI: a session cannot run slash commands, so ask the user to run
+   `/rename <name>` and go on; sessions the autopilot starts are already named).
+2. **Where things live.** State: `<absolute path>/state/` (`specs/NNN-slug/state/`, beside this file):
+   `RESUME.md`, `handoff/T0nn.md`, `design-review.md`, `screens/`, `merge.lock`. Every `state/…` path
+   in this file (§1–§5) means that folder, read and written by its absolute path from the repo root and
+   from every worktree; never create a `state/` where the session happens to run.
    <git-ignored folders are read and written by absolute path from worktrees>. Code work happens in
    <the integration worktree `<path>`, branch `<branch>`, created by T001>; a `[P]` card works in
-   `<path>-t0nn`, branch `<branch>-t0nn-<slug>`, and merges back at the end of the card — only while no
-   card without `[P]` is `doing` in RESUME; otherwise the branch waits for the next checkpoint. A `[P]`
-   batch started beside another works in `<path>-b<n>`, branch `batch/b<n>`, dev server on its own
-   port, and merges back at the batch's end (main merged in first, then the full check). Merge into the
-   integration branch only while holding the merge lock: `mkdir state/merge.lock` (it fails while
-   another session holds it: wait and retry), write `<card or batch> <UTC time>` to
-   `state/merge.lock/holder`, and `rm -rf state/merge.lock` right after the merge. Never `git
-   stash` while another session works in the repo (the stash is shared by every worktree); save a patch
-   with `git diff` instead.
+   `<path>-t0nn`, branch `<branch>-t0nn-<slug>`; a `[P]` batch started beside another works in
+   `<path>-b<n>`, branch `batch/b<n>`, dev server on its own port. Either merges back at its end, by one
+   rule, while holding the merge lock: `mkdir state/merge.lock` (it fails while another session holds
+   it: wait a minute and retry; after 30 minutes of waiting, record a blocker and stop), write
+   `<card or batch> <UTC time>` to `state/merge.lock/holder`; merge the integration branch into your
+   branch and run <the full check command> there; then, in the integration worktree, run
+   `git status --short`: when a session without `[P]` has uncommitted work there, or git refuses the
+   merge over local changes, release the lock and wait the same way; otherwise merge your branch into
+   the integration branch.
+   `rm -rf state/merge.lock` right after, also when a step failed. A `[P]` card or batch is not done
+   until its branch is merged: never tick it while the branch waits. Never `git stash` while another
+   session works in the repo (the stash is shared by every worktree); save a patch with `git diff`
+   instead.
 3. **Start.** Read, in this order and only these:
    1. this file's §1–§3 and your card;
    2. RESUME (status, decisions, locks, blockers);
@@ -373,28 +390,40 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
    Path prefixes: <`core/` = `…`, `api/` = `…`>. In **Verify**, <`pytest` means `…`; test files live
    under `…`>.
 4. **Preconditions.** Every dependency is `done` in RESUME and every precondition the card names holds
-   (an owner's answer recorded in RESUME's decisions). If not, write it in RESUME's blockers (naming
-   your card) and stop. If they hold, set your row in RESUME to `doing` with the date (UTC) and the
-   branch before any other work, so the supervisor sees the card running.
+   (an owner's answer recorded in RESUME's decisions). If not, write it in RESUME's blockers as
+   `- T0nn: <what is missing>` (your card's id first, then a colon) or `- <what is missing> before T0nn`,
+   so the supervisor and the autopilot know which card waits, and stop. If they hold, set your row in
+   RESUME to `doing` with the date (UTC) and the branch before any other work, so the supervisor sees
+   the card running.
 5. **Stay in scope; one fix, no follow-up cards; checks are fixed.** Do only your card (or your
    batch's cards). Each gets one fix; whatever still fails afterwards, is a guess, or belongs to other work goes as a dated line
    in `state/design-review.md` (date, card, screen or file, finding, screenshot), and the card closes.
    Don't add §5 cards: the owner reviews design-review.md in one go, decides which lines become
-   cards and batches them (§5's Batches) in the same step (checkpoint reviews still add §5 cards).
+   cards and batches them (§5's Batches) in the same step (checkpoint reviews still add §5 cards, and
+   a split under the Context budget item adds the one remainder card).
    Never edit your card's Verify or Done when, a pinning test, or any other check to obtain a pass,
    and never waive one yourself: only the owner waives (a RESUME decision).
 6. **Context budget.** Keep raw logs, query results and big files out of the conversation (scratch
-   files; read summaries). If the session gets heavy before the card is done, write the hand-off with
-   what is finished, what is left and what you tried that did not work, add the remainder as a new §5
-   card, and stop. Any session that stops before its card is done fills the hand-off's "Tried, did not
-   work" line the same way.
+   files; read summaries). If the session gets heavy before the card is done, **split** it, the one
+   time a session adds a §5 card itself: commit what is finished, with the full check green (a `[P]`
+   card merges it back too, as "Where things live" says); write the hand-off with what is finished,
+   what is left and what you tried that did not work (in its Checks table, a criterion not met yet is
+   `unresolved`, its correction `moved to T0nnB`; the remainder's Do ends by turning those rows to
+   `pass` with its own evidence); add the remainder as a §5 card (`T0nnB`, the next free letter) with the
+   criteria still open, whose `after:` names the original card and whose `blocks:` names the cards
+   that wait for the original (outside your batch), and its RESUME row; only then tick the original
+   card done (its hand-off says what was left), and stop. An autopilot session ends with
+   `AUTOPILOT: SPLIT`. In a batch, split the card you are on; the batch's cards not started stay open,
+   its line stays unticked, and its next session goes on with them. Any session that stops before its
+   card is done fills the hand-off's "Tried, did not work" line the same way.
 7. **Owner's yes.** <deploys, production writes, paid steps (check the remaining budget first), new
    dependencies, outward messages> need the owner's yes **in that session**. After the yes the session
    runs the step, or hands the exact commands to the owner when it can't. Before repeating such a step
    after an interruption, check whether the earlier attempt already did it. A session the autopilot
    started (nobody reads it) asks through RESUME's Approvals table instead and stops; it is resumed with
    the answer. <Only the session holding
-   RESUME's deploy lock deploys; take it before, release it after.>
+   RESUME's deploy lock deploys: take it before (the section's one line becomes
+   `held by T0nn since <UTC time>`), release it after (the line becomes exactly `free`).>
 8. **<Project rules from the constitution>** (data handling, secrets, words that must never appear in
    code, …).
 9. **Finish.** (In a batch: steps 1–4 for each card with the card's own tests and <the fast checks,
@@ -407,7 +436,8 @@ Format: `- [ ] T0nn [P] title — fulfills FR-…`. Every requirement maps to at
       evidence; write a `|` inside a cell as `\|`. An interface card's screenshots are in `state/screens/T0nn/`; when the browser window won't shrink to
       phone width, load the page in a phone-wide iframe and say so in the hand-off.
    2. Commit on the card's branch (conventional message, nothing else in the commit); merge back if the
-      card is `[P]` (the rule under "Where things live").
+      card is `[P]` (the rule under "Where things live"). T001 is the exception: it commits nothing
+      (its **Never** line), so it skips this step.
    3. Write the hand-off note from §2's template.
    4. Tick the card here (`[x]`) and update its row in RESUME (status, branch, commit, date UTC).
    5. Stop. Tell the owner which cards are now unblocked.
@@ -466,7 +496,7 @@ rejected | done)
 | --- | --- | --- | --- | --- | --- |
 
 ## Blockers
-- <precondition> before <card>.
+- <card>: <what is missing> (or: <what is missing> before <card>)
 
 ## Status
 | card | title | status | branch | commit | date (UTC) |
@@ -631,7 +661,7 @@ verify on the deployed system, the rollback path.>
 ### Close
 
 #### T0nn — Results
-after: <last rollout card>, §5 · M · effort medium · kind fullstack
+after: <last rollout card, or the last checkpoint when there is no rollout>, §5 · M · effort medium · kind fullstack
 
 **Do:** every success criterion with its measured number and source, as a Checks table in the
 hand-off (criterion | verdict | evidence | correction)<; the project's phase report>.
