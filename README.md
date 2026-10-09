@@ -231,7 +231,7 @@ To see it all at a glance, serve the dashboard:
 python3 <skill dir>/hooks/supervisor.py specs/004-webhook-retries --serve --open
 ```
 
-It opens `http://127.0.0.1:8765` (local only, no dependencies; when 8765 is busy it takes the next free port up to 8784, and `--port` sets another start) and refreshes every 3 seconds:
+It prints the dashboard's link, `http://127.0.0.1:8765/?k=…`, and `--open` opens that link in your browser (local only, no dependencies; when 8765 is busy it takes the next free port up to 8784, and `--port` sets another start). Open the dashboard from that link: it carries a key for this launch, which your browser then keeps in a cookie so reloads work. The bare `http://127.0.0.1:8765` shows only a locked page that sends you back to the link, and each launch prints a new one. The page refreshes every 3 seconds:
 
 - **Progress** — one bar split by status, with counts, and the back-end / front-end balance.
 - **Run next** — every ready card with its effort tier and a copy button for its **Start with** line (or a Start button, with the autopilot), plus which ones may run side by side. A ready batch, a stage's or the backlog's, is one row: its id and name, its cards in order, its effort and its own line.

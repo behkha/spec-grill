@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -464,6 +465,25 @@ class Pids(unittest.TestCase):
             self.assertFalse(sv.run_alive(run))
             self.assertFalse(autopilot.kill(run))
             self.assertFalse(autopilot.kill(run, signal.SIGKILL))
+
+
+def doc(name: str) -> str:
+    with open(os.path.join(HERE, "..", name), encoding="utf-8") as handle:
+        return re.sub(r"\s+", " ", handle.read())
+
+
+class Docs(unittest.TestCase):
+    """Items 5f and 5g: the README and SKILL.md say what the merged code does."""
+
+    def test_the_dashboard_opens_from_the_keyed_link_not_the_bare_url(self):
+        readme, skill = doc("README.md"), doc("SKILL.md")
+        self.assertNotIn("It opens `http://127.0.0.1:8765`", readme)
+        self.assertIn("`http://127.0.0.1:8765/?k=…`", readme)
+        self.assertIn("`--open` opens that link", readme)
+        self.assertIn("The bare `http://127.0.0.1:8765` shows only a locked page", readme)
+        self.assertIn("opened from the link it prints", skill)
+        self.assertNotIn("open its URL", skill)
+        self.assertIn("the bare URL shows a locked page", skill)
 
 
 if __name__ == "__main__":
