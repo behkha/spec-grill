@@ -10,7 +10,8 @@
     supervisor.py TASKS --lessons    what each card took (runs, tries, cost, hours), for the
                                      close card's retro
     supervisor.py TASKS --serve      dashboard at http://127.0.0.1:8765 for every feature
-                                     beside TASKS (local only; add --open to open a browser)
+                                     beside TASKS (local only; open the link it prints, which
+                                     carries this launch's key, or add --open to open a browser)
     supervisor.py TASKS --serve --autopilot
                                      the same, plus the dispatcher that starts card sessions
                                      on its own (autopilot.py next to this file)
@@ -24,30 +25,50 @@ state/.supervisor.json. The dashboard page is dashboard.html next to this file. 
 library only.
 """
 
+from __future__ import annotations  # `X | None` annotations on Python 3.9
+
 import argparse
 import datetime as dt
 import fcntl
 import fnmatch
 import glob
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
-ID = r"(?:T\d+(?:[A-Z]+\d*)*|CP[A-Z0-9]+)"  # T001, T012A, follow-ups like T042B2 and T042R2A; CPA, CP0, CPEND
+# T001, T012A, follow-ups like T042B2 and T042R2A; CPA, CP0, CPEND (no nested quantifier: no backtracking blow-up)
+ID = r"(?:T\d+[A-Z0-9]*|CP[A-Z0-9]+)"
 ID_RE = re.compile(rf"\b{ID}\b")
 RANGE_RE = re.compile(rf"\b({ID})\s*[–-]\s*({ID})\b")
-CHECK_RE = re.compile(rf"^- \[([ xX])\] ({ID})((?: \[P\])?)(?: (.+?))?(?: — fulfills .*)?\s*$", re.M)
+# "- [ ] T012 [P] Title", also indented, with "*", a tab, "T012: Title", or "[P]" after the title (group 5)
+CHECK_RE = re.compile(rf"^[ \t]*[-*][ \t]+\[([ xX])\][ \t]+({ID}):?((?:[ \t]+\[P\])?)(?:[ \t]+(.+?))?"
+                      rf"((?:[ \t]+\[P\])?)(?: — fulfills .*)?\s*$", re.M)
 SECTION_RE = re.compile(r"^#{2,3} (.+?)\s*$", re.M)
-COND_RE = re.compile(r"\(([^)]*\bif\b[^)]*)\)")  # "(T036 if German)": a dependency under a condition
+# "(T036 if German)", "(T036 (de) if German)": a dependency under a condition
+COND_RE = re.compile(r"\(((?:[^()]|\([^()]*\))*\bif\b(?:[^()]|\([^()]*\))*)\)")
 BEFORE_RE = re.compile(rf"\bbefore:?\s+({ID})")
-HEAD_RE = re.compile(rf"^#{{3,4}} ({ID})((?: \[P\])?) — (.+?)\s*$", re.M)
+# "#### T012 [P] — Title"; "-", "–" or ":" also separate the title, but "### T001 – T003 Setup" is a range
+HEAD_RE = re.compile(rf"^#{{3,4}}[ \t]+({ID})((?:[ \t]+\[P\])?)[ \t]*(?:—|[–:-](?![ \t]*{ID}\b))[ \t]+(.+?)\s*$",
+                     re.M)
+# a heading that starts with a card id (T only: "### CPU usage" is no card), parsed by HEAD_RE or not
+HEAD_LIKE_RE = re.compile(rf"^#{{3,4}}[ \t]+(T\d+[A-Z0-9]*)\b(?![ \t]*[—–-][ \t]*{ID}\b).*$", re.M)
+# a §5 card written inline: its meta line and fields indented under its checklist line, up to the next one
+INLINE_RE = re.compile(r"(?:\n(?![ \t]*[-*][ \t]+\[[ xX]\])[ \t]+\S[^\n]*)+")
+# a meta field written bold ("**after:** T001 · **S**"): read as plain text, so only other bold fields
+# ("**Start with:**") end the meta lines
+META_BOLD_RE = re.compile(r"\*\*((?i:after|blocks|fulfills|added by|effort|kind|model|size)\b[^*\n]*|[SML])\*\*")
 # "phase 11's T034", "Phase 10's T042A and T043", "phase 11's T021–T023": another feature's cards
-PHASE_RE = re.compile(rf"\b(?i:phase)\s+(\d+)['’]s\s+({ID}(?:\s*(?:[–-]|\band\b|\bor\b|&)\s*{ID})*)\b")
+# "phase 11's T034, T035": a comma list too, which split_phases ends where the ids turn local
+PHASE_RE = re.compile(rf"\b(?i:phase)\s+(\d+)['’]s\s+({ID}(?:\s*(?:[–,-]|\band\b|\bor\b|&)\s*{ID})*)\b")
 BATCH = r"B\d+"  # batches of small cards (a stage's, §5's): B1, B2, … (not cards: never in order or progress)
-BATCH_CHECK_RE = re.compile(rf"^- \[([ xX])\] ({BATCH})\b((?: \[P\])?)(?: (.+?))?\s*$", re.M)
+# "- [ ] B3 [P] name", as leniently as CHECK_RE; a "[P]" after the name counts too (group 5)
+BATCH_CHECK_RE = re.compile(rf"^[ \t]*[-*][ \t]+\[([ xX])\][ \t]+({BATCH})\b:?((?:[ \t]+\[P\])?)(?:[ \t]+(.+?))?"
+                            rf"((?:[ \t]+\[P\])?)\s*$", re.M)
 TOUCHES_RE = re.compile(r"\*\*Touches:?\*\*:?(.*?)(?=\s\*\*\w[^*\n]*\*\*|\n[ \t]*\n|\Z)", re.S)
 DO_RE = re.compile(r"\*\*Do:?\*\*:?(.*?)(?=\n[ \t]*\*\*\w[^*\n]*:\*\*|\Z)", re.S)
 # a card that always runs alone: one whose Do asks for the owner's yes, or a walk-through (title)
@@ -78,6 +99,7 @@ SETTINGS = {  # state/autopilot.json; the dashboard changes them, autopilot.py a
     "result_grace_s": 30,        # stop a session this long after its final result if it has not exited
     "claude": "claude",
     "paused_reason": "",
+    "resume_after": 0,           # a usage limit's pause: switch auto back on after this UTC epoch (0: wait for the owner)
 }
 
 
@@ -101,20 +123,55 @@ def read_json(path: str, default):
         return default
 
 
+def read_json_strict(path: str, default):
+    """Like read_json, but only a missing file gives default: one that exists and does not parse raises
+    (OSError or ValueError), for files where starting over from empty would do harm (runs.json)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+
+
 def load_settings(state_dir: str) -> dict:
-    """The autopilot's settings; "exists" says whether the feature uses the autopilot at all."""
+    """The autopilot's settings; "exists" says whether the feature uses the autopilot at all. The two the
+    dispatcher keeps for itself are read safely (paused_reason as text, resume_after as a finite number);
+    the guarded ones stay as written, so autopilot.forbidden() can name what is wrong with them."""
     found = read_json(os.path.join(state_dir, "autopilot.json"), None)
     out = {**SETTINGS, **(found if isinstance(found, dict) else {})}
     out["exists"] = isinstance(found, dict)
+    out["paused_reason"] = out["paused_reason"] if isinstance(out["paused_reason"], str) else \
+        "" if out["paused_reason"] is None else str(out["paused_reason"])
+    out["resume_after"] = number(out["resume_after"])
     return out
 
 
+def gates_approved(settings: dict) -> list:
+    """The stage gates the owner approved, as a list whatever the file holds (a session may write a string
+    there: "CPA" must not read as approving every gate whose name is part of it)."""
+    found = settings.get("approved_gates")
+    return [g for g in found if isinstance(g, str)] if isinstance(found, list) else []
+
+
 def pid_alive(pid) -> bool:
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
+    """A process with this pid exists (a zombie too), whoever runs it: EPERM says it is there under another
+    account. False for what is no pid: not a whole number, 0 or less (os.kill would signal a process group,
+    or every process), or past what a pid_t holds (os.kill would raise OverflowError)."""
+    if isinstance(pid, bool):
         return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not 0 < pid < 2 ** 31:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
 
 
 def run_alive(run: dict) -> bool:
@@ -123,7 +180,8 @@ def run_alive(run: dict) -> bool:
     if run.get("ended") or not pid_alive(run.get("pid")):
         return False
     try:
-        args = subprocess.run(["ps", "-o", "args=", "-p", str(int(run["pid"]))],
+        # -ww: without a TTY procps cuts args= at 80 columns, before the session id
+        args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(int(run["pid"]))],
                               capture_output=True, text=True, timeout=3).stdout
     except Exception:
         return True
@@ -131,17 +189,37 @@ def run_alive(run: dict) -> bool:
 
 
 def dispatcher_alive(state_dir: str) -> bool:
-    """Some process holds the feature's dispatcher lock (autopilot.acquire)."""
+    """Some process dispatches the feature: the pid autopilot.acquire() wrote into state/.autopilot.lock is
+    alive and the lock is held. The lock is probed (shared, non-blocking, dropped at once) only when that
+    pid is alive, or can't be read (acquire() is between emptying the file and writing it), so a
+    dispatcher taking the lock over from one that died never meets the probe. Left: if the recorded pid
+    lives on without the lock (it released it, or the pid was reused), an acquire() at the very moment of
+    a probe fails, and that dispatcher skips one pass."""
     path = os.path.join(state_dir, ".autopilot.lock")
     if not os.path.exists(path):
         return False
+    said = read_json(path, None)
+    pid = said.get("pid") if isinstance(said, dict) else None
+    if isinstance(pid, int) and not isinstance(pid, bool):  # os.kill takes a C int: a bigger one raises
+        if not 0 < pid < 2 ** 31:
+            return False
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # alive, under another account: the lock decides
+        except OSError:
+            return False
     try:
-        with open(path, "a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        return False
+        handle = open(path)
     except OSError:
-        return True
+        return False
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return False
 
 
 MERGE_LOCK = "merge.lock"  # state/merge.lock: a [P] session merges only while it holds it (autopilot RULES)
@@ -173,7 +251,11 @@ def find_tasks(arg: str | None) -> str:
         if not os.path.isfile(arg):
             sys.exit(f"supervisor: no such file: {arg}")
         return os.path.abspath(arg)
-    found = sorted(glob.glob(os.path.join("specs", "*", "tasks.md")))
+    def number(path: str) -> tuple:  # "9-x" before "10-x": by the folder's number, unnumbered ones first
+        n = re.match(r"\d+", os.path.basename(os.path.dirname(path)))
+        return (int(n.group(0)) if n else -1, path)
+
+    found = sorted(glob.glob(os.path.join("specs", "*", "tasks.md")), key=number)
     if not found:
         sys.exit("supervisor: no specs/*/tasks.md here; pass the path of a tasks.md")
     return os.path.abspath(found[-1])
@@ -204,13 +286,14 @@ def parse_tasks(text: str) -> tuple[dict, list]:
         return re.sub(r"\s*\(.*\)$", "", re.sub(r"^\d+\.\s*", "", name))
 
     inline = {}
-    for m in CHECK_RE.finditer(text):
+    lines = checklist(text)
+    for m in lines:
         c = card(m.group(2))
         c["ticked"] |= m.group(1).lower() == "x"
-        c["parallel"] |= bool(m.group(3))
+        c["parallel"] |= bool(m.group(3) or m.group(5))
         c["title"] = c["title"] or (m.group(4) or "").strip()  # a bare "- [x] T010B" under a card's heading
         # a §5 card written inline: its meta line and fields indented under the checklist line
-        block = re.match(r"(?:\n[ \t]+\S[^\n]*)+", text[m.end():])
+        block = INLINE_RE.match(text, m.end())
         if block:
             inline[m.group(2)] = (block.group(0), m.start())
 
@@ -233,28 +316,121 @@ def parse_tasks(text: str) -> tuple[dict, list]:
     for c in cards.values():
         c.pop("headed", None)
         # "phase 11's T034" names a card of another feature: never one of this file's
-        local = PHASE_RE.sub(" ", c["after_text"])
-        c["after"] = ids_in(local, order)
+        local = split_phases(c["after_text"], order)[0]
+        c["after"] = [x for x in ids_in(local, order) if x != c["id"]]  # waiting on itself: drift, dropped
         c["conditional"] = [x for x in ids_in(" ".join(COND_RE.findall(local)), order)
-                            if x not in c["after"]]
+                            if x not in c["after"] and x != c["id"]]
         c["after"] += c["conditional"]  # the condition cannot be read here; waiting is the safe side
-        c["external"] = external_deps(c["after_text"])
+        c["external"] = external_deps(c["after_text"], order)
     # "after: CPF, §5": the card waits for every backlog card too (the close waits for everything)
     backlog_at = re.search(r"^## 5\.", text, re.M)
     if backlog_at:
-        backlog = [m.group(2) for m in CHECK_RE.finditer(text) if m.start() > backlog_at.start()]
+        backlog = [m.group(2) for m in lines if m.start() > backlog_at.start()]
         backlog += [m.group(1) for m in HEAD_RE.finditer(text) if m.start() > backlog_at.start()]
         for c in cards.values():
             if "§5" in c["after_text"]:
                 c["after"] += [x for x in dict.fromkeys(backlog) if x != c["id"] and x not in c["after"]]
     for c in cards.values():  # "blocks: T009" on a backlog card makes T009 wait for it
-        for target in ids_in(PHASE_RE.sub(" ", c["blocks_text"]), order):
-            if target in cards and c["id"] not in cards[target]["after"]:
+        for target in ids_in(split_phases(c["blocks_text"], order)[0], order):
+            if target in cards and target != c["id"] and c["id"] not in cards[target]["after"]:
                 cards[target]["after"].append(c["id"])
     return cards, order
 
 
-def external_deps(text: str) -> list:
+def checklist(text: str) -> list:
+    """CHECK_RE's matches that are cards' own lines: an indented one inside a card heading's body naming
+    another card ("  - [x] T001 reviewed" under CPA's heading) is a note in that card, not T001's line."""
+    heads = list(HEAD_RE.finditer(text))
+    bounds = sorted([m.start() for m in heads] + [m.start() for m in re.finditer(r"^#{1,3} ", text, re.M)])
+    spans = []  # each card heading's body, as parse_tasks reads it: up to the next card or section heading
+    for m in heads:
+        spans.append((m.end(), next((b for b in bounds if b > m.start()), len(text)), m.group(1)))
+    out = []
+    for m in CHECK_RE.finditer(text):
+        if m.group(0)[:1] in " \t" and any(a <= m.start() < b and cid != m.group(2) for a, b, cid in spans):
+            continue
+        out.append(m)
+    return out
+
+
+def tasks_drift(text: str, cards: dict, order: list, status: dict) -> list:
+    """What parse_tasks read but could not use: a card heading it cannot parse (its after: and size go
+    unread), a card defined twice (read as one card), a card naming itself in after: or blocks:
+    (dropped), and open cards that wait on each other in a loop (none of them can start)."""
+    out = []
+    for m in HEAD_LIKE_RE.finditer(text):
+        if not HEAD_RE.match(m.group(0)):
+            out.append(f"{m.group(0).strip()!r} is not read as a card heading: write it "
+                       f"`#### {m.group(1)} — <title>`, or its after:, size and fields are ignored")
+    # a card has one heading and one checklist line at most (one of each is the usual pair)
+    for what, ids in (("card headings", [m.group(1) for m in HEAD_RE.finditer(text)]),
+                      ("checklist lines", [m.group(2) for m in checklist(text)])):
+        counts: dict = {}
+        for cid in ids:
+            counts[cid] = counts.get(cid, 0) + 1
+        out += [f"{cid} is defined {'twice' if n == 2 else f'{n} times'} ({what}); they are read as one card"
+                for cid, n in counts.items() if n > 1]
+    for cid in order:
+        c = cards[cid]
+        for field, said in (("after:", c["after_text"]), ("blocks:", c["blocks_text"])):
+            local = split_phases(said, order)[0]
+            if cid in ids_in(local + " " + " ".join(COND_RE.findall(local)), order):
+                out.append(f"{cid} names itself in {field}; ignored")
+    # a loop of after: (blocks: and §5 included) among open cards: walk their dependencies depth first.
+    # A finished card waits on nothing, so a loop through one holds nobody; every loop of open cards
+    # (each strongly connected group of them) has a back edge, so each deadlock is reported at least once.
+    open_cards = {cid for cid in order if status.get(cid) not in FINISHED}
+    seen: dict = {}  # 1: on the current path, 2: done
+    loops = []
+    for root in order:
+        if root in seen or root not in open_cards:
+            continue
+        path, stack = [root], [iter(cards[root]["after"])]
+        seen[root] = 1
+        while stack:
+            dep = next(stack[-1], None)
+            if dep is None:
+                seen[path.pop()] = 2
+                stack.pop()
+            elif dep not in open_cards:
+                continue
+            elif seen.get(dep) == 1:
+                loop = path[path.index(dep):]
+                start = min(loop, key=order.index)  # the same loop reads the same however it was reached
+                loop = loop[loop.index(start):] + loop[: loop.index(start)]
+                if loop not in loops:
+                    loops.append(loop)
+            elif dep not in seen:
+                seen[dep] = 1
+                path.append(dep)
+                stack.append(iter(cards[dep]["after"]))
+    out += [f"after: cycle {' → '.join(loop + loop[:1])} (each waits for the next): none of them can start"
+            for loop in loops]
+    return out
+
+
+def split_phases(text: str, order: list) -> tuple[str, list]:
+    """The text with its mentions of other features' cards blanked out, and those mentions as
+    (phase, ids). After a comma the list stays with the phase only while its ids are not defined in this
+    tasks.md (`order`) and are of the phase's first id's kind (T… or CP…): "phase 11's T034, T035" is
+    two of phase 11's cards, "phase 11's T034, T001" (T001 here) and "phase 11's T021–T023, CPD" end
+    at the comma, so T001 and CPD are this feature's."""
+    refs, parts, last = [], [], 0
+    for m in PHASE_RE.finditer(text):
+        ids, end = m.group(2), m.end()
+        kind = ids[:2] == "CP"
+        for comma in re.finditer(r",\s*", ids):
+            after = ID_RE.match(ids, comma.end())
+            if after and (after.group(0) in order or (after.group(0)[:2] == "CP") != kind):
+                ids, end = ids[: comma.start()], m.start(2) + comma.start()
+                break
+        parts += [text[last: m.start()], " "]
+        last = end
+        refs.append((m.group(1), ids))
+    return "".join(parts + [text[last:]]), refs
+
+
+def external_deps(text: str, order: list = ()) -> list:
     """The other features' cards an `after:` names: "phase 11's T034" -> {"phase": "11", "card": "T034"};
     a range "phase 11's T021–T023" keeps its end as "through" (build() expands it with that feature's
     cards). Like ids_in, a mention in brackets is no dependency unless it names a condition, "(… if …)":
@@ -262,33 +438,35 @@ def external_deps(text: str) -> list:
     out: list = []
 
     def take(part: str, conditional: bool) -> None:
-        for m in PHASE_RE.finditer(part):
-            for piece in re.split(r"\s*(?:\band\b|\bor\b|&)\s*", m.group(2)):
+        for phase, ids in split_phases(part, order)[1]:
+            for piece in re.split(r"\s*(?:\band\b|\bor\b|&|,)\s*", ids):
                 ends = ID_RE.findall(piece)
                 if not ends:
                     continue
-                dep = {"phase": m.group(1), "card": ends[0], "conditional": conditional}
+                dep = {"phase": phase, "card": ends[0], "conditional": conditional}
                 if len(ends) > 1:
                     dep["through"] = ends[-1]
                 if not any(d["phase"] == dep["phase"] and d["card"] == dep["card"] for d in out):
                     out.append(dep)
 
-    take(re.sub(r"\([^)]*\)", " ", text), False)
+    take(unbracket(text), False)
     take(" ".join(COND_RE.findall(text)), True)
     return out
 
 
 def read_meta(c: dict, body: str) -> None:
     """A card's fields from its body: the meta line(s) before the first bold field, and Start with."""
-    meta = body.split("**", 1)[0]  # the lines before the first bold field
-    if found := re.search(r"\bafter:\s*([^·\n]*)", meta):
+    # the lines before the first bold field; a bold meta field ("**after:** T001 · **S**") is no such field
+    meta = META_BOLD_RE.sub(r"\1", body).split("**", 1)[0]
+    # "after:", also "After:"; "effort high" or "Effort: high"; "· S ·" or "Size: S"
+    if found := re.search(r"(?i:\bafter):\s*([^·\n]*)", meta):
         c["after_text"] = found.group(1).strip()
-    if found := re.search(r"\bblocks:?\s*([^·\n]*)", meta):
+    if found := re.search(r"(?i:\bblocks):?\s*([^·\n]*)", meta):
         c["blocks_text"] = found.group(1).strip()
-    if found := re.search(r"·\s*([SML])\s*(?:·|$)", meta, re.M):
+    if found := re.search(r"(?:·|(?i:\bsize):?)\s*([SML])\s*(?:·|$)", meta, re.M):
         c["size"] = found.group(1)
-    if found := re.search(r"\beffort\s+(\w+)", meta):
-        c["effort"] = found.group(1)
+    if found := re.search(r"(?i:\beffort):?\s+(\w+)", meta):
+        c["effort"] = found.group(1).lower()
     # "· kind frontend ·", "kind: owner", "model `opus`": a field that starts a segment or a line
     if found := re.search(r"(?:^|·)\s*kind\s*:?\s*`?([A-Za-z]+)", meta, re.M | re.I):
         c["kind"] = found.group(1).lower()
@@ -385,7 +563,7 @@ def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
         b = found.setdefault(m.group(2), {"id": m.group(2), "name": "", "named": [], "effort": "",
                                           "start_with": "", "ticked": False, "row": False, "parallel": False})
         b["ticked"] |= m.group(1).lower() == "x"
-        b["parallel"] |= bool(m.group(3))
+        b["parallel"] |= bool(m.group(3) or m.group(5))  # "B3 [P] name", or "B3 name [P]"
         b["name"] = b["name"] or (m.group(4) or "").strip()
     drift, owner = [], {}
     batches = []
@@ -409,19 +587,34 @@ def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
     return batches, drift
 
 
-def alone(cid: str, c: dict) -> str:
-    """Why a card may never be in a batch (T001, a checkpoint, an owner's card); "" when it may."""
+def alone(cid: str, c: dict, decisions: list = ()) -> str:
+    """Why a card may never be in a batch, rule 11's always-alone list; "" when it may: T001, a checkpoint,
+    an owner's card, the Results card (the close: it waits for §5, rule 16, or is titled just "Results"),
+    one whose Do asks for the owner's yes, a walk-through, a card waiting for one of the open decisions
+    (RESUME's "needed before", or "decision 2" in its after:)."""
     if cid == "T001":
         return "the first card"
     if cid.startswith("CP"):
         return "a checkpoint"
-    return "an owner's card" if c["kind"] == "owner" else ""
+    if c["kind"] == "owner":
+        return "an owner's card"
+    if "§5" in c["after_text"] or re.fullmatch(r"(?:results|close)\W*", c["title"].strip(), re.I):
+        return "the Results card"
+    if c["asks_owner"]:
+        return "a card whose Do asks for the owner's yes"
+    if WALK_RE.search(c["title"]):
+        return "a walk-through"
+    named = set(re.findall(r"\bdecisions?\s+(\d+)", c["after_text"], re.I))
+    if any(cid in d["before"] or str(d["n"]).strip() in named for d in decisions):
+        return "a card waiting for an owner's decision"
+    return ""
 
 
-def batch_rules(batches: list, cards: dict, status: dict) -> list:
-    """Drift for unfinished batches that break the batching rules: a card that always runs alone, an L
-    card or more than BATCH_BUDGET by size (S = 1, M = 2), and a card outside the batch that waits on
-    one of its cards while another of its cards waits on it (the batch could never run)."""
+def batch_rules(batches: list, cards: dict, status: dict, decisions: list = ()) -> list:
+    """Drift for unfinished batches that break the batching rules: a card that always runs alone (alone(),
+    with the open decisions), an L card or more than BATCH_BUDGET by size (S = 1, M = 2), and a card
+    outside the batch that waits on one of its cards while another of its cards waits on it (the batch
+    could never run)."""
     waiters: dict = {}
     for cid, c in cards.items():
         for dep in c["after"]:
@@ -432,7 +625,7 @@ def batch_rules(batches: list, cards: dict, status: dict) -> list:
             continue
         mine = b["cards"]
         for cid in mine:
-            if why := alone(cid, cards[cid]):
+            if why := alone(cid, cards[cid], decisions):
                 out.append(f"batch {b['id']} holds {cid}, {why}: it runs on its own, never in a batch")
         large = [c for c in mine if cards[c]["size"] == "L"]
         out += [f"batch {b['id']} holds {c}, an L card: split it before it goes in a batch" for c in large]
@@ -468,15 +661,10 @@ def unbatched(cards: dict, order: list, status: dict, doing: list, batch_of: dic
     files their Touches share (or a chain: one waits on another), by stage when Touches can't be read.
     Given only when such groups hold 3 cards or more. Cards that always run alone are left out: T001,
     checkpoints, owner's cards, the Results card, a card waiting for an owner's decision, one whose Do
-    asks for the owner's yes, a walk-through."""
-    waiting_on = {c for d in decisions for c in d["before"]}
-    open_n = {str(d["n"]).strip() for d in decisions}
+    asks for the owner's yes, a walk-through (alone())."""
 
     def never(cid: str) -> bool:
-        c = cards[cid]
-        named = set(re.findall(r"\bdecisions?\s+(\d+)", c["after_text"], re.I))
-        return bool(alone(cid, c) or c["asks_owner"] or WALK_RE.search(c["title"]) or "§5" in c["after_text"]
-                    or re.match(r"(results|close)\b", c["title"], re.I) or cid in waiting_on or named & open_n)
+        return bool(alone(cid, cards[cid], decisions))
 
     picked = [c for c in order if cards[c]["size"] == "S" and status[c] not in FINISHED and c not in doing
               and c not in batch_of and not never(c)]
@@ -548,10 +736,13 @@ def unbatched(cards: dict, order: list, status: dict, doing: list, batch_of: dic
 def runs_as(text: str) -> dict:
     """tasks.md §6: "**Runs as:** owner@example.com via `~/.local/bin/claude-work`" (the account the
     feature's sessions must use, and the CLI launcher logged in as it) and "**App URL:** http://…" (the
-    page a Chrome check opens)."""
+    page a Chrome check opens). The launcher is the first backticked word after a "via" on that line, or
+    the bare word right after "<email> via"; a note around it ("(work account)") is not part of it."""
     out = {"email": "", "launcher": "", "app_url": ""}
-    if found := re.search(r"\*\*Runs as\s*:?\*\*:?\s*`?([^\s`]+@[^\s`]+?)`?(?:\s+via\s+`?([^\s`]+)`?)?\s*$", text, re.M | re.I):
-        out["email"], out["launcher"] = found.group(1).strip(".,;"), (found.group(2) or "").strip(".,;")
+    if found := re.search(r"\*\*Runs as\s*:?\*\*:?[ \t]*`?([^\s`]+@[^\s`]+?)`?[.,;]?(?=[ \t]|$)([^\n]*)", text, re.M | re.I):
+        out["email"], rest = found.group(1).strip(".,;"), found.group(2)
+        launcher = re.search(r"\bvia[ \t]+`([^\s`]+)`", rest) or re.match(r"[ \t]+via[ \t]+([^\s`]+)", rest)
+        out["launcher"] = launcher.group(1).strip(".,;") if launcher else ""
     if found := re.search(r"\*\*App URL\s*:?\*\*:?\s*`?(https?://[^\s`]+)`?", text, re.I):
         out["app_url"] = found.group(1).rstrip(".,;")
     return out
@@ -564,8 +755,17 @@ def unattended_deny(text: str) -> list:
     return re.findall(r"`([^`]+)`", found.group(1)) if found else []
 
 
+def unbracket(text: str) -> str:
+    """The text without its brackets, nested ones too: "(beside (x) T004)" leaves no "T004)" behind."""
+    while True:
+        out = re.sub(r"\([^()]*\)", " ", text)
+        if out == text:
+            return out
+        text = out
+
+
 def ids_in(text: str, order: list) -> list:
-    text = re.sub(r"\([^)]*\)", " ", text)  # "(beside T002)" is not a dependency
+    text = unbracket(text)  # "(beside T002)" is not a dependency
     out = []
     for m in RANGE_RE.finditer(text):
         a, b = m.group(1), m.group(2)
@@ -588,7 +788,7 @@ def sections(text: str) -> dict:
     for line in text.splitlines():
         if m := re.match(r"^##\s+(.+?)\s*$", line):
             current = m.group(1).lower()
-            out[current] = []
+            out.setdefault(current, [])  # a heading written twice: the second adds to the first
         elif current is not None:
             out[current].append(line)
     return out
@@ -602,18 +802,42 @@ def cells(line: str) -> list:
     return [cell.strip() for cell in PIPE_RE.split(line.strip().strip("|"))]
 
 
-def table(lines: list) -> list:
-    rows = [line.strip() for line in lines if line.strip().startswith("|")]
-    if not rows:
-        return []
-    head = [h.lower() for h in cells(rows[0])]
-    out = []
-    for row in rows[1:]:
-        values = cells(row)
-        if all(set(v) <= set("-: ") for v in values):
-            continue
-        out.append(dict(zip(head, values)))
+def tables(lines: list) -> list:
+    """Each Markdown table in lines, as (its lowercased header, its rows as dicts by that header). A
+    table ends at the first line that is not a table line; a run of `|` lines without a separator under
+    its first line continues the table before it (a blank line slipped in), one with it starts a new one."""
+    runs, run = [], []
+    for line in lines + [""]:
+        if line.strip().startswith("|"):
+            run.append(line.strip())
+        elif run:
+            runs.append(run)
+            run = []
+    out: list = []
+    for run in runs:
+        if not out or (len(run) > 1 and separator(run[1])):
+            out.append(([h.lower() for h in cells(run[0])], []))
+            run = run[1:]
+        head, rows = out[-1]
+        for row in run:
+            values = cells(row)
+            if all(set(v) <= set("-: ") for v in values):
+                continue
+            rows.append(dict(zip(head, values)))
     return out
+
+
+def table(lines: list) -> list:
+    """The rows of the first table in lines."""
+    found = tables(lines)
+    return found[0][1] if found else []
+
+
+def rows_of(lines: list, *names: str) -> list:
+    """The rows of every table in lines whose header has each of the named columns (a section written
+    twice, or a second table of the same kind under it, still counts; a table of other columns not)."""
+    return [row for head, rows in tables(lines) if all(any(h.startswith(n) for h in head) for n in names)
+            for row in rows]
 
 
 def column(row: dict, name: str) -> str:
@@ -629,8 +853,13 @@ VERDICTS = {  # a Checks row's verdict, judged by its first word
 NO_EVIDENCE = OPEN_ANSWERS | {"n/a", "na", "none", "tbd", "–", "—", "-"}
 # a session that stopped to wait for the owner; is_try() leaves it out, here and in autopilot.py
 WAITED = re.compile(r"AUTOPILOT: (?:WAITING FOR (?:DECISION|APPROVAL)|BLOCKED)")
+# a session that finished its card with a remainder card (§1's Context budget item): not a failed try
+SPLIT = re.compile(r"AUTOPILOT: SPLIT")
 REVIEWED_RE = re.compile(r"Pins reviewed up to[\s`*:]*([0-9a-f]{7,40})\b", re.I)
 GIT: dict = {}  # cached git answers: the repo root, the pin history (per ref state), ancestry
+GIT_LIMIT = 4096  # a long --serve asks about ever more commits: past this many answers, the older half of
+# the ancestry answers is forgotten (the repo roots and pin histories stay)
+EOO: list = []  # [True] once git is known to take --end-of-options (2.24+), [False] when it does not
 
 
 def flat(value, limit: int = 80, cell: bool = True) -> str:
@@ -750,11 +979,22 @@ def git(root: str, *args: str, timeout: float = 5) -> subprocess.CompletedProces
         return None
 
 
+def end_of_options() -> list:
+    """["--end-of-options"] when the installed git knows it (2.24+): nothing after it is read as an option."""
+    if not EOO:
+        out = git("/", "--version", timeout=3)
+        found = re.search(r"(\d+)\.(\d+)", out.stdout) if out else None
+        EOO.append(bool(found) and (int(found.group(1)), int(found.group(2))) >= (2, 24))
+    return ["--end-of-options"] if EOO[0] else []
+
+
+# (each cached answer is read into a local first: another thread may clear GIT at any moment)
 def git_root(folder: str) -> str:
-    if not GIT.get(("root", folder)):  # a folder that is not in a repo yet is asked again
+    found = GIT.get(("root", folder))
+    if not found:  # a folder that is not in a repo yet is asked again
         out = git(folder, "rev-parse", "--show-toplevel", timeout=3)
-        GIT[("root", folder)] = out.stdout.strip() if out and out.returncode == 0 else ""
-    return GIT[("root", folder)]
+        found = GIT[("root", folder)] = out.stdout.strip() if out and out.returncode == 0 else ""
+    return found
 
 
 def pin_history(root: str, specs: list, tasks: str) -> tuple:
@@ -764,8 +1004,9 @@ def pin_history(root: str, specs: list, tasks: str) -> tuple:
     refs = git(root, "rev-parse", "--all", "HEAD", timeout=3)
     key = ("pins", root, tuple(specs), tasks)
     stamp = refs.stdout if refs else ""
-    if key in GIT and GIT[key][0] == stamp:
-        return GIT[key][1]
+    cached = GIT.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
     out = git(root, "log", "--all", "--full-history", "--no-merges", "-z",
               "--format=%x1e%H%x1f%ct%x1f%s", "--name-only", "--", *specs, timeout=10)
     commits: list = []
@@ -783,10 +1024,15 @@ def pin_history(root: str, specs: list, tasks: str) -> tuple:
 
 def is_ancestor(root: str, sha: str, reviewed: str) -> bool:
     key = ("ancestor", root, sha, reviewed)
-    if key not in GIT:
+    found = GIT.get(key)
+    if found is None:
+        if len(GIT) >= GIT_LIMIT:
+            older = [k for k in list(GIT) if k[0] == "ancestor"]  # (oldest first: insertion order)
+            for k in older[: len(older) // 2 + 1]:
+                GIT.pop(k, None)
         out = git(root, "merge-base", "--is-ancestor", sha, reviewed, timeout=3)
-        GIT[key] = bool(out and out.returncode == 0)
-    return GIT[key]
+        found = GIT[key] = bool(out and out.returncode == 0)
+    return found
 
 
 def pin_drift(tasks: str, cards: dict, rows: dict, pins: dict, reviewed: str) -> list:
@@ -830,34 +1076,74 @@ def pin_drift(tasks: str, cards: dict, rows: dict, pins: dict, reviewed: str) ->
     return out
 
 
-def parse_resume(text: str) -> dict:
+# a status cell's words for todo/doing/done/…: what sessions write besides the bare word (an ambiguous
+# one, "pending review" or "open PR", is left out: drift asks for the word, and the card's tick stands in)
+STATUS_SYNONYMS = {
+    "to do": "todo", "to-do": "todo", "not started": "todo",
+    "in progress": "doing", "in-progress": "doing", "inprogress": "doing", "wip": "doing", "started": "doing",
+    "ongoing": "doing", "in review": "doing", "review": "doing", "reviewing": "doing", "testing": "doing",
+    "on hold": "blocked", "stuck": "blocked",
+    "complete": "done", "completed": "done", "finished": "done", "merged": "done",
+}
+
+
+def status_word(cell: str) -> str:
+    """A status cell as one of STATUSES when it says one ("**Doing**", "in progress", "Done (merged)"),
+    else the cell as written, lowercased ("" when empty or a dash): build() reports that as drift."""
+    words = re.sub(r"[`*_~]", " ", cell).lower().split()
+    if not words:
+        return ""
+    two = " ".join(words[:2]).strip(".,;:!()")
+    word = words[0].strip(".,;:!()").strip("-–—")
+    said = STATUS_SYNONYMS.get(two) or STATUS_SYNONYMS.get(word, word)
+    return said if said in STATUSES or not said else " ".join(words)
+
+
+def resume_ids(text: str, order: "list | None") -> list:
+    """The cards a RESUME cell or line names, a range ("T005–T008") as every card in it by the order;
+    with the order, only the cards tasks.md defines ("CPU" or "CPP" is a word, not a card)."""
+    found = list(dict.fromkeys(ids_in(text, order or []) + ID_RE.findall(text)))  # ids_in skips "(…)"
+    return [x for x in found if x in order] if order else found
+
+
+def lock_free(lock: str) -> bool:
+    """The deploy lock is free when it is unset or its first word is "free" ("free (released by T009)")."""
+    words = re.sub(r"[`*_~]", " ", lock).lower().split()
+    return not words or words[0].strip(".,;:!()") == "free"
+
+
+def parse_resume(text: str, order: "list | None" = None) -> dict:
+    """RESUME.md's tables and lists. With tasks.md's card order, ranges expand to its cards and only
+    the cards it defines count as a decision's or blocker's subject."""
     secs = sections(text)
     status = {}
-    for row in table(section(secs, "status")):
-        found = ID_RE.search(column(row, "card"))
-        if not found:
-            continue
-        words = column(row, "status").lower().split()
+    for row in rows_of(section(secs, "status"), "card", "status"):
+        found = ID_RE.search(column(row, "card"))  # one tasks.md lacks ("CPU") is drift, never a card's status
+        if not found or found.group(0) in status:
+            continue  # a card's first row counts, the one autopilot.set_row edits
         status[found.group(0)] = {
-            "status": words[0] if words else "",
+            "status": status_word(column(row, "status")),
             "branch": column(row, "branch").strip("`"),
             "commit": column(row, "commit").strip("`"),
             "date": column(row, "date"),
         }
     decisions = []
-    for row in table(section(secs, "decisions")):
+    for row in rows_of(section(secs, "decisions"), "question"):
+        n, question = column(row, "#"), column(row, "question")
+        if n.startswith("<") or question.startswith("<") or not (n or question):
+            continue  # the template's placeholder row, or an empty one
         answer = column(row, "answer")
         plain = answer.lower().strip(" .")
         decisions.append({
-            "n": column(row, "#"),
-            "question": column(row, "question"),
-            "before": ID_RE.findall(column(row, "needed")),
+            "n": n,
+            "question": question,
+            "before": resume_ids(column(row, "needed"), order),
             "recommended": column(row, "recommend"),
             "answer": answer,
             "open": plain in OPEN_ANSWERS or plain.startswith("deferred"),
         })
     approvals = []
-    for row in table(section(secs, "approvals")):
+    for row in rows_of(section(secs, "approvals"), "step"):
         n = column(row, "#")
         if not n or n.startswith("<"):
             continue
@@ -880,39 +1166,158 @@ def parse_resume(text: str) -> dict:
             continue
         if any(b["text"] == item for b in blockers):
             continue  # the same blocker written twice blocks once
-        blockers.append({"text": item, "cards": blocker_subjects(item)})
-    lock = next((line.strip() for line in section(secs, "deploy lock") if line.strip()), "")
+        blockers.append({"text": item, "cards": blocker_subjects(item, order)})
+    lock, inside = "", False
+    for line in text.splitlines():  # the first line under the last "## Deploy lock" (sections() joins them)
+        if heading := re.match(r"^##\s+(.+?)\s*$", line):
+            inside = heading.group(1).lower().startswith("deploy lock")
+            lock = "" if inside else lock
+        elif inside and not lock and line.strip():
+            lock = line.strip()
     reviewed = REVIEWED_RE.findall(text)  # a checkpoint's "Pins reviewed up to <commit>"; the last one counts
     return {"status": status, "decisions": decisions, "approvals": approvals, "blockers": blockers, "lock": lock,
-            "pins_reviewed": reviewed[-1] if reviewed else ""}
+            "lock_free": lock_free(lock), "pins_reviewed": reviewed[-1] if reviewed else ""}
 
 
-def blocker_subjects(item: str) -> list:
-    """The cards a blocker holds up: the card it opens with ("T037 (date): …", "T016C: …"), else the
-    cards after "before" ("<precondition> before T005"), else the card it opens with, else none."""
-    lead = re.match(rf"\s*({ID})\b(\s*[(:])?", item)
-    if lead and lead.group(2):
-        return [lead.group(1)]
-    before = BEFORE_RE.findall(item)
+def blocker_subjects(item: str, order: "list | None" = None) -> list:
+    """The cards a blocker holds up: the card (or range) it opens with ("T037 (date): …", "T016C: …",
+    "T005–T008: …"), else the cards after "before" ("<precondition> before T005"), else the card it
+    opens with, else the one card it names outside parentheses ("waiting on the API key for T005"), else none.
+    With the order, only cards tasks.md defines count ("CPU quota exceeded" names no card)."""
+    lead = re.match(rf"\s*({ID}(?:\s*[–-]\s*{ID})?)\b(\s*[(:])?", item)
+    if lead and lead.group(2) and (named := resume_ids(lead.group(1), order)):
+        return named
+    before = []
+    for m in BEFORE_RE.finditer(item):
+        span = RANGE_RE.match(item, m.start(1))  # "before T005–T008": all of them
+        before += resume_ids(span.group(0) if span else m.group(1), order)
     if before:
         return list(dict.fromkeys(before))
-    return [lead.group(1)] if lead else []
+    if lead and (named := resume_ids(lead.group(1), order)):
+        return named
+    # "(T003 shipped the stub)" is an aside, not the card held up: a blocker on a finished card is history
+    anywhere = resume_ids(re.sub(r"\([^)]*\)", " ", item), order)
+    return anywhere if len(anywhere) == 1 else []
 
 
 # --- the picture ----------------------------------------------------------------------
 
 
 def last_commit(repo: str, branch: str) -> float | None:
-    if not branch or branch in ("-", "—"):
+    """When a card's branch last moved here, from its reflog: a commit, a merge into it, or its creation (a
+    branch just cut from an old tip is not "quiet since" that tip). Without a reflog, when its tip was
+    committed if no other local branch holds that tip, else None (it is not this card's work). None too
+    when the cell names nothing git knows. Sessions write RESUME, so a cell starting with "-" never
+    reaches git: git would read it as an option (`--output=<file>` writes that file)."""
+    branch = (branch or "").strip()
+    if not branch or branch in ("-", "—") or branch.startswith("-"):
         return None
+    rev = [*end_of_options(), branch, "--"]
+    out = git(repo, "log", "-g", "-1", "--format=%gd", "--date=unix", *rev, timeout=3)
+    if out and out.returncode == 0 and (moved := re.search(r"@\{(\d+)\}$", out.stdout.strip())):
+        return float(moved.group(1))
+    name = re.sub(r"^refs/heads/", "", branch)
+    out = git(repo, "log", "-1", "--format=%ct", "--not", f"--exclude={name}", "--branches", "--not", *rev,
+              timeout=3)
+    text = out.stdout.strip() if out and out.returncode == 0 else ""
+    return float(text) if text.isdigit() else None
+
+
+def number(value) -> float:
+    """A number from runs.json; 0 for anything else ("n/a", null, NaN, infinity: never in the JSON)."""
     try:
-        out = subprocess.run(
-            ["git", "-C", repo, "log", "-1", "--format=%ct", branch],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-        return float(out) if out else None
-    except Exception:
+        out = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return out if math.isfinite(out) else 0.0
+
+
+# runs.json: its tables and lists, and the fields of a run that are text or numbers
+REGISTRY_FIELDS = (("runs", list), ("attention", dict), ("handled", list), ("manual", list), ("notified", list),
+                   ("queued", list), ("granted", dict), ("blocked_on", dict), ("retried", dict))
+RUN_TEXT = ("card", "session", "batch", "reason", "approval", "started", "ended", "result", "error", "log")
+RUN_NUMBERS = ("cost", "started_ts", "kill_sent_ts", "killed_ts", "leftovers_ts", "seen_ts")
+
+
+def registry_of(found) -> dict:
+    """runs.json as everything that reads it expects it (build(), lessons(), autopilot.registry()): each
+    table and list of its type, the ids in them as text, every run an object whose text fields are text
+    ("" when missing) and whose costs and times are finite numbers (0 for "n/a", null, NaN or infinity),
+    a run's port slot a whole number. A hand-edited or half-broken file must take down neither the
+    report, the dashboard nor the dispatcher. Changes found in place and returns it."""
+    reg = found if isinstance(found, dict) else {}
+    for key, kind in REGISTRY_FIELDS:
+        if not isinstance(reg.get(key), kind):
+            reg[key] = kind()
+    for key in ("handled", "manual", "notified", "queued"):
+        reg[key] = [x for x in reg[key] if isinstance(x, str)]
+    reg["attention"] = {str(k): "" if v is None else str(v) for k, v in reg["attention"].items()}
+    for key in ("granted", "retried"):  # counts per unit
+        reg[key] = {str(k): max(0, int(number(v))) for k, v in reg[key].items()}
+    reg["blocked_on"] = {str(k): [str(x) for x in v] if isinstance(v, list) else []
+                         for k, v in reg["blocked_on"].items()}
+    runs = []
+    for run in reg["runs"]:
+        if not isinstance(run, dict):
+            continue
+        for key in RUN_TEXT:
+            value = run.get(key)
+            run[key] = value if isinstance(value, str) else "" if value in (None, False) else str(value)
+        for key in RUN_NUMBERS:
+            if key in run:
+                run[key] = number(run[key])
+        if "slot" in run:
+            run["slot"] = max(0, int(number(run["slot"])))
+        runs.append(run)
+    reg["runs"] = runs
+    for key in ("account", "chrome_check"):  # the account and Chrome checks: an object, or nothing
+        entry = reg.get(key)
+        if key in reg and not isinstance(entry, dict):
+            reg[key] = None
+        elif isinstance(entry, dict):  # times as numbers, words as text, flags true only when true, names a list
+            if "ts" in entry:
+                entry["ts"] = number(entry["ts"])
+            for field in ("launcher", "email", "error", "detail", "url", "final_url", "account"):
+                if field in entry and not isinstance(entry[field], str):
+                    entry[field] = "" if entry[field] is None else str(entry[field])
+            for field in ("ok", "running", "logged_in"):  # "false" or "no" must not read as true
+                if field in entry:
+                    entry[field] = entry[field] is True
+            if "keep_env" in entry and not isinstance(entry["keep_env"], list):
+                entry["keep_env"] = []
+    return reg
+
+
+def mtime(path: str) -> float | None:
+    try:
+        return os.path.getmtime(path)
+    except OSError:  # removed since it was listed
         return None
+
+
+def row_time(cell: str, day: bool = False) -> float | None:
+    """The newest time in a RESUME status row's date cell, as a UTC timestamp: "2026-10-09 14:05Z" (or
+    "T14:05") at that minute. With day, the newest bare day instead, at its end but never later than
+    now: it says only that the row changed that day."""
+    out = []
+    for m in re.finditer(r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?", cell or ""):
+        if (m.group(4) is None) != day:
+            continue
+        try:  # (not named `day`: that is the flag every later match is checked against)
+            date = dt.datetime(*(int(x) for x in m.groups()[:3]), tzinfo=dt.timezone.utc)
+            at = (min(date + dt.timedelta(days=1), now()) if m.group(4) is None
+                  else date.replace(hour=int(m.group(4)), minute=int(m.group(5))))
+        except ValueError:
+            continue
+        out.append(at.timestamp())
+    return max(out, default=None)
+
+
+def run_times(state_dir: str, run: dict) -> list:
+    """When a session the autopilot started began, and when its log last grew (its last output)."""
+    began = number(run.get("started_ts")) or row_time(str(run.get("started") or ""))
+    log = run.get("log")
+    return [began, mtime(os.path.join(state_dir, log)) if isinstance(log, str) and log else None]
 
 
 def recent_commits(folder: str, cards: dict, rows: dict, limit: int = 25) -> list:
@@ -927,8 +1332,10 @@ def recent_commits(folder: str, cards: dict, rows: dict, limit: int = 25) -> lis
         return []
     recorded = {}
     for cid, row in rows.items():
-        commit = re.sub(r"[^0-9a-f]", "", (row.get("commit") or "").lower())
-        if len(commit) >= 7:
+        if cid not in cards:
+            continue  # a row for a card tasks.md does not define: drift, not a commit's owner
+        # whole hashes only (SHA-1 or SHA-256): "merged a1b2c3d" is a1b2c3d, not "merged"'s hex letters too
+        for commit in re.findall(r"\b[0-9a-f]{7,64}\b", (row.get("commit") or "").lower()):
             recorded[commit[:7]] = cid
     items = []
     for line in out.splitlines():
@@ -982,7 +1389,7 @@ def phase_cards(folder: str, phase: str, cache: dict) -> dict:
         if number and int(number.group(1)) == int(phase) and name[number.end():][:1] in ("-", "_", " ", ".", "") \
                 and os.path.isfile(path):
             cards, order = parse_tasks(read(path))
-            resume = parse_resume(read(os.path.join(parent, name, "state", "RESUME.md")))
+            resume = parse_resume(read(os.path.join(parent, name, "state", "RESUME.md")), order)
             found = {"folder": os.path.join(parent, name), "order": order,
                      "status": card_status(cards, order, resume)}
             break
@@ -999,11 +1406,12 @@ def build(tasks: str, stale_hours: float) -> dict:
     state_dir = os.path.join(folder, "state")
     resume_path = os.path.join(state_dir, "RESUME.md")
     has_resume = os.path.isfile(resume_path)
-    resume = parse_resume(read(resume_path))
+    resume = parse_resume(read(resume_path), order)
     handoff_dir = os.path.join(state_dir, "handoff")
     handoffs = {}
     for path in glob.glob(os.path.join(handoff_dir, "*.md")):
-        handoffs[os.path.basename(path)[:-3]] = os.path.getmtime(path)
+        if (when := mtime(path)) is not None:
+            handoffs[os.path.basename(path)[:-3]] = when
 
     status = card_status(cards, order, resume)
     phases: dict = {}  # the other features this one's cards wait on, read once per build
@@ -1012,7 +1420,7 @@ def build(tasks: str, stale_hours: float) -> dict:
     # a finished checkpoint holds the next stage until the owner has looked at it (autopilot only)
     gates_open = [c for c in order if is_gate(c) and status[c] == "done"
                   and settings["exists"] and settings["gate_checkpoints"]
-                  and c not in settings["approved_gates"]]
+                  and c not in gates_approved(settings)]
     gates_open = [g for g in gates_open if any(g in cards[c]["after"] and status[c] not in FINISHED for c in order)]
     open_decisions = [d for d in resume["decisions"] if d["open"]]
     # a blocker about finished cards only is history: it stays in RESUME, not in "Needs you"
@@ -1048,8 +1456,7 @@ def build(tasks: str, stale_hours: float) -> dict:
             reasons.append({"kind": "blocker", "on": "marked blocked in RESUME"})
         waits[cid] = reasons
 
-    registry = read_json(os.path.join(state_dir, "runs.json"), {})
-    registry = registry if isinstance(registry, dict) else {}
+    registry = registry_of(read_json(os.path.join(state_dir, "runs.json"), {}))  # a hand-edited one too
     alive = {id(r): run_alive(r) for r in registry.get("runs", []) if not r.get("ended")}
     live_runs = [r for r in registry.get("runs", []) if alive.get(id(r))]
     batch_runs = {r["batch"]: r for r in live_runs if r.get("batch")}
@@ -1074,7 +1481,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         mine = [r for r in registry.get("runs", []) if r.get("batch") == b["id"]]
         b["run_card"] = (batch_runs.get(b["id"]) or (mine[-1] if mine else {})).get("card", "")
     open_batch = {b["id"]: b for b in batches if not b["done"]}
-    batch_drift += batch_rules(batches, cards, status)
+    batch_drift += batch_rules(batches, cards, status, open_decisions)
     live_cards = [c for c in order if status[c] not in FINISHED and any(
         r.get("card") == c for r in live_runs)]
     # a live batch session works on its batch's first open card, whichever card it was started on
@@ -1162,9 +1569,16 @@ def build(tasks: str, stale_hours: float) -> dict:
     stalled = []
     for cid in doing:
         row = resume["status"].get(cid, {})
-        last = last_commit(folder, row.get("branch", ""))
-        if cid in handoffs:
-            last = max(last or 0, handoffs[cid])
+        # the newest sign of work: its branch moving, its hand-off, its RESUME row's time, and its latest
+        # session's start and last output (a batch's session counts for the card the batch is on); a sign
+        # from the future (a local time written as UTC, a skewed clock) says nothing. A bare day on its
+        # row counts only when there is nothing finer
+        signs = [last_commit(folder, row.get("branch", "")), handoffs.get(cid), row_time(row.get("date", ""))]
+        run = next((r for r in reversed(registry["runs"]) if r.get("card") == cid
+                    or (batch_of.get(cid) and r.get("batch") == batch_of[cid])), None)
+        signs += run_times(state_dir, run) if run else []
+        last = max((x for x in signs if x and x <= stamp + 300), default=None) \
+            or row_time(row.get("date", ""), day=True)
         if last and stamp - last > stale_hours * 3600:
             stalled.append({"card": cid, "quiet": ago(stamp - last)})
 
@@ -1174,6 +1588,9 @@ def build(tasks: str, stale_hours: float) -> dict:
             row = resume["status"].get(cid)
             if not row:
                 drift.append(f"{cid} is in tasks.md but has no row in RESUME's status table")
+            elif row["status"] and row["status"] not in STATUSES:  # its tick in tasks.md stands in for it
+                drift.append(f"{cid} has unknown status '{row['status']}' in RESUME"
+                             f" (one of {', '.join(sorted(STATUSES))})")
             elif cards[cid]["ticked"] and row["status"] not in FINISHED:
                 drift.append(f"{cid} is ticked in tasks.md but RESUME says {row['status'] or 'nothing'}")
             elif row["status"] in FINISHED and not cards[cid]["ticked"]:
@@ -1182,11 +1599,13 @@ def build(tasks: str, stale_hours: float) -> dict:
             if cid not in cards:
                 drift.append(f"RESUME has a row for {cid}, which tasks.md does not define")
     for cid in order:
-        if status[cid] == "done" and cid not in handoffs and has_resume:
+        # an owner's card is marked done on the dashboard, which writes no hand-off
+        if status[cid] == "done" and cid not in handoffs and has_resume and cards[cid]["kind"] != "owner":
             drift.append(f"{cid} is done but state/handoff/{cid}.md is missing")
         for dep in cards[cid]["after"]:
             if dep not in cards:
                 drift.append(f"{cid} waits for {dep}, which tasks.md does not define")
+    drift += tasks_drift(text, cards, order, status)
     drift += batch_drift
     # features whose templates have a Checks table: a pinning test changed by any card but its writer is
     # drift until a checkpoint reviews it, and every done card shows its checks with their evidence
@@ -1226,9 +1645,10 @@ def build(tasks: str, stale_hours: float) -> dict:
                 open_checks.append({"card": cid, "criterion": flat(r["criterion"], 120, cell=False),
                                     "verdict": said, "note": note})
     lock = resume["lock"]
-    holder = ID_RE.search(lock or "")
-    if holder and status.get(holder.group(0)) in FINISHED:
-        drift.append(f"the deploy lock is still held by {holder.group(0)}, which is {status[holder.group(0)]}")
+    # "free (released by T009)" is free: the card it names let go of it
+    holder = "" if resume["lock_free"] else next((x for x in ID_RE.findall(lock) if x in cards), "")
+    if holder and status.get(holder) in FINISHED:
+        drift.append(f"the deploy lock is still held by {holder}, which is {status[holder]}")
     merging = merge_lock(state_dir)
     if merging and merging["holder"]:
         who = merging["holder"]
@@ -1243,7 +1663,7 @@ def build(tasks: str, stale_hours: float) -> dict:
     session_cost: dict = {}
     for run in registry.get("runs", []):
         key = run.get("session") or id(run)
-        session_cost[key] = max(session_cost.get(key, 0.0), float(run.get("cost") or 0))
+        session_cost[key] = max(session_cost.get(key, 0.0), number(run.get("cost")))
     for run in registry.get("runs", []):
         cid = run.get("card", "")
         live = bool(alive.get(id(run)))
@@ -1260,7 +1680,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         entry.pop("keys")
     attention = registry.get("attention", {})
     runs_file = os.path.join(state_dir, "runs.json")
-    beat = os.path.getmtime(runs_file) if os.path.exists(runs_file) else None
+    beat = mtime(runs_file)
     pending = [a for a in resume["approvals"] if a["status"] == "pending"]
     answered = [a for a in resume["approvals"] if a["status"] in ("approved", "rejected")]
     yours = [c for c in order if cards[c]["kind"] == "owner" and status[c] not in FINISHED and not waits[c]]
@@ -1282,7 +1702,10 @@ def build(tasks: str, stale_hours: float) -> dict:
     for path in sorted(glob.glob(os.path.join(state_dir, "screens", "*"))):
         name = os.path.basename(path)
         if re.fullmatch(ID, name) and os.path.isdir(path):
-            files = sorted(f for f in os.listdir(path) if IMAGE_RE.match(f))
+            try:
+                files = sorted(f for f in os.listdir(path) if IMAGE_RE.match(f))
+            except OSError:  # removed since the glob
+                files = []
             if files:
                 screens[name] = files
 
@@ -1313,6 +1736,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         "open_decisions": open_decisions,
         "blockers": active_blockers,
         "lock": lock,
+        "lock_free": resume["lock_free"],
         "merge_lock": merging,
         "stalled": stalled,
         "drift": drift,
@@ -1493,7 +1917,7 @@ def render(s: dict) -> str:
     lines.append("")
     lines.append("Needs you:")
     lines += [f"  {n}" for n in needs] or ["  nothing"]
-    if s["lock"] and s["lock"].lower() != "free":
+    if not s["lock_free"]:
         lines.append(f"Deploy lock: {s['lock']}")
     if s.get("merge_lock"):
         m = s["merge_lock"]
@@ -1519,20 +1943,25 @@ def check_line(c: dict) -> str:
 
 
 def is_try(run: dict) -> bool:
-    """A session that counts against a card's attempts: not one that stopped to wait for the owner,
-    one resumed with the owner's answer, or one that never reached the API."""
-    return (not run.get("api_error") and not str(run.get("reason") or "").startswith("answer")
-            and not WAITED.search(run.get("result") or ""))
+    """A session that counts against a card's attempts: not one that never reached the API, one resumed
+    with the owner's answer that did work, one that split its card, or one that stopped to wait for the
+    owner, unless RESUME had no pending approval or open decision for it when it ended ("unbacked",
+    autopilot.py judges that): a session that only says it waits would otherwise be resumed for ever."""
+    result = run.get("result") or ""
+    if run.get("api_error"):
+        return False
+    if str(run.get("reason") or "").startswith("answer"):
+        return bool(run.get("ended")) and not run.get("worked")
+    return not SPLIT.search(result) and (not WAITED.search(result) or bool(run.get("unbacked")))
 
 
 def lessons(s: dict) -> str:
     """What each card really took (runs, tries, cost, hours) beside what the plan guessed (size, effort),
     as Markdown for the close card's retro and specs/lessons.md. Only measured numbers; a card the
     autopilot never ran shows "-"."""
-    registry = read_json(os.path.join(os.path.dirname(s["tasks"]), "state", "runs.json"), {})
-    registry = registry if isinstance(registry, dict) else {}
-    runs, attention = registry.get("runs", []), registry.get("attention", {})
-    resume = parse_resume(read(s["resume"])) if s["resume"] else {"approvals": [], "decisions": []}
+    registry = registry_of(read_json(os.path.join(os.path.dirname(s["tasks"]), "state", "runs.json"), {}))
+    runs, attention = registry["runs"], registry["attention"]
+    resume = parse_resume(read(s["resume"]), list(s["cards"])) if s["resume"] else {"approvals": [], "decisions": []}
     utc = lambda v: dt.datetime.strptime(v, "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc).timestamp()  # noqa: E731
     def measure(mine: list) -> tuple:
         """runs, tries, cost and hours of some runs (each session's cost once, at its highest report)."""
@@ -1540,10 +1969,10 @@ def lessons(s: dict) -> str:
         hours = 0.0
         for r in mine:
             key = r.get("session") or id(r)
-            cost[key] = max(cost.get(key, 0.0), float(r.get("cost") or 0))
+            cost[key] = max(cost.get(key, 0.0), number(r.get("cost")))  # "n/a", NaN, infinity: 0
             try:
                 if r.get("ended"):
-                    began = float(r["started_ts"]) if r.get("started_ts") else utc(r["started"])
+                    began = number(r.get("started_ts")) or utc(r["started"])
                     hours += max(utc(r["ended"]) - began, 0) / 3600  # "ended" keeps minutes only
             except (KeyError, ValueError, TypeError):
                 pass
@@ -1610,6 +2039,8 @@ def owner_part(cid: str, mine: list, resume: dict, attention: dict) -> str:
 
 
 def snapshot(s: dict) -> dict:
+    """What --wait compares (each field a str, list or dict, which like() checks a saved one against)."""
+    merging = s.get("merge_lock")
     return {
         "status": s["status"],
         "ready": s["ready"],
@@ -1623,10 +2054,22 @@ def snapshot(s: dict) -> dict:
         "open_checks": [check_line(c) for c in s["open_checks"]],
         "approvals": [f"{a['n']} {a['card']}: {a['step']}" for a in s["approvals"]],
         "gates": s["gates"],
-        "attention": sorted(s["autopilot"]["attention"]),
-        "paused": s["autopilot"]["settings"]["paused_reason"],
+        "attention": {c: flat(why, 200, cell=False) for c, why in s["autopilot"]["attention"].items()},
+        "live": sorted(str(c) for c in s["autopilot"]["live"]),
+        "merge_lock": f"held by {merging['holder'] or 'a session that has not said who it is'}"
+                      + (f" since {merging['since']}" if merging["since"] else "") if merging else "",
+        "paused": str(s["autopilot"]["settings"]["paused_reason"] or ""),
         "commits": [f"{c['hash'][:7]} {c['subject']}" for c in s["commits"][:10]],
     }
+
+
+def like(saved, new: dict) -> dict | None:
+    """The last --wait's snapshot with new's fields in new's types; a field it lacks (say, from an older
+    supervisor) or holds in another type takes new's value, since it can't say what changed. None when
+    it is no snapshot at all."""
+    if not isinstance(saved, dict) or not isinstance(saved.get("status"), dict):
+        return None
+    return {k: saved[k] if isinstance(saved.get(k), type(v)) else v for k, v in new.items()}
 
 
 def changes(old: dict, new: dict) -> list:
@@ -1657,7 +2100,13 @@ def changes(old: dict, new: dict) -> list:
     out += [f"open check: {c}" for c in new.get("open_checks", []) if c not in old.get("open_checks", [])]
     out += [f"approval needed: {a}" for a in new.get("approvals", []) if a not in old.get("approvals", [])]
     out += [f"stage {g} finished and waits for your review" for g in new.get("gates", []) if g not in old.get("gates", [])]
-    out += [f"{c} needs you" for c in new.get("attention", []) if c not in old.get("attention", [])]
+    said = old.get("attention", {})
+    out += [f"{c} needs you: {why}" for c, why in new.get("attention", {}).items() if said.get(c) != why]
+    out += [f"{c} no longer needs you" for c in said if c not in new.get("attention", {})]
+    out += [f"{c}: a session started" for c in new.get("live", []) if c not in old.get("live", [])]
+    out += [f"{c}: its session ended" for c in old.get("live", []) if c not in new.get("live", [])]
+    if old.get("merge_lock", "") != new.get("merge_lock", ""):
+        out.append(f"merge lock: {old.get('merge_lock') or 'free'} → {new.get('merge_lock') or 'free'}")
     out += [f"new commit {c}" for c in new.get("commits", []) if c not in old.get("commits", [])][:5]
     if new.get("paused") and new.get("paused") != old.get("paused"):
         out.append(f"autopilot paused: {new['paused']}")
@@ -1680,7 +2129,8 @@ def main() -> None:
     parser.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     parser.add_argument("--interval", type=float, default=5, help="seconds between reads (5)")
     parser.add_argument("--stale-hours", type=float, default=4,
-                        help="a doing card with no commit or hand-off for this long is stalled (4)")
+                        help="a doing card with no sign of work for this long (a commit only its branch holds,"
+                             " its hand-off, its RESUME date, its session's output) is stalled (4)")
     args = parser.parse_args()
     tasks = find_tasks(args.tasks)
 
@@ -1692,7 +2142,10 @@ def main() -> None:
         shown, drawn = None, 0.0
         try:
             while True:
-                body = render(build(tasks, args.stale_hours))
+                try:
+                    body = render(build(tasks, args.stale_hours))
+                except Exception as error:  # shown in place of the view; the next read may succeed
+                    body = f"{tasks}\nsupervisor: could not read the state: {type(error).__name__}: {error}"
                 key = body.split("\n", 1)[1]
                 if key != shown or time.time() - drawn > 60:
                     sys.stdout.write("\033[2J\033[H" + body + f"\n\nwatching every {args.interval:g}s · Ctrl-C stops\n")
@@ -1704,10 +2157,11 @@ def main() -> None:
     elif args.serve:
         serve(tasks, args.port, args.stale_hours, args.open, args.autopilot)
     elif args.autopilot:
-        import threading
         import autopilot
         stop = threading.Event()
-        enable(tasks)
+        if enable(tasks):
+            print("Autopilot: new on this feature, so it starts paused; press Resume on the dashboard"
+                  " (supervisor.py … --serve) to let it run", flush=True)
         print(f"Autopilot: dispatching {tasks} (Ctrl-C stops; running sessions keep going)", flush=True)
         try:
             autopilot.loop(lambda: users(tasks), args.interval, stop, lambda line: print(line, flush=True))
@@ -1715,18 +2169,16 @@ def main() -> None:
             stop.set()
     elif args.wait:
         path = os.path.join(os.path.dirname(tasks), "state", ".supervisor.json")
-        try:
-            with open(path, encoding="utf-8") as handle:
-                old = json.load(handle)
-        except (OSError, ValueError):
-            old = None
+        saved, old = read_json(path, None), None
         while True:
             state = build(tasks, args.stale_hours)
             new = snapshot(state)
             if old is None:
-                old = new  # first run: this is the baseline
-                save(path, new)
-            elif new != old:
+                old = like(saved, new)
+                if old is None:  # first run, or a snapshot that is missing or broken: this is the baseline
+                    old = new
+                    save(path, new)
+            if new != old:
                 save(path, new)
                 print("Changed:")
                 print("\n".join(f"  {line}" for line in changes(old, new)) or "  (details only)")
@@ -1738,11 +2190,18 @@ def main() -> None:
         print(render(build(tasks, args.stale_hours)))
 
 
-def enable(tasks: str) -> None:
-    """--autopilot on a feature that has never used it: create its settings, switched on."""
+NEW_PAUSED = "new: press Resume to start"
+
+
+def enable(tasks: str) -> bool:
+    """--autopilot on a feature that has never used it: create its settings, paused, so the owner looks at
+    the dashboard first (or tries one card with its Start button) and presses Resume to let it run.
+    True when it created them."""
     path = os.path.join(os.path.dirname(tasks), "state", "autopilot.json")
-    if not os.path.exists(path):
-        save(path, {**{k: v for k, v in SETTINGS.items()}, "auto": True})
+    if os.path.exists(path):
+        return False
+    save(path, {**SETTINGS, "auto": False, "paused_reason": NEW_PAUSED})
+    return True
 
 
 def users(tasks: str) -> list:
@@ -1752,16 +2211,65 @@ def users(tasks: str) -> list:
                   if os.path.exists(os.path.join(os.path.dirname(p), "state", "autopilot.json")))
 
 
+MAX_BODY = 1 << 20  # the largest action the dashboard may post (its answers are a few hundred bytes)
+
+
+def finite(text: str) -> float:
+    """A JSON number the dashboard could have sent; ValueError for one that is not finite."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is not a finite number")
+    return value
+
+
+LOCKED = """<!doctype html><meta charset="utf-8"><title>Spec-Grill dashboard</title>
+<p style="font: 16px system-ui; margin: 2em">This dashboard opens only from the link printed in the terminal that
+started it (<code>supervisor.py … --serve</code>): the link carries this launch's key. Open that link, or start
+the supervisor with <code>--open</code>.</p>"""
+
+
 def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatch: bool = False) -> None:
     import secrets
-    import threading
+    import shutil
+    import tempfile
+    import traceback
+    from http.cookies import CookieError, SimpleCookie
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import parse_qs, urlparse
+    from urllib.parse import parse_qs, quote, urlparse
 
     specs = os.path.dirname(os.path.dirname(tasks))
     default = os.path.basename(os.path.dirname(tasks))
     page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
     token = secrets.token_urlsafe(24)  # the page carries it; other sites can't read it, so can't post
+    # This launch's key. The page (and so the token) goes only to a request that carries it: in the link
+    # printed to this terminal (?k=), or in the cookie that link sets. It never enters argv or the
+    # environment, so a card session can't fetch the page and post actions as the owner. Sessions run as
+    # the same OS user, though: this raises the bar, it is no sandbox.
+    key = secrets.token_urlsafe(24)
+    handed: list = []  # the private folder --open may forward the browser through; removed once used
+
+    def forget() -> None:  # (a request thread and the timer may both call it)
+        while True:
+            try:
+                folder = handed.pop()
+            except IndexError:
+                return
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def forwarder(link: str) -> str:
+        """A private page that sends the browser on to link, for a browser webbrowser starts with the link
+        on its command line (Linux, or $BROWSER), where `ps` would show the key for the browser's whole
+        life. Removed once the dashboard has loaded through it, or after a minute."""
+        folder = tempfile.mkdtemp(prefix="spec-grill-")  # only this user may enter it
+        path = os.path.join(folder, "dashboard.html")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={link}">'
+                         f'<a href="{link}">Open the dashboard</a>')
+        handed.append(folder)
+        timer = threading.Timer(60, forget)
+        timer.daemon = True
+        timer.start()
+        return "file://" + path
 
     def features() -> list:
         return sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(specs, "*", "tasks.md")))
@@ -1770,12 +2278,42 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
         name = name or default
         return os.path.join(specs, name, "tasks.md") if name in features() else None  # no paths from the URL
 
+    failed = [""]  # the last error a request met, printed once
+
     class Handler(BaseHTTPRequestHandler):
+        timeout = 30  # a request that sends less than its Content-Length gives its thread back after this
+
         def log_message(self, *args) -> None:
             pass
 
+        def do_POST(self) -> None:
+            self.guarded(self.post)
+
+        def do_GET(self) -> None:
+            self.guarded(self.get)
+
+        def guarded(self, answer) -> None:
+            """Answer a request; an error answers 500 with its text, instead of dropping the connection."""
+            try:
+                answer()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the page went away
+            except Exception as error:
+                said = f"{type(error).__name__}: {error}"
+                if said != failed[0]:
+                    failed[0] = said
+                    print(f"supervisor: {self.command} {self.path.split('?', 1)[0]} failed\n{traceback.format_exc()}",
+                          file=sys.stderr, flush=True)
+                try:  # the dashboard shows an action's answer as text; the GET API answers JSON
+                    if self.command == "POST":
+                        self.send(500, f"the supervisor failed: {said}", "text/plain; charset=utf-8")
+                    else:
+                        self.send(500, json.dumps({"error": said}), "application/json; charset=utf-8")
+                except OSError:
+                    pass
+
         def send(self, code: int, body: str, kind: str) -> None:
-            data = body.encode("utf-8")
+            data = body.encode("utf-8", "replace")  # a lone surrogate from a session's JSON: "?", not a 500
             self.send_response(code)
             self.send_header("Content-Type", kind)
             self.send_header("Cache-Control", "no-store")
@@ -1795,7 +2333,22 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
                 return False
             return True
 
-        def do_POST(self) -> None:
+        def cookie(self) -> str:  # one per port: a browser sends 127.0.0.1's cookies to every port
+            return f"spec_grill_{self.server.server_address[1]}"
+
+        def owner(self, query: dict) -> bool:
+            """The request carries this launch's key: in the link printed to the terminal, or its cookie."""
+            given = query.get("k", [""])[0]
+            if not given:
+                jar = SimpleCookie()
+                try:
+                    jar.load(self.headers.get("Cookie") or "")
+                except CookieError:
+                    pass
+                given = jar[self.cookie()].value if self.cookie() in jar else ""
+            return secrets.compare_digest(given.encode(), key.encode())
+
+        def post(self) -> None:
             if not self.local():
                 return
             origin = self.headers.get("Origin")
@@ -1807,10 +2360,19 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
             if url.path != "/api/act":
                 return self.send(404, "not found", "text/plain")
             try:
-                length = min(int(self.headers.get("Content-Length") or 0), 65536)
-                data = json.loads(self.rfile.read(length) or b"{}")
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self.send(400, "bad Content-Length", "text/plain")
+            if length < 0:  # rfile.read(-1) would wait for the client to hang up
+                return self.send(400, "bad Content-Length", "text/plain")
+            if length > MAX_BODY:
+                return self.send(413, f"request too large (at most {MAX_BODY} bytes)", "text/plain")
+            try:  # Infinity, NaN and 1e999 are no JSON numbers: they would only reach act() to fail there
+                data = json.loads(self.rfile.read(length) or b"{}", parse_float=finite, parse_constant=finite)
             except ValueError:
                 return self.send(400, "bad JSON", "text/plain")
+            if not isinstance(data, dict):
+                return self.send(400, "bad JSON: the body must be an object", "text/plain")
             path = tasks_of(str(data.get("f", "")))
             if not path:
                 return self.send(404, "no such feature", "text/plain")
@@ -1824,13 +2386,27 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
                 return self.send(409, str(error), "text/plain; charset=utf-8")
             self.send(200, message, "text/plain; charset=utf-8")
 
-        def do_GET(self) -> None:
+        def get(self) -> None:
             if not self.local():
                 return
             url = urlparse(self.path)
             query = parse_qs(url.query)
             name = query.get("f", [""])[0]
             if url.path == "/":
+                if not self.owner(query):
+                    return self.send(403, LOCKED, "text/html; charset=utf-8")
+                if "k" in query:  # the key goes into a cookie, and out of the address bar
+                    forget()
+                    # Lax, not Strict: Chrome drops a Strict cookie on a redirect that began on another site
+                    # (the forwarder's file://), and the cookie only unlocks a page no other site can read
+                    self.send_response(303)
+                    self.send_header("Location", "/" + (f"?f={quote(name)}" if name else ""))
+                    self.send_header("Set-Cookie", f"{self.cookie()}={key}; HttpOnly; SameSite=Lax; Path=/")
+                    self.send_header("Cache-Control", "no-store")
+                    self.frame_guard()
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 html = read(page) or "dashboard.html is missing"
                 meta = f'<meta name="supervisor-token" content="{token}"><meta name="supervisor-dispatch" content="{int(dispatch)}">'
                 self.send(200, html.replace("</head>", meta + "</head>", 1), "text/html; charset=utf-8")
@@ -1892,33 +2468,70 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
             continue
     else:
         sys.exit(f"supervisor: ports {port}-{port + 19} are all busy")
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    # only this terminal sees the key (--open hands the link to the browser; on macOS via osascript's stdin)
+    url = f"http://127.0.0.1:{server.server_address[1]}/?k={key}"
     print(f"Dashboard: {url} (Ctrl-C stops)", flush=True)
     stop = threading.Event()
     if dispatch:
         import autopilot
-        enable(tasks)
+        if enable(tasks):
+            print("Autopilot: new on this feature, so it starts paused; press Resume on the dashboard to let it run",
+                  flush=True)
         worker = threading.Thread(target=autopilot.loop, daemon=True,
                                   args=(lambda: users(tasks), 5, stop, lambda line: print(line, flush=True)))
         worker.start()
         print("Autopilot: dispatching; running sessions keep going if this stops", flush=True)
     if open_browser:
         import webbrowser
-        webbrowser.open(url)
+        # macOS: webbrowser hands the link to osascript on its stdin; elsewhere it goes on a command line
+        direct = sys.platform == "darwin" and not os.environ.get("BROWSER")
+        webbrowser.open(url if direct else forwarder(url))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        forget()
         stop.set()
         if dispatch:
             worker.join(timeout=10)
 
 
-def save(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1)
+def save(path: str, data, backup: bool = False) -> None:
+    """Write JSON whole and durably; the one writer of the state files, the supervisor's (the --wait
+    snapshot, a new autopilot.json) and the autopilot's (autopilot.json, runs.json). Into a file beside
+    path, flushed to disk, then renamed over it, and the rename flushed too: no reader sees half of it, and
+    a crash leaves the old file or the new one. A failed write leaves the old file and no temporary one.
+    With backup (runs.json), the file it replaces is kept as <path>.bak first, by a second name for the
+    same file, but only while it still parses: a corrupt one never replaces a good .bak."""
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=1)  # ASCII: a lone surrogate in a session's text still writes
+            handle.flush()
+            os.fsync(handle.fileno())
+        if backup:
+            try:
+                read_json_strict(path, None)
+                os.link(path, tmp + ".bak")  # the old file itself, under a second name: no copy
+                os.replace(tmp + ".bak", path + ".bak")
+            except (OSError, ValueError):
+                pass  # no old file, or a corrupt one: the .bak stays as it is
+        os.replace(tmp, path)
+    finally:
+        for left in (tmp, tmp + ".bak"):
+            if os.path.exists(left):  # the write failed half way
+                os.remove(left)
+    try:  # make the rename itself survive a crash
+        handle = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

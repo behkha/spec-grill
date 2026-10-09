@@ -2,7 +2,7 @@
 
 A Claude Code skill that refuses to let you start coding until your idea survives an interrogation.
 
-You bring a vague feature idea. Spec-Grill interviews you — one question at a time, each with a recommended answer — until it can produce a `constitution.md`, `spec.md`, `plan.md`, and `tasks.md` that actually say something. Nothing gets written to disk until you approve it.
+You bring a vague feature idea. Spec-Grill interviews you — one question at a time, each with a recommended answer — until it can produce a `constitution.md`, `spec.md`, `plan.md`, and `tasks.md` that actually say something. No artifact gets written until you approve it. Until then the interview keeps a draft (`constitution.draft.md`, `spec.draft.md`) with every answer you've confirmed, so an interrupted session picks up where it stopped; the draft is deleted on approval and nothing downstream treats it as approved.
 
 It's Spec-Driven Development (SDD) phase structure married to a decision-tree interview method. The name is the promise: you get grilled.
 
@@ -23,6 +23,8 @@ And one escape hatch that matters more than it sounds: **"I don't know" is alway
 ---
 
 ## Install
+
+The interview needs nothing beyond Claude Code. The card-rename hook, the supervisor and the autopilot need **Python 3.9+** (standard library only) on **macOS or Linux**; Windows is not supported (the supervisor uses `fcntl`).
 
 ### With the `skills` CLI (recommended)
 
@@ -64,6 +66,8 @@ git clone https://github.com/behkha/spec-grill.git .claude/skills/spec-grill
 
 Copying `SKILL.md` by hand works too; copy the `hooks/` folder beside it if you want the card-rename hook and the supervisor.
 
+Commands below write `<skill dir>` for the folder that holds `SKILL.md`: `~/.claude/skills/spec-grill` for a personal install, `.claude/skills/spec-grill` (from the project root) for a project one, or wherever `npx skills` wrote it, such as `~/.agents/skills/spec-grill`.
+
 ### Verify
 
 ```
@@ -72,7 +76,7 @@ Copying `SKILL.md` by hand works too; copy the `hooks/` folder beside it if you 
 
 `spec-grill` should be listed. If it isn't:
 
-- Confirm the file landed at `<skills-dir>/spec-grill/SKILL.md` and its YAML frontmatter is intact.
+- Confirm the file landed at `<skill dir>/SKILL.md` and its YAML frontmatter is intact.
 - Restart your session — skills are picked up at startup.
 - If you installed with `npx skills` and nothing appears, check where it wrote. The CLI can install to `~/.agents/skills/`, while Claude Code reads `~/.claude/skills/` — passing `-a claude-code` pins it to the path Claude Code actually reads.
 
@@ -120,11 +124,17 @@ Every phase ends at an explicit approval gate.
 
 ### Phase 0 — Constitution check
 
-Looks for `specs/constitution.md`.
+Runs when an interview starts; the supervisor, the dashboard and the autopilot skip it.
+
+First it resumes what already exists, in this order: an unfinished `constitution.draft.md`; then the feature's folder, if it has one (its `spec.draft.md` resumes the Spec Grill at the next open question, otherwise it continues with the phase after the latest approved artifact). It says in one line what it found and where it picks up. It never overwrites a `tasks.md` whose cards have started; it offers backlog cards or a template upgrade instead.
+
+Then it looks for `specs/constitution.md`.
 
 Missing? The Constitution Grill runs first. A feature spec with no stated principles has nothing to be checked against.
 
 Present? It gets read, and the feature spec is continuously checked against its Constraints and Quality Standards. On a detected conflict the skill **stops and flags it**, then grills on whether to amend the constitution — it won't quietly proceed past a contradiction, and it won't nag about amendment when nothing conflicts.
+
+No git repository? The cards lean on git (worktrees, branches, `[P]`, the merge lock), so it asks once and recommends `git init`. Say no and it records "No git" as a constitution constraint: the cards then run one at a time in the project folder, with no `[P]` and no worktrees.
 
 ### Phase 1 — Constitution Grill
 
@@ -140,7 +150,7 @@ Grilled toward: **User Scenarios**, **Functional Requirements**, **Experience**,
 
 **Experience** is grilled only when the feature has a user interface: every screen, the flow through them for each scenario, each screen's states (empty, loading, error, success), and what it should feel like. It exists because a spec of requirements alone produces a back end that works behind screens nobody designed.
 
-Walked in dependency order — User Scenarios first because everything downstream derives from who and why; Success Criteria after Requirements so they can map back to them; Out of Scope last, once there's enough context to know what you're excluding. Open Questions accumulate as you go rather than being asked about.
+Walked in dependency order — User Scenarios first because everything downstream derives from who and why; Success Criteria after Requirements so they can map back to them; Out of Scope last, once there's enough context to know what you're excluding. Open Questions accumulate as you go rather than being asked about. Requirements and criteria get ids (`FR-1`, `NFR-1`, `SC-1`, …) that the cards cite.
 
 `Out of Scope` is doing real work here. It's the section that stops scope creep three weeks into implementation.
 
@@ -158,18 +168,18 @@ Not grilled. `tasks.md` is written as the **entry point of every implementation 
 
 The file has six fixed sections:
 
-1. **Session protocol** — one card per session, renamed to the card it completes; what to read and in what order; finding code by symbol, not line number; preconditions; staying in scope; the context budget; which steps need the owner's yes; how to finish (verify, commit, hand-off note, tick, stop).
-2. **Templates** — the hand-off note each card leaves behind (with a Checks table: each Done when criterion, its verdict and its evidence, and the approaches that were tried and failed) and the `RESUME.md` state file (status table, decisions waiting on the owner, locks, blockers).
+1. **Session protocol** — one card or one batch per session, renamed to the card or batch it completes; what to read and in what order; finding code by symbol, not line number; preconditions; staying in scope; the context budget; which steps need the owner's yes; how to finish (verify, commit, hand-off note, tick, stop).
+2. **Templates** — the hand-off note each card leaves behind (with a Checks table: each Done when criterion, its verdict and its evidence, and the approaches that were tried and failed) and the `RESUME.md` state file (status table, decisions and approvals waiting on the owner, pins, locks, blockers).
 3. **Traceability** — every requirement to its cards, every success criterion to the card that measures it, every invariant to the test that pins it. Gaps get flagged.
-4. **Cards** — grouped into stages, each stage closed by a checkpoint card that merges, runs the checks and reviews the stage's diff (and, when the stage built screens, reviews their design from fresh screenshots). With an interface, stages follow user scenarios end to end — storage, API and screens together — so the UI is built from the first stage, not left for last. Every card carries *fulfills · after · size · effort · kind* (`backend`, `frontend`, `fullstack`, or `owner` for cards only you can do), a paste-ready **Start with** line, **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** and **Never**. Cards marked `[P]` may run side by side in their own worktree. Interface cards verify by looking: they drive their screens in a browser and save screenshots at phone and desktop width to `state/screens/`.
-5. **Backlog** — cards added during execution (review findings, work split off when a session ran out of room).
+4. **Cards** — grouped into stages, each stage closed by a checkpoint card that merges, runs the checks and reviews the stage's diff (and, when the stage built screens, reviews their design from fresh screenshots). With an interface, stages follow user scenarios end to end — storage, API and screens together — so the UI is built from the first stage, not left for last. Every card carries *fulfills · after · size · effort · kind* (`backend`, `frontend`, `fullstack`, or `owner` for cards only you can do), a paste-ready **Start with** line, **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** and **Never**. Cards marked `[P]` may run side by side in their own worktree. Interface cards verify by looking: they drive their screens in a browser and save screenshots at phone and desktop width to `state/screens/`. Small cards are grouped into **batches** (`B1`, `B2`, …; at most 4 by size, S = 1 and M = 2), listed in a table under their stage: one session runs a batch's cards in order, commits each on its own and runs the full check once at the end. Checkpoints, T001, the results card, your own cards, walk-throughs and cards waiting on your decision or your yes always run alone.
+5. **Backlog** — cards added during execution (checkpoint review findings, work split off when a session ran out of room), batched the same way. A card gets one fix; whatever is left goes to `state/design-review.md` for you to triage in one go, not to a new card.
 6. **Supervisor** — the brief for the one long-lived session that tracks the feature for you (see below).
 
 ### Phase 5 — Handoff
 
 Spec-Grill checks that the project registers its **card-rename hook** (`hooks/card-rename.py`) and, with your yes, adds it to `.claude/settings.local.json`. The hook turns rule 1 of the session protocol into something Claude can't forget: when you paste a card's **Start with** line, it reads the name pattern and the card's title from `tasks.md` and makes renaming the session the first action (for example `004 T003 Backoff schedule`). Other prompts pass through untouched.
 
-Then it stops. Spec-Grill's job ends at approved artifacts; implementation is a separate concern. It tells you how to run the cards — on autopilot (below), or by hand, one per fresh session starting with T001's **Start with** line — and how to start the supervisor, and offers to, but won't start anything unprompted.
+Then it stops. Spec-Grill's job ends at approved artifacts; implementation is a separate concern. It tells you how to run the cards — on autopilot (below), or by hand, one card or batch per fresh session starting with T001's **Start with** line — and how to start the supervisor, and offers to, but won't start anything unprompted.
 
 ---
 
@@ -190,7 +200,7 @@ It never edits code or the state files and never starts a card unless you ask. I
 The bookkeeping is a plain script, `hooks/supervisor.py` (standard library only), which you can also run yourself:
 
 ```bash
-python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retries
+python3 <skill dir>/hooks/supervisor.py specs/004-webhook-retries
 ```
 
 ```
@@ -202,7 +212,7 @@ Running now:
   T002 `webhook_deliveries` migration (feat/x, since 2026-10-06)
 
 Ready to run next:
-  T003 [P] Backoff schedule · S · effort medium
+  T003 [P] Backoff schedule · M · effort medium
     Start with: Webhook retries · T003. Follow /abs/path/…/tasks.md §1, then card T003.
 
 Waiting:
@@ -218,13 +228,13 @@ Needs you:
 To see it all at a glance, serve the dashboard:
 
 ```bash
-python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retries --serve --open
+python3 <skill dir>/hooks/supervisor.py specs/004-webhook-retries --serve --open
 ```
 
-It opens `http://127.0.0.1:8765` (local only, no dependencies) and refreshes every 3 seconds:
+It prints the dashboard's link, `http://127.0.0.1:8765/?k=…`, and `--open` opens that link in your browser (local only, no dependencies; when 8765 is busy it takes the next free port up to 8784, and `--port` sets another start). Open the dashboard from that link: it carries a key for this launch, which your browser then keeps in a cookie so reloads work. The bare `http://127.0.0.1:8765` shows only a locked page that sends you back to the link, and each launch prints a new one. The page refreshes every 3 seconds:
 
 - **Progress** — one bar split by status, with counts, and the back-end / front-end balance.
-- **Run next** — every ready card with its effort tier and a copy button for its **Start with** line (or a Start button, with the autopilot), plus which ones may run side by side. A ready batch of small backlog cards is one row: its id and name, its cards in order, its effort and its own line.
+- **Run next** — every ready card with its effort tier and a copy button for its **Start with** line (or a Start button, with the autopilot), plus which ones may run side by side. A ready batch, a stage's or the backlog's, is one row: its id and name, its cards in order, its effort and its own line.
 - **Needs you** — approvals to give, stages to review, stuck cards, your own cards, open decisions (answer them right there), blockers, stalled cards, a held deploy lock, and a warning when the interface falls behind the back end; open checks wait there in one quiet, collapsed line that jumps to the full list.
 - **Screens** — the screenshots every interface card saved, card by card.
 - **Live sessions** — with the autopilot, each running session shows its elapsed time, time since its last output, its to-do progress, the step it is on and its latest lines, refreshed every 2 seconds; its drawer follows the whole transcript as it grows.
@@ -235,29 +245,31 @@ It opens `http://127.0.0.1:8765` (local only, no dependencies) and refreshes eve
 
 A picker switches between every feature in `specs/`. The supervisor session offers to start it for you; just say "show the dashboard."
 
-Add `--watch` instead for a live view in a terminal that redraws whenever the state changes; leave it open in a terminal tab and it costs nothing. `--wait` blocks until something changes and prints what did (that's what wakes the supervisor session); `--json` is for your own scripts. It also flags stalled cards (doing, but no commit or hand-off for 4 hours), drift (a card ticked in `tasks.md` but not done in `RESUME.md`, done with no hand-off or no Checks table, a commit that changes a pinning test outside the card that writes it until a checkpoint records `Pins reviewed up to <commit>` in RESUME, and so on), and open checks for you to decide (a check a done card recorded as `fail` or `unresolved`, a pass without evidence, a waiver you have not granted). `--lessons` prints what each card and each batch really took (runs, tries, cost, hours beside its size and effort); the close card appends it to `specs/lessons.md`, which the next feature's task drafting reads.
+Features can depend on each other. A card's `after:` may name another feature's card, `after: phase 3's T007`, and it then waits until T007 is done in `specs/003-…` (if that feature can't be found, the card keeps waiting). Name more with `and`, a comma or a range (`phase 3's T007 and T009`, `phase 3's T007, T009`, `phase 3's T007–T009`); a comma list ends at the first id this feature defines itself, so `phase 3's T007, T002` waits for 003's T007 and this feature's T002. And one dispatcher serves the whole `specs/` folder: `--autopilot` dispatches every feature there that has a `state/autopilot.json` (every one that has used the autopilot), each by its own on/paused setting, not only the one you named.
+
+Add `--watch` instead for a live view in a terminal that redraws whenever the state changes; leave it open in a terminal tab and it costs nothing. `--wait` blocks until something changes and prints what did (that's what wakes the supervisor session); `--json` is for your own scripts. It also flags stalled cards (doing, but no sign of work for 4 hours: a commit or move on the card's branch, its hand-off, the time on its RESUME row, its session's output), drift (a card ticked in `tasks.md` but not done in `RESUME.md`, done with no hand-off or no Checks table, a commit that changes a pinning test outside the card that writes it until a checkpoint records `Pins reviewed up to <commit>` in RESUME, and so on), and open checks for you to decide (a check a done card recorded as `fail` or `unresolved`, a pass without evidence, a waiver you have not granted). `--lessons` prints what each card and each batch really took (runs, tries, cost, hours beside its size and effort); the close card appends it to `specs/lessons.md`, which the next feature's task drafting reads.
 
 ### The autopilot
 
 Opening a session per card, pasting its line, picking its effort and watching it — the autopilot does all of that. Start it once, in your own terminal:
 
 ```bash
-python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retries --serve --autopilot --open
+python3 <skill dir>/hooks/supervisor.py specs/004-webhook-retries --serve --autopilot --open
 ```
 
-It needs the `claude` CLI logged in and the project folder trusted (run `claude` there once). Then it:
+It needs the `claude` CLI logged in and the project folder trusted (run `claude` there once). The first run on a feature starts paused: look around the dashboard, try one card with its Start button if you like, and press **Resume** when you want the autopilot to run the cards on its own. The dashboard opens only from the link the command prints, which carries a key for this launch (`--open` uses it), so a card session can't fetch the page and press its buttons. Then it:
 
 - **starts every ready card** in its own headless session (`claude -p`): the card's **Start with** line, its effort tier and model, the session named after the card, a dollar cap, and up to 3 sessions at once (at most one card or batch without `[P]`, since those share the integration worktree). A ready **batch** of small cards gets one session for all of them, in order, from the batch's own line. `[P]` cards and batches run side by side, but never two whose cards' **Touches** overlap (a card without Touches runs alone); each works in its own worktree and branch on its own dev-server port (`$SPEC_GRILL_PORT_OFFSET`), and merges back only while it holds the merge lock (`state/merge.lock`, shown on the dashboard), so two that finish together merge one at a time;
 - **asks you through the dashboard**, never in a chat: a step that needs your yes (a deploy, a paid run) becomes an Approve / Reject button, and the session resumes with your answer; open questions get an answer box with the recommended default filled in;
 - **holds each stage for your review**: after a checkpoint, the next stage waits until you have looked at the findings and the screenshots and pressed "Approve stage";
 - **runs as the right account**: if you have several Claude accounts, §6's `**Runs as:** you@example.com via ~/.local/bin/claude-work` makes sessions start with that launcher and pauses the autopilot when it is logged in as anyone else; with Chrome on, a quick check first confirms the sessions' Chrome reaches the app signed in;
 - **waits out blockers**: a session that records a blocker doesn't count as a failed try; mark the blocker resolved on the dashboard (or clear it in RESUME) and the card carries on by itself;
-- **recovers on its own**: a session that stopped early is resumed once; a card that still isn't done, a silent session or one over its cap lands under "Needs you" with Retry and "I'll take it";
-- **pauses itself** when the login expires or a usage limit hits, and when a total budget you set is spent;
+- **recovers on its own**: a session that stopped early is resumed once; a card that still isn't done, a silent session or one over its cap lands under "Needs you" with Retry and "I'll take it", and goes back to `todo` once its session has ended, so the other cards don't wait for you too. A session that ignores the stop is killed 30 seconds later, and what a session leaves running in its process group (a dev server) is stopped when it ends;
+- **pauses itself** when the login expires or a usage limit hits, and when a total budget you set is spent. A usage limit's pause ends on its own at the reset time the error names (30 minutes when it names none), kept as `resume_after` in `state/autopilot.json`; a login or billing problem waits for your Resume;
 - **notifies you** on the desktop whenever something needs you;
 - **can give sessions Chrome**, so cards that walk through the app or take screenshots can do it unattended. It's off by default; switching it on in Settings hands sessions your real, signed-in Chrome, so they then run one at a time and are told to stay in their own tab and the app under test.
 
-Commands listed on §6's **Never unattended** line (`git push`, deploys) are denied to these sessions outright. Running sessions keep going if you stop the dashboard; restart it and it picks them up. The supervisor session, if you run one, keeps answering questions but leaves starting sessions to the autopilot.
+Commands listed on §6's **Never unattended** line (`git push`, deploys) are denied to these sessions outright, and so is editing `state/autopilot.json` and `state/runs.json` with Claude's file tools (a script could still write them, which is what the next guard is for). Sessions also can't loosen their own guardrails: the autopilot starts every session with the settings it started with (or that you accepted since), and an edit to the files that widens them, by a session or by you, pauses it until you press **Resume** on its dashboard: another `claude` program or §6 launcher, a different `permission_mode` (never `bypassPermissions`), a pattern removed from the Never unattended list, a higher budget or limit, a name added to `keep_env`, Chrome switched on, or stage review switched off or a stage approved in the file. Narrowing edits take effect at once, and changes you make on the dashboard that runs the autopilot need no confirmation (another `--serve` dashboard's changes are edits like any other). Sessions start without `ANTHROPIC_API_KEY` and without the variables a parent Claude Code sets (`CLAUDECODE` and the `CLAUDE_CODE_*` ones, but for the `CLAUDE_CODE_USE_*` provider switches and `CLAUDE_CODE_OAUTH_TOKEN`), so they bill the account `claude auth status` shows; list any you need in `keep_env` in `state/autopilot.json`. Running sessions keep going if you stop the dashboard; restart it and it picks them up. The supervisor session, if you run one, keeps answering questions but leaves starting sessions to the autopilot.
 
 ---
 
@@ -266,13 +278,16 @@ Commands listed on §6's **Never unattended** line (`git push`, deploys) are den
 ```
 specs/
 ├── constitution.md              # project-wide, created once, reused across features
+├── constitution.draft.md        # only while the constitution grill is unfinished
+├── lessons.md                   # project-wide, what past features' cards really took (each close appends)
 └── 001-feature-slug/
+    ├── spec.draft.md            # only while the spec grill is unfinished
     ├── spec.md
     ├── plan.md
     ├── ux.md                    # with an interface: screens, states, tokens
     ├── prototype/index.html     # the clickable prototype you approved
     ├── tasks.md
-    └── state/                   # RESUME.md + handoff/ notes + screens/, written during implementation;
+    └── state/                   # RESUME.md + handoff/ notes + screens/ + design-review.md, written during implementation;
                                  # autopilot.json, runs.json, runs/ when the autopilot runs;
                                  # .supervisor.json, the supervisor's last-seen snapshot
 ```
@@ -288,24 +303,28 @@ The checklist in §4:
 - [x] CP0 The owner's open questions
 - [ ] T002 `webhook_deliveries` migration — fulfills FR-1
 - [ ] T003 [P] Backoff schedule — fulfills FR-2, FR-3
+- [ ] T004 Worker wiring — fulfills FR-4
 - [ ] CPA Storage and schedule merged and pinned
+
+**Who may run beside whom:** Stage 2: T002 ∥ T003
 ```
 
 And one card:
 
 ```markdown
 #### T003 [P] — Backoff schedule
-fulfills FR-2, FR-3 · after: CP0 (beside T002) · S · effort medium · kind backend
+fulfills FR-2, FR-3 · after: CP0 (beside T002) · M · effort medium · kind backend
 
 **Start with:** `Webhook retries · T003. Follow /abs/path/specs/004-webhook-retries/tasks.md §1, then card T003.`
 **Read:** spec FR-2, FR-3; plan "Architecture" (the scheduler paragraph). Code by symbol: `DeliveryWorker.run` (`worker/delivery.py`).
 **Do:** `next_attempt_at(attempt)` with exponential backoff and jitter, capped at the spec's limit.
 **Done when:** the cap and the jitter bounds have tests that fail before and pass after.
 **Verify:** `pytest tests/test_backoff.py`.
+**Hand-off extras:** the cap and the jitter range T004 must respect.
 **Touches:** `worker/backoff.py`, `tests/test_backoff.py`. **Never:** change `DeliveryWorker`.
 ```
 
-Full templates for all four artifacts live at the bottom of `SKILL.md`.
+Full templates for all four artifacts, and for `ux.md`, live at the bottom of `SKILL.md`.
 
 ---
 

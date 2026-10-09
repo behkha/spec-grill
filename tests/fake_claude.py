@@ -5,7 +5,14 @@ FAKE_SCRIPT (a JSON file) maps a card to the behaviour of each of its sessions, 
 "done" finishes the card the way §1's Finish item says (RESUME row done, ticked, hand-off written),
 "doing" marks it doing and stops, "work" acts out a realistic session (to-dos, tools, pauses) and finishes, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
 records a blocker, "apierror" fails the way an expired login does, "budget" hits the dollar
-cap, "sleep" stays alive until killed (a batch too). Every call is appended to FAKE_CALLS as one JSON
+cap, "sleep" stays alive until killed (a batch too), "stubborn" ignores SIGTERM and stays alive until
+SIGKILL, "linger" gives a result that is no error and then lingers the same way, "garbage" writes log
+lines that are not stream-json objects (and a TodoWrite after a TaskCreate) before it finishes;
+"noconversation" and "noauth" fail before the stream starts (stderr only), "claimapproval"/"claimdecision"
+say they wait without writing the RESUME row, "loginfail" fails in its own work, "split"/"splitopen"/
+"splitbare" end with AUTOPILOT: SPLIT; "orphan" (and "orphan-stubborn", whose child ignores SIGTERM) finishes the
+card but leaves a child running in its process group, its pid appended to FAKE_CHILDREN. Every call is
+appended to FAKE_CALLS as one JSON
 line: the unit, the arguments, the working folder and $SPEC_GRILL_PORT_OFFSET.
 
 A batch session (SPEC_GRILL_CARD is a batch id such as B1) reads its cards from the batch table:
@@ -16,15 +23,23 @@ only the first open card and marks the next one doing (a batch interrupted half 
 import json
 import os
 import re
+import signal
 import sys
 import time
 
 args = sys.argv[1:]
+if os.environ.get("FAKE_ENV"):  # which variables each call got (names only), for the tests of session_env
+    with open(os.environ["FAKE_ENV"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"card": os.environ.get("SPEC_GRILL_CARD"), "args": args[:2],
+                                 "env": sorted(os.environ)}) + "\n")
 if args[:2] == ["auth", "status"]:  # who the CLI is logged in as
     print(json.dumps({"loggedIn": True, "email": os.environ.get("FAKE_EMAIL", "owner@example.com")}))
     sys.exit(0)
 if os.environ.get("SPEC_GRILL_PROBE"):  # the autopilot's Chrome check
-    ok = os.environ.get("FAKE_CHROME", "ok") == "ok"
+    if os.environ.get("FAKE_CHROME") == "list":  # JSON on stdout, but not an object
+        print("[]")
+        sys.exit(0)
+    ok =os.environ.get("FAKE_CHROME", "ok") == "ok"
     print(json.dumps({"type": "result", "result": json.dumps({"ok": ok, "final_url": "http://localhost:3000/login" if not ok else "http://localhost:3000/", "detail": "signed in" if ok else "the app shows its login page"})}))
     sys.exit(0)
 card = os.environ["SPEC_GRILL_CARD"]
@@ -44,6 +59,30 @@ counts[card] = n + 1
 json.dump(counts, open(counter, "w"))
 steps = script.get(card, ["done"])
 behaviour = steps[min(n, len(steps) - 1)]
+if behaviour in ("stubborn", "linger"):  # only SIGKILL stops it
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def save(path: str, text: str) -> None:
+    """Write tasks.md or RESUME.md whole (a file beside it, then a rename), so the dispatcher and the
+    tests never read one half written."""
+    tmp = f"{path}.{os.getpid()}.fake"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+if os.environ.get("FAKE_TAMPER"):  # a session that rewrites its own guardrails first, then acts as scripted
+    tamper = json.loads(os.environ["FAKE_TAMPER"])  # {"settings": {key: value}, "tasks": [old, new]}
+    if tamper.get("settings"):
+        path = os.path.join(os.path.dirname(tasks), "state", "autopilot.json")
+        with open(path, encoding="utf-8") as handle:
+            found = json.load(handle)
+        save(path, json.dumps({**found, **tamper["settings"]}))
+    if tamper.get("tasks"):
+        with open(tasks, encoding="utf-8") as handle:
+            text = handle.read()
+        save(tasks, text.replace(*tamper["tasks"]))
 
 
 def emit(event: dict) -> None:
@@ -53,16 +92,14 @@ def emit(event: dict) -> None:
 def set_status(status: str, cid: str = card) -> None:
     text = open(resume).read()
     text = re.sub(rf"^\| {cid} \|([^|]*)\| [a-z]+ \|", rf"| {cid} |\1| {status} |", text, flags=re.M)
-    with open(resume, "w") as handle:
-        handle.write(text)
+    save(resume, text)
 
 
 def finish(cid: str) -> None:
     """Finish a card the way §1's Finish item says: RESUME row done, ticked, hand-off written, committed."""
     set_status("done", cid)
     text = open(tasks).read()
-    with open(tasks, "w") as handle:
-        handle.write(re.sub(rf"^- \[ \] {cid}\b", f"- [x] {cid}", text, flags=re.M))
+    save(tasks, re.sub(rf"^- \[ \] {cid}\b", f"- [x] {cid}", text, flags=re.M))
     os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
     with open(os.path.join(os.path.dirname(resume), "handoff", f"{cid}.md"), "w") as handle:
         handle.write(f"# {cid}\n")
@@ -83,11 +120,25 @@ def batch_cards() -> list:
     return [c for c in cards if not re.search(rf"^\| {c} \|[^|]*\| (?:done|waived) \|", rows, re.M)]
 
 
+if behaviour == "noconversation":  # `--resume` of a session the CLI cannot find: stderr, no stream at all
+    print(f"No conversation found with session ID: {session}", file=sys.stderr)
+    sys.exit(1)
+if behaviour == "noauth":  # the CLI refuses to start: its own words, outside the stream
+    print("Invalid API key · Please run /login", file=sys.stderr)
+    sys.exit(1)
+
 emit({"type": "system", "subtype": "init"})
 if behaviour == "apierror":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Failed"}]}, "is_api_error_message": True})
     emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
           "result": "Failed to authenticate: OAuth session expired", "total_cost_usd": 0})
+    sys.exit(1)
+if behaviour.startswith("limit"):  # a usage limit: "limit=<s>" names a reset <s> seconds ahead, "limit" no time
+    reset = behaviour.partition("=")[2]
+    text = f"Claude AI usage limit reached|{int(time.time() + float(reset))}" if reset else "You've hit your usage limit"
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}, "is_api_error_message": True})
+    emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+          "result": text, "total_cost_usd": 0})
     sys.exit(1)
 
 if behaviour == "work":  # a realistic session: a to-do list, tool calls with results, usage, pauses
@@ -111,6 +162,28 @@ if behaviour == "work":  # a realistic session: a to-do list, tool calls with re
         emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": f"ok: {tool} finished ({i + 1}/{len(steps)})"}]}})
     behaviour = "done"
 
+if behaviour == "garbage":  # stderr is merged into the log; a TodoWrite replaces the list TaskCreate grew
+    print("[1, 2, 3]", flush=True)
+    print('"a bare string"', flush=True)
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "tc1", "name": "TaskCreate", "input": {"subject": "Write the test"}},
+        {"type": "tool_use", "id": "tw1", "name": "TodoWrite", "input": {"todos": []}}]}})
+    emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tc1", "content": "Task #1 created"}]}})
+    time.sleep(float(os.environ.get("FAKE_STEP", "1.5")))
+    behaviour = "done"
+
+if behaviour.startswith("orphan"):  # leaves a child running in its process group (a dev server it started in
+    # the background), then finishes the card and exits; "orphan-stubborn": a child that ignores SIGTERM
+    child = os.fork()
+    if child == 0:
+        if behaviour == "orphan-stubborn":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(600)
+        os._exit(0)
+    with open(os.environ["FAKE_CHILDREN"], "a", encoding="utf-8") as handle:
+        handle.write(f"{child}\n")
+    behaviour = "done"
+
 emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})
 if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):  # a batch
     todo = batch_cards()
@@ -118,8 +191,7 @@ if re.fullmatch(r"B\d+", card) and behaviour in ("done", "doing"):  # a batch
         finish(cid)
     if behaviour == "done":
         text = open(tasks).read()
-        with open(tasks, "w") as handle:
-            handle.write(re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
+        save(tasks, re.sub(rf"^- \[ \] {card}\b", f"- [x] {card}", text, flags=re.M))
     elif todo[1:]:
         set_status("doing", todo[1])
 elif behaviour == "sleep":
@@ -130,7 +202,7 @@ elif behaviour == "done":
     finish(card)
     if "answered approval" in args[-1] and "approved" in args[-1]:
         text = open(resume).read()
-        open(resume, "w").write(re.sub(r"\| approved \|", "| done |", text))
+        save(resume, re.sub(r"\| approved \|", "| done |", text))
 elif behaviour == "doing":
     set_status("doing")
 elif behaviour.startswith("approval"):  # "approval", "approval=<step>", "approval#A1=<step>"
@@ -142,23 +214,66 @@ elif behaviour.startswith("approval"):  # "approval", "approval=<step>", "approv
     step = (found.group(2) or "deploy to staging").replace("|", "\\|")
     row = f"| {number} | {card} | {step} | the card's verify step | pending | |\n"
     text = re.sub(r"(## Approvals\n(?:.*\n)*?\| --- .*\n)", lambda m: m.group(1) + row, text)
-    open(resume, "w").write(text)
+    save(resume, text)
 elif behaviour == "decision":
     set_status("doing")
     text = open(resume).read()
     text = text.replace("| 1 | Which payment provider? | Stripe | T006 | | |",
                         f"| 1 | Which payment provider? | Stripe | T006 | | |\n| 2 | Which layout? | B | {card} | | |")
-    open(resume, "w").write(text)
+    save(resume, text)
     emit({"type": "result", "subtype": "success", "is_error": False,
           "result": "AUTOPILOT: WAITING FOR DECISION 2", "total_cost_usd": 0.1})
     sys.exit(0)
 elif behaviour == "blocked":
     set_status("blocked")
     text = open(resume).read()
-    open(resume, "w").write(text.replace("## Blockers\n", f"## Blockers\n- {card}: needs a key\n"))
+    save(resume, text.replace("## Blockers\n", f"## Blockers\n- {card}: needs a key\n"))
+if behaviour in ("claimapproval", "claimdecision"):  # says it waits for the owner, but writes no RESUME row
+    set_status("doing")
+    emit({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.1,
+          "result": "AUTOPILOT: WAITING FOR " + ("APPROVAL A1" if behaviour == "claimapproval" else "DECISION 7")})
+    sys.exit(0)
+if behaviour == "waitapproval":  # §1's way: a `<card>.1` row in Approvals, then the end line naming it
+    set_status("doing")
+    text = open(resume).read()
+    row = f"| {card}.1 | {card} | deploy to staging | the card's verify step | pending | |\n"
+    save(resume, re.sub(r"(## Approvals\n(?:.*\n)*?\| --- .*\n)", lambda m: m.group(1) + row, text))
+    emit({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.1,
+          "result": f"AUTOPILOT: WAITING FOR APPROVAL {card}.1"})
+    sys.exit(0)
+if behaviour == "loginfail":  # a session that fails in its own work, its prose naming a login page and a budget
+    set_status("doing")
+    emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "total_cost_usd": 0.3,
+          "result": "The login page test still fails (rate limit stub); Context budget is fine."})
+    sys.exit(1)
+if behaviour.startswith("split"):  # "split": §1's way (ticked, hand-off, remainder card); "splitopen": the card
+    # left `doing` with its hand-off written; "splitbare": left `doing`, no hand-off
+    target = batch_cards()[0] if re.fullmatch(r"B\d+", card) else card
+    if behaviour == "split":
+        finish(target)
+    else:
+        set_status("doing", target)
+    if behaviour != "splitbare":
+        os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
+        with open(os.path.join(os.path.dirname(resume), "handoff", f"{target}.md"), "w") as handle:
+            handle.write(f"# {target}\nLeft: the rest, in {target}R.\n")
+    text = open(tasks).read()
+    remainder = (f"- [ ] {target}R Remainder of {target}\n  added by {target} · after: {target} · S · effort medium"
+                 f" · kind backend\n  **Start with:** `Demo · {target}R. Follow {tasks} §1, then card {target}R.`\n\n")
+    save(tasks, text.replace("## 6. Supervisor", ("" if "## 5. Backlog" in text else "## 5. Backlog\n\n")
+                             + remainder + "## 6. Supervisor", 1))
+    save(resume, open(resume).read() + f"| {target}R | x | todo | - | - | - |\n")
+    emit({"type": "result", "subtype": "success", "is_error": False, "result": "AUTOPILOT: SPLIT",
+          "total_cost_usd": 0.4})
+    sys.exit(0)
 if behaviour == "hang":  # gives its final result, then never exits
     emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
           "result": "You've hit your session limit · resets 3:10pm", "total_cost_usd": 1.5})
+    time.sleep(600)
+if behaviour == "stubborn":
+    time.sleep(600)
+if behaviour == "linger":  # a final result that is no error, then never exits
+    emit({"type": "result", "subtype": "success", "is_error": False, "result": "AUTOPILOT: DONE", "total_cost_usd": 0.2})
     time.sleep(600)
 if behaviour == "budget":
     emit({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
