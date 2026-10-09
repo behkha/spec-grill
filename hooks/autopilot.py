@@ -825,6 +825,8 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
     logs = os.path.join(state_dir(tasks), "runs")
     os.makedirs(logs, exist_ok=True)
     log = os.path.join(logs, f"{cid}-{attempt}.jsonl")
+    if os.path.exists(log):  # a run the registry lost (read back from runs.json.bak): never write over its log
+        log = os.path.join(logs, f"{cid}-{attempt}-{uuid.uuid4().hex[:8]}.jsonl")
     run = {"card": (b["current"] or b["cards"][0]) if b else cid, "session": session, "attempt": attempt,
            "reason": reason, "approval": approval,
            "pid": None, "started": stamp(), "started_ts": time.time(), "ended": "", "exit": None, "cost": 0, "result": "", "error": "",
@@ -856,8 +858,8 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
                 change_settings(tasks, auto=False, paused_reason=run["error"])
     reg["runs"].append(run)
     reg["attention"].pop(cid, None)
-    if stuck:
-        reg["attention"][cid] = stuck
+    if stuck:  # its prompt can't start: the owner's (and a card its last session left `doing` is freed)
+        give_up(s, reg, cid, stuck)
     if approval and not run["error"]:
         reg["handled"].append(approval)
     return run
@@ -899,14 +901,19 @@ def reap(tasks: str, reg: dict) -> list:
         if run["ended"]:
             continue
         proc = PROCS.get(run["session"])
-        if proc and proc.pid == run["pid"]:
+        ours = bool(proc) and proc.pid == run["pid"]
+        if ours:
             code = proc.poll()
         else:
             code = None if sv.run_alive(run) else -1
         if code is None:
             continue
         PROCS.pop(run["session"], None)
-        if signal_leftovers(run, signal.SIGTERM):  # what it left running in its group; SIGKILL follows (step)
+        # what it left running in its group (SIGKILL follows, step()): for a session this process started,
+        # or one whose log moved lately; after a dispatcher was down for long, the group id may be another's
+        last = sv.mtime(os.path.join(state_dir(tasks), run["log"])) if run["log"] else None
+        recent = ours or (last is not None and time.time() - last < GROUP_STALE)
+        if recent and signal_leftovers(run, signal.SIGTERM):
             run["leftovers_ts"] = time.time()
         found = result_of(os.path.join(state_dir(tasks), run["log"]))
         result = found["result"] or {}
@@ -1029,14 +1036,8 @@ def signal_leftovers(run: dict, sig: int) -> bool:
         pgid = int(run.get("pgid") or run.get("pid") or 0)
     except (TypeError, ValueError, OverflowError):
         return False
-    if not 1 < pgid < 2 ** 31 or pgid == os.getpgrp():
-        return False
-    try:
-        os.kill(pgid, 0)
-        return False  # a process has the leader's id: not the session (it ended), so not its group
-    except ProcessLookupError:
-        pass  # the leader is gone, as it should be
-    except OSError:  # EPERM: a process of another account holds that id
+    # (pid_alive: alive, or EPERM, a process of another account: either way the id is not the session's)
+    if not 1 < pgid < 2 ** 31 or pgid == os.getpgrp() or sv.pid_alive(pgid):
         return False
     try:
         os.killpg(pgid, sig)
@@ -1326,7 +1327,8 @@ def step(tasks: str) -> list:
         settling = [r for r in reg["runs"] if r.get("unsettled")]
         # a session the dispatcher stopped (silent, overlong) frees its cards' `doing` rows only now that it
         # has ended, so it can't write RESUME after its card was freed; once (the flag goes with it)
-        if stopped := [run_unit(r) for r in settling if r.pop("free_on_end", False)]:
+        stopped = [run_unit(r) for r in settling if r.pop("free_on_end", False)]
+        if stopped := [u for u in dict.fromkeys(stopped) if not any(run_unit(r) == u for r in live(reg))]:
             free_worktree(s, stopped)
             s = read_whole(tasks, events)
             if s is None:
@@ -1485,9 +1487,13 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         answered = [a for a in s["approvals_answered"] if a["card"] in mem and approval_key(a) not in reg["handled"]]
         if worked and answered:  # the owner answered: resume that conversation with the answer
             a = answered[0]
-            lost = [r for r in unit_runs(reg, s, cid) if r.get("approval") == approval_key(a) and sv.is_try(r)]
-            if len(lost) >= cfg["max_attempts"]:  # the answer never reached a working session (no such
-                # conversation, a crash at start): sent again only that often, then the owner decides
+            # the answer never reached a working session (no such conversation, a crash at start): sent again
+            # only max_attempts times since the owner last started the unit (Retry), and once more for each
+            # Retry that waited for a slot (granted); then the owner decides
+            mine = unit_runs(reg, s, cid)
+            since = max((i for i, r in enumerate(mine) if str(r.get("reason") or "").endswith("(owner)")), default=-1)
+            lost = [r for r in mine[since + 1:] if r.get("approval") == approval_key(a) and sv.is_try(r)]
+            if len(lost) >= cfg["max_attempts"] + int(reg["granted"].get(cid, 0)):
                 give_up(s, reg, cid, f"{len(lost)} sessions could not take your answer to {a['n']}; the last"
                                      f" ended with: {ending(lost[-1])[:200]}")
                 continue
@@ -1812,13 +1818,10 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(f"{cid} has no live session")
             for run in mine_live:
                 kill(run)
+                run["free_on_end"] = True  # freed again once it has ended: until then it may still write RESUME
             reg["attention"][cid] = "you stopped its session"
             save_registry(tasks, reg)
-            for c in mem:
-                if s["status"][c] == "doing" and c in s["rows"]:
-                    # a stopped card no longer holds the integration worktree: the other cards may go on
-                    with contextlib.suppress(Refused):
-                        set_row(s, "status", {"card": c}, {"status": "todo"})
+            free_worktree(s, [cid])  # at once: a stopped card no longer holds the integration worktree
             return f"{cid} stopped"
         if action == "takeover":  # the owner runs the card (or batch) by hand; the autopilot leaves it alone
             if mine_live:

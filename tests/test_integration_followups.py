@@ -524,6 +524,97 @@ class ReviewFixes(Scratch):
                       " then press Resume", events)
 
 
+class ReviewFixesLogsAndGroups(Scratch):
+    """The code review: a lost run's log is never overwritten; a group is signalled only when its id is fresh."""
+
+    def test_a_new_session_never_writes_over_the_log_of_a_run_the_registry_lost(self):
+        logs = os.path.join(autopilot.state_dir(self.tasks), "runs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "T001-1.jsonl"), "w") as handle:
+            handle.write('{"type": "system", "subtype": "init", "session_id": "lost"}\n')
+        self.script_for({"T001": ["sleep"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        run = self.runs()[0]
+        self.assertNotEqual(run["log"], "runs/T001-1.jsonl")
+        self.assertTrue(run["log"].startswith("runs/T001-1-") and run["log"].endswith(".jsonl"), run["log"])
+        with open(os.path.join(logs, "T001-1.jsonl")) as handle:
+            self.assertIn('"lost"', handle.read(), "the lost session's log is kept")
+
+    def test_a_run_from_another_dispatcher_with_an_old_log_is_not_signalled(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        logs = os.path.join(autopilot.state_dir(self.tasks), "runs")
+        os.makedirs(logs)
+        log = os.path.join(logs, "T001-1.jsonl")
+        open(log, "w").close()
+        for age, signalled in ((autopilot.GROUP_STALE + 60, False), (5, True)):
+            with self.subTest(age=age):
+                os.utime(log, (time.time() - age, time.time() - age))
+                reg = autopilot.registry(self.tasks)
+                reg["runs"] = [{"card": "T001", "session": "old", "pid": gone.pid, "log": "runs/T001-1.jsonl",
+                                "started": "2026-01-01 00:00Z", "ended": ""}]
+                sv.registry_of(reg)  # as registry() reads it
+                with mock.patch.object(autopilot, "signal_leftovers", return_value=False) as signal_it:
+                    autopilot.reap(self.tasks, reg)
+                self.assertEqual(signal_it.called, signalled)
+
+
+class ReviewFixesGiveUps(Scratch):
+    """The code review: the owner's Retry renews an answer's tries; every give-up and Stop frees the card
+    once its session has ended."""
+
+    def test_after_a_retry_the_answer_is_delivered_again_not_given_up_on_at_once(self):
+        self.script_for({"T001": ["approval", "noconversation", "noconversation", "doing", "done"]})
+        self.settle()
+        autopilot.act(self.tasks, "approval", {"n": "A1", "card": "T001", "verdict": "approved"})
+        self.settle()
+        self.assertIn("could not take your answer to A1", autopilot.registry(self.tasks)["attention"]["T001"])
+        self.assertEqual(autopilot.act(self.tasks, "retry", {"card": "T001"}), "T001 started")
+        self.settle()
+        runs = [r for r in self.runs() if r["card"] == "T001"]
+        self.assertEqual([r["reason"] for r in runs],
+                         ["start", "answer A1", "answer A1", "continue (owner)", "answer A1"])
+        self.assertEqual(runs[-1]["approval"], "T001 A1")
+        self.assertEqual(self.status("T001"), "done", "the answer reached the session the Retry woke")
+        self.assertNotIn("T001", autopilot.registry(self.tasks)["attention"])
+
+    def test_a_unit_whose_session_cannot_start_gives_the_worktree_back(self):
+        self.serial_t002()
+        autopilot.change_settings(self.tasks, max_attempts=5)
+        self.script_for({"T002": ["doing"], "T003": ["done"], "T004": ["done"]})
+        real, starts = subprocess.Popen, []
+
+        def popen(cmd, *args, **kwargs):
+            if (kwargs.get("env") or {}).get("SPEC_GRILL_CARD") == "T002":
+                starts.append(1)
+                if len(starts) == 2:  # its resume: a prompt the OS refuses
+                    raise OSError(7, "Argument list too long")
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(autopilot.subprocess, "Popen", side_effect=popen):
+            self.steps_until(lambda: "T004" in self.launched_cards())
+        self.assertIn("Argument list too long", autopilot.registry(self.tasks)["attention"]["T002"])
+        self.assertEqual(self.status("T002"), "todo")
+        self.settle()
+
+    def test_a_stopped_session_that_writes_doing_again_is_freed_once_it_ends(self):
+        self.script_for({"T001": ["stubborn"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        self.set_row_status("T001", "doing")
+        self.assertEqual(autopilot.act(self.tasks, "stop", {"card": "T001"}), "T001 stopped")
+        self.assertEqual(self.status("T001"), "todo", "freed at once, as before")
+        self.set_row_status("T001", "doing")  # the session, which ignores SIGTERM, writes its row again
+        with mock.patch.object(autopilot, "KILL_GRACE", 0.5):
+            self.steps_until(lambda: self.runs()[0]["ended"])
+        self.assertEqual(self.status("T001"), "todo", "and freed again once it has ended")
+        self.assertEqual(autopilot.registry(self.tasks)["attention"]["T001"], "you stopped its session")
+
+    def set_row_status(self, cid: str, status: str) -> None:
+        autopilot.set_row(self.state(), "status", {"card": cid}, {"status": status})
+
+
 def doc(name: str) -> str:
     with open(os.path.join(HERE, "..", name), encoding="utf-8") as handle:
         return re.sub(r"\s+", " ", handle.read())
