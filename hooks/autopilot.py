@@ -31,10 +31,19 @@ processes. It writes state/autopilot.json (settings), state/runs.json (one entry
 started) and state/runs/*.jsonl (each session's stream-json output); the owner's answers go into
 RESUME's Approvals and Decisions tables, and an owner's card the owner marks done is ticked in
 tasks.md. Standard library only; macOS and Linux.
+
+Sessions start with the dispatcher's environment minus ANTHROPIC_API_KEY (it would bill past the account
+`claude auth status` reports) and what tells a session it runs inside the Claude Code that started the
+dispatcher (CLAUDECODE, CLAUDE_CODE_* but the CLAUDE_CODE_USE_* provider switches and
+CLAUDE_CODE_OAUTH_TOKEN, …); autopilot.json's "keep_env" (a list of names) passes chosen ones on anyway.
+The account and Chrome checks run in that same environment.
 """
+
+from __future__ import annotations  # `dict | None` annotations on Python 3.9
 
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import json
 import os
@@ -59,6 +68,10 @@ API_ERROR = re.compile(r"authenticat|oauth|log ?in|rate.?limit|usage limit|sessi
                        r"overloaded|credit balance|quota", re.I)
 ACCOUNT_AGE = 300  # seconds an account check stays good for display; spawning re-checks after 60
 BUDGET = re.compile(r"budget", re.I)
+# not passed on to sessions (see session_env): an API key that bills past the CLI's login, and what a parent
+# Claude Code sets for its own children (the provider switches CLAUDE_CODE_USE_* and a setup-token pass)
+UNINHERITED = re.compile(r"ANTHROPIC_API_KEY|CLAUDECODE|CLAUDE_CODE_(?!USE_|OAUTH_TOKEN$)\w*|CLAUDE_AGENT_SDK_\w*"
+                         r"|CLAUDE_PID|CLAUDE_EFFORT")
 
 RULES = """You are running unattended: the Spec-Grill autopilot started this session for {what} of
 {tasks}. Nobody reads this conversation while it runs, so never wait for a reply; the files are your
@@ -500,13 +513,27 @@ def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: boo
         cmd.append("--chrome")
         rules += CHROME_RULES
     cmd += ["--append-system-prompt", rules]
-    return cmd + [prompt]
+    return cmd + ["--", prompt]  # a Start with line that begins with "-" is the prompt, not an option
+
+
+def session_env(cfg: dict, **extra: str) -> dict:
+    """The environment a session (or a check of its CLI) starts with: the dispatcher's, without
+    UNINHERITED's variables unless the settings' "keep_env" list names them, plus extra."""
+    keep = cfg.get("keep_env")
+    keep = {str(k) for k in keep} if isinstance(keep, list) else set()
+    env = {k: v for k, v in os.environ.items() if k in keep or not UNINHERITED.fullmatch(k)}
+    return {**env, **extra}
 
 
 def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, session: str = "",
           approval: str = "", deny: list | None = None) -> dict:
     """Start (no session) or resume (session) the session of a unit (a card, or a batch); record it in
-    the registry. A batch's run names the batch's first open card as its card."""
+    the registry (the caller saves it at once). A batch's run names the batch's first open card as its
+    card. A session that could not start is not a try: a launcher that cannot start pauses the autopilot
+    (every unit would fail the same way); a prompt the OS refuses hands the unit to the owner."""
+    b = batch(s, cid)
+    if b and not b["cards"]:
+        raise Refused(f"batch {cid} names no card")
     cfg = settings(tasks)
     resume = bool(session)
     session = session or str(uuid.uuid4())
@@ -514,7 +541,6 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
     logs = os.path.join(state_dir(tasks), "runs")
     os.makedirs(logs, exist_ok=True)
     log = os.path.join(logs, f"{cid}-{attempt}.jsonl")
-    b = batch(s, cid)
     run = {"card": (b["current"] or b["cards"][0]) if b else cid, "session": session, "attempt": attempt,
            "reason": reason, "approval": approval,
            "pid": None, "started": stamp(), "started_ts": time.time(), "ended": "", "exit": None, "cost": 0, "result": "", "error": "",
@@ -523,9 +549,9 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
         run["batch"] = cid
     run["slot"] = port_slot(s, reg, cid)
     beside = running_units(s, reg, cid)
-    env = {**os.environ, "SPEC_GRILL_AUTOPILOT": "1", "SPEC_GRILL_CARD": cid,
-           "SPEC_GRILL_PORT_OFFSET": str(run["slot"])}
+    env = session_env(cfg, SPEC_GRILL_AUTOPILOT="1", SPEC_GRILL_CARD=cid, SPEC_GRILL_PORT_OFFSET=str(run["slot"]))
     deny = s["autopilot"]["deny"] if deny is None else deny
+    stuck = ""
     try:
         with open(log, "w", encoding="utf-8") as out:
             proc = subprocess.Popen(command(cfg, s, cid, session, prompt, resume, deny, run["slot"], beside),
@@ -534,10 +560,19 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
                                     env=env, start_new_session=True)
         run["pid"] = proc.pid
         PROCS[session] = proc
-    except OSError as error:
-        run.update(ended=stamp(), error=f"could not start {launcher(cfg, s)}: {error}")
+    except (OSError, ValueError) as error:  # never reached the API: not a try (api_error, see sv.is_try)
+        if isinstance(error, ValueError) or error.errno == errno.E2BIG:  # this unit's own prompt or arguments
+            run.update(ended=stamp(), error=f"could not start the session of {cid}: {error}", api_error=True)
+            stuck = (f"its session could not start ({error}): its prompt or arguments hold something the OS "
+                     "refuses (a NUL byte, far too much text); fix the line it came from, then Retry")
+        else:  # the launcher is missing or broken, or the state folder is unwritable: every unit would fail
+            run.update(ended=stamp(), error=f"could not start {launcher(cfg, s)}: {error}", api_error=True)
+            if cfg["auto"]:
+                change_settings(tasks, auto=False, paused_reason=run["error"])
     reg["runs"].append(run)
     reg["attention"].pop(cid, None)
+    if stuck:
+        reg["attention"][cid] = stuck
     if approval and not run["error"]:
         reg["handled"].append(approval)
     return run
@@ -666,14 +701,18 @@ def launcher(cfg: dict, s: dict) -> str:
     return os.path.expanduser(chosen)
 
 
-def check_account(reg: dict, cli: str, max_age: float) -> dict:
-    """`<cli> auth status`: which account the sessions would bill, cached in the registry."""
+def check_account(reg: dict, cli: str, max_age: float, cfg: dict | None = None) -> dict:
+    """`<cli> auth status`: which account the sessions would bill (asked in their environment), cached in
+    the registry."""
     known = reg.get("account") or {}
-    if known.get("launcher") == cli and time.time() - known.get("ts", 0) < max_age:
+    keep = (cfg or {}).get("keep_env")
+    keep = sorted(str(k) for k in keep) if isinstance(keep, list) else []
+    if known.get("launcher") == cli and known.get("keep_env", []) == keep and time.time() - known.get("ts", 0) < max_age:
         return known
-    info = {"launcher": cli, "ts": time.time(), "email": "", "logged_in": False, "error": ""}
+    info = {"launcher": cli, "keep_env": keep, "ts": time.time(), "email": "", "logged_in": False, "error": ""}
     try:
-        out = subprocess.run([cli, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
+        out = subprocess.run([cli, "auth", "status", "--json"], capture_output=True, text=True, timeout=30,
+                             env=session_env(cfg or {}))
         data = json.loads(out.stdout or "{}")
         info.update(email=str(data.get("email") or ""), logged_in=bool(data.get("loggedIn")))
         if not info["logged_in"]:
@@ -686,7 +725,7 @@ def check_account(reg: dict, cli: str, max_age: float) -> dict:
 
 def account_problem(s: dict, reg: dict, cfg: dict, max_age: float) -> str:
     """Why sessions must not start under the current account ("" when they may)."""
-    info = check_account(reg, launcher(cfg, s), max_age)
+    info = check_account(reg, launcher(cfg, s), max_age, cfg)
     expected = s["autopilot"]["runs_as"]["email"]
     if not expected:
         return ""
@@ -715,7 +754,7 @@ def probe_chrome(tasks: str, s: dict, cfg: dict, account: str = "") -> None:
     result = {"ok": False, "detail": "", "ts": time.time(), "running": False, "url": url, "account": account}
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=240, cwd=repo_root(tasks),
-                             env={**os.environ, "SPEC_GRILL_PROBE": "1"})
+                             env=session_env(cfg, SPEC_GRILL_PROBE="1"))
         text = str(json.loads(out.stdout or "{}").get("result") or "")
         found = re.search(r"\{.*\}", text, re.S)
         answer = json.loads(found.group(0)) if found else {}
@@ -815,11 +854,12 @@ def step(tasks: str) -> list:
                 cfg = change_settings(tasks, auto=False, paused_reason=problem)
                 events.append(f"autopilot paused: {problem}")
         else:
-            check_account(reg, launcher(cfg, s), ACCOUNT_AGE)  # for the dashboard's "runs as"
+            check_account(reg, launcher(cfg, s), ACCOUNT_AGE, cfg)  # for the dashboard's "runs as"
         if cfg["auto"]:
             events += dispatch(tasks, s, reg, cfg)
             save_registry(tasks, reg)
             s = sv.build(tasks, 4)
+            cfg = settings(tasks)  # dispatch may have paused (the budget, a launcher that cannot start)
         events += alert(tasks, s, reg, cfg)
         save_registry(tasks, reg)
     return events
@@ -972,8 +1012,12 @@ def dispatch(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
             reg["queued"].remove(cid)
         if not run["error"]:
             reg["blocked_on"].pop(cid, None)
+        save_registry(tasks, reg)  # at once: a crash later in this pass must not lose a live session
         tier = unit_info(s, cid)["effort"] or "default"
         events.append(f"{cid}: {reason} · effort {tier}" + (f" · failed: {run['error']}" if run["error"] else ""))
+        if run["error"] and not settings(tasks)["auto"]:  # the launcher could not start: spawn paused
+            events.append(f"autopilot paused: {run['error']}")
+            break
     return events
 
 
@@ -1062,6 +1106,8 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(f"{cid} already has a live session")
             if unit_finished(s, cid):
                 raise Refused(f"{cid} is {'done' if b else s['status'][cid]}")
+            if not mem:
+                raise Refused(f"batch {cid} names no card")
             if any(s["cards"][c]["kind"] == "owner" for c in (b["open"] if b else mem)):
                 raise Refused(f"{cid} is your card: do it, then mark it done" if not b
                               else f"{cid} holds an owner's card: take it out of the batch, or run the batch by hand")
