@@ -364,6 +364,13 @@ def setting(cfg: dict, key: str) -> float:
     return found if found is not None else float(sv.SETTINGS[key])
 
 
+def limit(tasks: str, cfg: dict, key: str) -> float:
+    """A stop check's limit (quiet_minutes, max_run_hours, result_grace_s): the lower of the file's and the
+    one this dispatcher confirmed, so a session that raises its own limit in the file is still stopped by
+    the confirmed one, and an owner who lowers it by hand is heard at once."""
+    return min(setting(cfg, key), setting(trusted(tasks, cfg), key))
+
+
 def whole_number(key: str, value, low: int) -> int:
     """A whole-number setting from the dashboard, at least low. Refused when it is not one, or is too large
     for a float to hold (10**400 would break every later comparison with a count or a budget)."""
@@ -1284,7 +1291,7 @@ def step(tasks: str) -> list:
                 continue  # stopped already: SIGKILL follows below if it lingers
             view = live_view(tasks, run["card"], events=False)
             if (view.get("final") and view.get("last_output_ts")
-                    and now - view["last_output_ts"] > setting(cfg, "result_grace_s")):
+                    and now - view["last_output_ts"] > limit(tasks, cfg, "result_grace_s")):
                 if kill(run):
                     events.append(f"{run_unit(run)}: its session gave its result but did not exit; stopped it")
 
@@ -1293,10 +1300,10 @@ def step(tasks: str) -> list:
             path = os.path.join(state_dir(tasks), run["log"])
             quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
             started = run.get("started_ts") or sv.row_time(run["started"]) or now  # a hand-edited time: not long
-            long = now - started > setting(cfg, "max_run_hours") * 3600
-            if ((quiet > setting(cfg, "quiet_minutes") * 60 or long) and run_unit(run) not in reg["attention"]
+            long = now - started > limit(tasks, cfg, "max_run_hours") * 3600
+            if ((quiet > limit(tasks, cfg, "quiet_minutes") * 60 or long) and run_unit(run) not in reg["attention"]
                     and not run.get("kill_sent_ts")):
-                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {setting(cfg, 'max_run_hours'):g} h"
+                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {limit(tasks, cfg, 'max_run_hours'):g} h"
                 kill(run)
                 run["free_on_end"] = True  # its cards leave `doing` once it has ended (it may linger)
                 reg["attention"][run_unit(run)] = f"its session was stopped ({why}); see `state/{run['log']}`"
@@ -1843,7 +1850,11 @@ def act(tasks: str, action: str, data: dict) -> str:
             gate = str(data.get("gate", ""))
             if gate not in s["gates"]:
                 raise Refused(f"{gate} is not waiting for a review")
-            change_settings(tasks, approved_gates=cfg["approved_gates"] + [gate])
+            with LOCK:
+                confirmed = TRUSTED[tasks]["approved_gates"] if tasks in TRUSTED else None
+                change_settings(tasks, approved_gates=sv.gates_approved(cfg) + [gate])
+                if tasks in TRUSTED:  # the owner approved this gate, not a gate a session added to the file
+                    TRUSTED[tasks]["approved_gates"] = sv.gates_approved({"approved_gates": confirmed}) + [gate]
             return f"stage {gate} approved"
         if action == "check-chrome":
             reg["chrome_check"] = None

@@ -467,6 +467,63 @@ class Pids(unittest.TestCase):
             self.assertFalse(autopilot.kill(run, signal.SIGKILL))
 
 
+class ReviewFixes(Scratch):
+    """What the code review of the integration found."""
+
+    def write_settings(self, **changes) -> None:
+        path = os.path.join(autopilot.state_dir(self.tasks), "autopilot.json")
+        with open(path) as handle:
+            cfg = json.load(handle)
+        with open(path, "w") as handle:  # what a session can do with a script
+            json.dump({**cfg, **changes}, handle)
+
+    def test_a_session_cannot_lift_its_own_silence_limit(self):
+        self.script_for({"T001": ["sleep"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        autopilot.change_settings(self.tasks, quiet_minutes=0.02)  # the owner's own setting: confirmed
+        self.write_settings(quiet_minutes=10 ** 9, max_run_hours=10 ** 9)  # then the session raises it
+        events = self.steps_until(lambda: "T001" in autopilot.registry(self.tasks)["attention"])
+        self.assertIn("T001: stopped its session (silent for 0 min)", events)
+        self.assertEqual(autopilot.limit(self.tasks, autopilot.settings(self.tasks), "quiet_minutes"), 0.02)
+
+    def test_an_owner_who_lowers_a_limit_by_hand_is_heard_at_once(self):
+        cfg = autopilot.settings(self.tasks)
+        autopilot.trusted(self.tasks, cfg)
+        self.write_settings(max_run_hours=1)
+        self.assertEqual(autopilot.limit(self.tasks, autopilot.settings(self.tasks), "max_run_hours"), 1.0)
+
+    def test_approving_a_stage_confirms_that_stage_only(self):
+        self.finish("T001")
+        for cid in ("T002", "T003", "T004", "CPA"):
+            self.finish(cid)
+        autopilot.change_settings(self.tasks, auto=False)
+        s = self.state()
+        self.assertEqual(s["gates"], ["CPA"])
+        autopilot.trusted(self.tasks, autopilot.settings(self.tasks), s)  # this process dispatches
+        self.write_settings(approved_gates=["CPX"])  # a session approves a stage of its own
+        self.assertEqual(autopilot.act(self.tasks, "gate", {"gate": "CPA"}), "stage CPA approved")
+        self.assertEqual(autopilot.TRUSTED[self.tasks]["approved_gates"], ["CPA"])
+        self.assertEqual(autopilot.settings(self.tasks)["approved_gates"], ["CPX", "CPA"])
+        changes = autopilot.widened(self.tasks, self.state(), autopilot.settings(self.tasks))
+        self.assertEqual(changes, ["state/autopilot.json's approved_gates added 'CPX'"], "still shown to the owner")
+
+    def test_odd_approved_gates_resume_after_or_paused_reason_never_crash_a_pass(self):
+        self.finish("T001")
+        for cid in ("T002", "T003", "T004", "CPA"):
+            self.finish(cid)
+        for gates in ("CPA", 5, None, [5, "CPB"]):
+            with self.subTest(gates=gates):
+                self.write_settings(approved_gates=gates, resume_after="soon", paused_reason=None, auto=False)
+                self.assertEqual(self.state()["gates"], ["CPA"], "a string is no list of approved gates")
+                autopilot.step(self.tasks)  # no TypeError at the top of the pass, in build() or in alert()
+                self.assertEqual(autopilot.settings(self.tasks)["resume_after"], 0.0)
+        self.write_settings(approved_gates=5, auto=True, paused_reason="", resume_after=0)
+        events = autopilot.step(self.tasks)  # with the autopilot on, forbidden() names the bad value and pauses
+        self.assertIn("autopilot paused: state/autopilot.json sets approved_gates to 5, not a list of names; fix it,"
+                      " then press Resume", events)
+
+
 def doc(name: str) -> str:
     with open(os.path.join(HERE, "..", name), encoding="utf-8") as handle:
         return re.sub(r"\s+", " ", handle.read())

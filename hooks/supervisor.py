@@ -134,11 +134,23 @@ def read_json_strict(path: str, default):
 
 
 def load_settings(state_dir: str) -> dict:
-    """The autopilot's settings; "exists" says whether the feature uses the autopilot at all."""
+    """The autopilot's settings; "exists" says whether the feature uses the autopilot at all. The two the
+    dispatcher keeps for itself are read safely (paused_reason as text, resume_after as a finite number);
+    the guarded ones stay as written, so autopilot.forbidden() can name what is wrong with them."""
     found = read_json(os.path.join(state_dir, "autopilot.json"), None)
     out = {**SETTINGS, **(found if isinstance(found, dict) else {})}
     out["exists"] = isinstance(found, dict)
+    out["paused_reason"] = out["paused_reason"] if isinstance(out["paused_reason"], str) else \
+        "" if out["paused_reason"] is None else str(out["paused_reason"])
+    out["resume_after"] = number(out["resume_after"])
     return out
+
+
+def gates_approved(settings: dict) -> list:
+    """The stage gates the owner approved, as a list whatever the file holds (a session may write a string
+    there: "CPA" must not read as approving every gate whose name is part of it)."""
+    found = settings.get("approved_gates")
+    return [g for g in found if isinstance(g, str)] if isinstance(found, list) else []
 
 
 def pid_alive(pid) -> bool:
@@ -1395,7 +1407,7 @@ def build(tasks: str, stale_hours: float) -> dict:
     # a finished checkpoint holds the next stage until the owner has looked at it (autopilot only)
     gates_open = [c for c in order if is_gate(c) and status[c] == "done"
                   and settings["exists"] and settings["gate_checkpoints"]
-                  and c not in settings["approved_gates"]]
+                  and c not in gates_approved(settings)]
     gates_open = [g for g in gates_open if any(g in cards[c]["after"] and status[c] not in FINISHED for c in order)]
     open_decisions = [d for d in resume["decisions"] if d["open"]]
     # a blocker about finished cards only is history: it stays in RESUME, not in "Needs you"
