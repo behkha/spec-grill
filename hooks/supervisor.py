@@ -10,7 +10,8 @@
     supervisor.py TASKS --lessons    what each card took (runs, tries, cost, hours), for the
                                      close card's retro
     supervisor.py TASKS --serve      dashboard at http://127.0.0.1:8765 for every feature
-                                     beside TASKS (local only; add --open to open a browser)
+                                     beside TASKS (local only; open the link it prints, which
+                                     carries this launch's key, or add --open to open a browser)
     supervisor.py TASKS --serve --autopilot
                                      the same, plus the dispatcher that starts card sessions
                                      on its own (autopilot.py next to this file)
@@ -24,16 +25,20 @@ state/.supervisor.json. The dashboard page is dashboard.html next to this file. 
 library only.
 """
 
+from __future__ import annotations  # `X | None` annotations on Python 3.9
+
 import argparse
 import datetime as dt
 import fcntl
 import fnmatch
 import glob
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 ID = r"(?:T\d+(?:[A-Z]+\d*)*|CP[A-Z0-9]+)"  # T001, T012A, follow-ups like T042B2 and T042R2A; CPA, CP0, CPEND
@@ -131,17 +136,37 @@ def run_alive(run: dict) -> bool:
 
 
 def dispatcher_alive(state_dir: str) -> bool:
-    """Some process holds the feature's dispatcher lock (autopilot.acquire)."""
+    """Some process dispatches the feature: the pid autopilot.acquire() wrote into state/.autopilot.lock is
+    alive and the lock is held. The lock is probed (shared, non-blocking, dropped at once) only when that
+    pid is alive, or can't be read (acquire() is between emptying the file and writing it), so a
+    dispatcher taking the lock over from one that died never meets the probe. Left: if the recorded pid
+    lives on without the lock (it released it, or the pid was reused), an acquire() at the very moment of
+    a probe fails, and that dispatcher skips one pass."""
     path = os.path.join(state_dir, ".autopilot.lock")
     if not os.path.exists(path):
         return False
+    said = read_json(path, None)
+    pid = said.get("pid") if isinstance(said, dict) else None
+    if isinstance(pid, int) and not isinstance(pid, bool):  # os.kill takes a C int: a bigger one raises
+        if not 0 < pid < 2 ** 31:
+            return False
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # alive, under another account: the lock decides
+        except OSError:
+            return False
     try:
-        with open(path, "a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        return False
+        handle = open(path)
     except OSError:
-        return True
+        return False
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return False
 
 
 MERGE_LOCK = "merge.lock"  # state/merge.lock: a [P] session merges only while it holds it (autopilot RULES)
@@ -409,19 +434,34 @@ def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
     return batches, drift
 
 
-def alone(cid: str, c: dict) -> str:
-    """Why a card may never be in a batch (T001, a checkpoint, an owner's card); "" when it may."""
+def alone(cid: str, c: dict, decisions: list = ()) -> str:
+    """Why a card may never be in a batch, rule 11's always-alone list; "" when it may: T001, a checkpoint,
+    an owner's card, the Results card (the close: it waits for §5, rule 16, or is titled just "Results"),
+    one whose Do asks for the owner's yes, a walk-through, a card waiting for one of the open decisions
+    (RESUME's "needed before", or "decision 2" in its after:)."""
     if cid == "T001":
         return "the first card"
     if cid.startswith("CP"):
         return "a checkpoint"
-    return "an owner's card" if c["kind"] == "owner" else ""
+    if c["kind"] == "owner":
+        return "an owner's card"
+    if "§5" in c["after_text"] or re.fullmatch(r"(?:results|close)\W*", c["title"].strip(), re.I):
+        return "the Results card"
+    if c["asks_owner"]:
+        return "a card whose Do asks for the owner's yes"
+    if WALK_RE.search(c["title"]):
+        return "a walk-through"
+    named = set(re.findall(r"\bdecisions?\s+(\d+)", c["after_text"], re.I))
+    if any(cid in d["before"] or str(d["n"]).strip() in named for d in decisions):
+        return "a card waiting for an owner's decision"
+    return ""
 
 
-def batch_rules(batches: list, cards: dict, status: dict) -> list:
-    """Drift for unfinished batches that break the batching rules: a card that always runs alone, an L
-    card or more than BATCH_BUDGET by size (S = 1, M = 2), and a card outside the batch that waits on
-    one of its cards while another of its cards waits on it (the batch could never run)."""
+def batch_rules(batches: list, cards: dict, status: dict, decisions: list = ()) -> list:
+    """Drift for unfinished batches that break the batching rules: a card that always runs alone (alone(),
+    with the open decisions), an L card or more than BATCH_BUDGET by size (S = 1, M = 2), and a card
+    outside the batch that waits on one of its cards while another of its cards waits on it (the batch
+    could never run)."""
     waiters: dict = {}
     for cid, c in cards.items():
         for dep in c["after"]:
@@ -432,7 +472,7 @@ def batch_rules(batches: list, cards: dict, status: dict) -> list:
             continue
         mine = b["cards"]
         for cid in mine:
-            if why := alone(cid, cards[cid]):
+            if why := alone(cid, cards[cid], decisions):
                 out.append(f"batch {b['id']} holds {cid}, {why}: it runs on its own, never in a batch")
         large = [c for c in mine if cards[c]["size"] == "L"]
         out += [f"batch {b['id']} holds {c}, an L card: split it before it goes in a batch" for c in large]
@@ -468,15 +508,10 @@ def unbatched(cards: dict, order: list, status: dict, doing: list, batch_of: dic
     files their Touches share (or a chain: one waits on another), by stage when Touches can't be read.
     Given only when such groups hold 3 cards or more. Cards that always run alone are left out: T001,
     checkpoints, owner's cards, the Results card, a card waiting for an owner's decision, one whose Do
-    asks for the owner's yes, a walk-through."""
-    waiting_on = {c for d in decisions for c in d["before"]}
-    open_n = {str(d["n"]).strip() for d in decisions}
+    asks for the owner's yes, a walk-through (alone())."""
 
     def never(cid: str) -> bool:
-        c = cards[cid]
-        named = set(re.findall(r"\bdecisions?\s+(\d+)", c["after_text"], re.I))
-        return bool(alone(cid, c) or c["asks_owner"] or WALK_RE.search(c["title"]) or "§5" in c["after_text"]
-                    or re.match(r"(results|close)\b", c["title"], re.I) or cid in waiting_on or named & open_n)
+        return bool(alone(cid, cards[cid], decisions))
 
     picked = [c for c in order if cards[c]["size"] == "S" and status[c] not in FINISHED and c not in doing
               and c not in batch_of and not never(c)]
@@ -631,6 +666,9 @@ NO_EVIDENCE = OPEN_ANSWERS | {"n/a", "na", "none", "tbd", "–", "—", "-"}
 WAITED = re.compile(r"AUTOPILOT: (?:WAITING FOR (?:DECISION|APPROVAL)|BLOCKED)")
 REVIEWED_RE = re.compile(r"Pins reviewed up to[\s`*:]*([0-9a-f]{7,40})\b", re.I)
 GIT: dict = {}  # cached git answers: the repo root, the pin history (per ref state), ancestry
+GIT_LIMIT = 4096  # a long --serve asks about ever more commits: past this many answers, the older half of
+# the ancestry answers is forgotten (the repo roots and pin histories stay)
+EOO: list = []  # [True] once git is known to take --end-of-options (2.24+), [False] when it does not
 
 
 def flat(value, limit: int = 80, cell: bool = True) -> str:
@@ -750,11 +788,22 @@ def git(root: str, *args: str, timeout: float = 5) -> subprocess.CompletedProces
         return None
 
 
+def end_of_options() -> list:
+    """["--end-of-options"] when the installed git knows it (2.24+): nothing after it is read as an option."""
+    if not EOO:
+        out = git("/", "--version", timeout=3)
+        found = re.search(r"(\d+)\.(\d+)", out.stdout) if out else None
+        EOO.append(bool(found) and (int(found.group(1)), int(found.group(2))) >= (2, 24))
+    return ["--end-of-options"] if EOO[0] else []
+
+
+# (each cached answer is read into a local first: another thread may clear GIT at any moment)
 def git_root(folder: str) -> str:
-    if not GIT.get(("root", folder)):  # a folder that is not in a repo yet is asked again
+    found = GIT.get(("root", folder))
+    if not found:  # a folder that is not in a repo yet is asked again
         out = git(folder, "rev-parse", "--show-toplevel", timeout=3)
-        GIT[("root", folder)] = out.stdout.strip() if out and out.returncode == 0 else ""
-    return GIT[("root", folder)]
+        found = GIT[("root", folder)] = out.stdout.strip() if out and out.returncode == 0 else ""
+    return found
 
 
 def pin_history(root: str, specs: list, tasks: str) -> tuple:
@@ -764,8 +813,9 @@ def pin_history(root: str, specs: list, tasks: str) -> tuple:
     refs = git(root, "rev-parse", "--all", "HEAD", timeout=3)
     key = ("pins", root, tuple(specs), tasks)
     stamp = refs.stdout if refs else ""
-    if key in GIT and GIT[key][0] == stamp:
-        return GIT[key][1]
+    cached = GIT.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
     out = git(root, "log", "--all", "--full-history", "--no-merges", "-z",
               "--format=%x1e%H%x1f%ct%x1f%s", "--name-only", "--", *specs, timeout=10)
     commits: list = []
@@ -783,10 +833,15 @@ def pin_history(root: str, specs: list, tasks: str) -> tuple:
 
 def is_ancestor(root: str, sha: str, reviewed: str) -> bool:
     key = ("ancestor", root, sha, reviewed)
-    if key not in GIT:
+    found = GIT.get(key)
+    if found is None:
+        if len(GIT) >= GIT_LIMIT:
+            older = [k for k in list(GIT) if k[0] == "ancestor"]  # (oldest first: insertion order)
+            for k in older[: len(older) // 2 + 1]:
+                GIT.pop(k, None)
         out = git(root, "merge-base", "--is-ancestor", sha, reviewed, timeout=3)
-        GIT[key] = bool(out and out.returncode == 0)
-    return GIT[key]
+        found = GIT[key] = bool(out and out.returncode == 0)
+    return found
 
 
 def pin_drift(tasks: str, cards: dict, rows: dict, pins: dict, reviewed: str) -> list:
@@ -903,16 +958,64 @@ def blocker_subjects(item: str) -> list:
 
 
 def last_commit(repo: str, branch: str) -> float | None:
-    if not branch or branch in ("-", "—"):
+    """When a card's branch last moved here, from its reflog: a commit, a merge into it, or its creation (a
+    branch just cut from an old tip is not "quiet since" that tip). Without a reflog, when its tip was
+    committed if no other local branch holds that tip, else None (it is not this card's work). None too
+    when the cell names nothing git knows. Sessions write RESUME, so a cell starting with "-" never
+    reaches git: git would read it as an option (`--output=<file>` writes that file)."""
+    branch = (branch or "").strip()
+    if not branch or branch in ("-", "—") or branch.startswith("-"):
         return None
+    rev = [*end_of_options(), branch, "--"]
+    out = git(repo, "log", "-g", "-1", "--format=%gd", "--date=unix", *rev, timeout=3)
+    if out and out.returncode == 0 and (moved := re.search(r"@\{(\d+)\}$", out.stdout.strip())):
+        return float(moved.group(1))
+    name = re.sub(r"^refs/heads/", "", branch)
+    out = git(repo, "log", "-1", "--format=%ct", "--not", f"--exclude={name}", "--branches", "--not", *rev,
+              timeout=3)
+    text = out.stdout.strip() if out and out.returncode == 0 else ""
+    return float(text) if text.isdigit() else None
+
+
+def number(value) -> float:
+    """A number from runs.json; 0 for anything else ("n/a", null, NaN, infinity: never in the JSON)."""
     try:
-        out = subprocess.run(
-            ["git", "-C", repo, "log", "-1", "--format=%ct", branch],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-        return float(out) if out else None
-    except Exception:
+        out = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return out if math.isfinite(out) else 0.0
+
+
+def mtime(path: str) -> float | None:
+    try:
+        return os.path.getmtime(path)
+    except OSError:  # removed since it was listed
         return None
+
+
+def row_time(cell: str, day: bool = False) -> float | None:
+    """The newest time in a RESUME status row's date cell, as a UTC timestamp: "2026-10-09 14:05Z" (or
+    "T14:05") at that minute. With day, the newest bare day instead, at its end but never later than
+    now: it says only that the row changed that day."""
+    out = []
+    for m in re.finditer(r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?", cell or ""):
+        if (m.group(4) is None) != day:
+            continue
+        try:
+            day = dt.datetime(*(int(x) for x in m.groups()[:3]), tzinfo=dt.timezone.utc)
+            at = (min(day + dt.timedelta(days=1), now()) if m.group(4) is None
+                  else day.replace(hour=int(m.group(4)), minute=int(m.group(5))))
+        except ValueError:
+            continue
+        out.append(at.timestamp())
+    return max(out, default=None)
+
+
+def run_times(state_dir: str, run: dict) -> list:
+    """When a session the autopilot started began, and when its log last grew (its last output)."""
+    began = number(run.get("started_ts")) or row_time(str(run.get("started") or ""))
+    log = run.get("log")
+    return [began, mtime(os.path.join(state_dir, log)) if isinstance(log, str) and log else None]
 
 
 def recent_commits(folder: str, cards: dict, rows: dict, limit: int = 25) -> list:
@@ -1003,7 +1106,8 @@ def build(tasks: str, stale_hours: float) -> dict:
     handoff_dir = os.path.join(state_dir, "handoff")
     handoffs = {}
     for path in glob.glob(os.path.join(handoff_dir, "*.md")):
-        handoffs[os.path.basename(path)[:-3]] = os.path.getmtime(path)
+        if (when := mtime(path)) is not None:
+            handoffs[os.path.basename(path)[:-3]] = when
 
     status = card_status(cards, order, resume)
     phases: dict = {}  # the other features this one's cards wait on, read once per build
@@ -1050,6 +1154,10 @@ def build(tasks: str, stale_hours: float) -> dict:
 
     registry = read_json(os.path.join(state_dir, "runs.json"), {})
     registry = registry if isinstance(registry, dict) else {}
+    for key, empty in (("runs", []), ("attention", {}), ("manual", []), ("queued", []), ("blocked_on", {})):
+        if not isinstance(registry.get(key, empty), type(empty)):
+            registry[key] = empty  # a hand-edited runs.json must not take every view down
+    registry["runs"] = [r for r in registry.get("runs", []) if isinstance(r, dict)]
     alive = {id(r): run_alive(r) for r in registry.get("runs", []) if not r.get("ended")}
     live_runs = [r for r in registry.get("runs", []) if alive.get(id(r))]
     batch_runs = {r["batch"]: r for r in live_runs if r.get("batch")}
@@ -1074,7 +1182,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         mine = [r for r in registry.get("runs", []) if r.get("batch") == b["id"]]
         b["run_card"] = (batch_runs.get(b["id"]) or (mine[-1] if mine else {})).get("card", "")
     open_batch = {b["id"]: b for b in batches if not b["done"]}
-    batch_drift += batch_rules(batches, cards, status)
+    batch_drift += batch_rules(batches, cards, status, open_decisions)
     live_cards = [c for c in order if status[c] not in FINISHED and any(
         r.get("card") == c for r in live_runs)]
     # a live batch session works on its batch's first open card, whichever card it was started on
@@ -1162,9 +1270,16 @@ def build(tasks: str, stale_hours: float) -> dict:
     stalled = []
     for cid in doing:
         row = resume["status"].get(cid, {})
-        last = last_commit(folder, row.get("branch", ""))
-        if cid in handoffs:
-            last = max(last or 0, handoffs[cid])
+        # the newest sign of work: its branch moving, its hand-off, its RESUME row's time, and its latest
+        # session's start and last output (a batch's session counts for the card the batch is on); a sign
+        # from the future (a local time written as UTC, a skewed clock) says nothing. A bare day on its
+        # row counts only when there is nothing finer
+        signs = [last_commit(folder, row.get("branch", "")), handoffs.get(cid), row_time(row.get("date", ""))]
+        run = next((r for r in reversed(registry["runs"]) if r.get("card") == cid
+                    or (batch_of.get(cid) and r.get("batch") == batch_of[cid])), None)
+        signs += run_times(state_dir, run) if run else []
+        last = max((x for x in signs if x and x <= stamp + 300), default=None) \
+            or row_time(row.get("date", ""), day=True)
         if last and stamp - last > stale_hours * 3600:
             stalled.append({"card": cid, "quiet": ago(stamp - last)})
 
@@ -1182,7 +1297,8 @@ def build(tasks: str, stale_hours: float) -> dict:
             if cid not in cards:
                 drift.append(f"RESUME has a row for {cid}, which tasks.md does not define")
     for cid in order:
-        if status[cid] == "done" and cid not in handoffs and has_resume:
+        # an owner's card is marked done on the dashboard, which writes no hand-off
+        if status[cid] == "done" and cid not in handoffs and has_resume and cards[cid]["kind"] != "owner":
             drift.append(f"{cid} is done but state/handoff/{cid}.md is missing")
         for dep in cards[cid]["after"]:
             if dep not in cards:
@@ -1243,7 +1359,7 @@ def build(tasks: str, stale_hours: float) -> dict:
     session_cost: dict = {}
     for run in registry.get("runs", []):
         key = run.get("session") or id(run)
-        session_cost[key] = max(session_cost.get(key, 0.0), float(run.get("cost") or 0))
+        session_cost[key] = max(session_cost.get(key, 0.0), number(run.get("cost")))
     for run in registry.get("runs", []):
         cid = run.get("card", "")
         live = bool(alive.get(id(run)))
@@ -1260,7 +1376,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         entry.pop("keys")
     attention = registry.get("attention", {})
     runs_file = os.path.join(state_dir, "runs.json")
-    beat = os.path.getmtime(runs_file) if os.path.exists(runs_file) else None
+    beat = mtime(runs_file)
     pending = [a for a in resume["approvals"] if a["status"] == "pending"]
     answered = [a for a in resume["approvals"] if a["status"] in ("approved", "rejected")]
     yours = [c for c in order if cards[c]["kind"] == "owner" and status[c] not in FINISHED and not waits[c]]
@@ -1282,7 +1398,10 @@ def build(tasks: str, stale_hours: float) -> dict:
     for path in sorted(glob.glob(os.path.join(state_dir, "screens", "*"))):
         name = os.path.basename(path)
         if re.fullmatch(ID, name) and os.path.isdir(path):
-            files = sorted(f for f in os.listdir(path) if IMAGE_RE.match(f))
+            try:
+                files = sorted(f for f in os.listdir(path) if IMAGE_RE.match(f))
+            except OSError:  # removed since the glob
+                files = []
             if files:
                 screens[name] = files
 
@@ -1610,6 +1729,8 @@ def owner_part(cid: str, mine: list, resume: dict, attention: dict) -> str:
 
 
 def snapshot(s: dict) -> dict:
+    """What --wait compares (each field a str, list or dict, which like() checks a saved one against)."""
+    merging = s.get("merge_lock")
     return {
         "status": s["status"],
         "ready": s["ready"],
@@ -1623,10 +1744,22 @@ def snapshot(s: dict) -> dict:
         "open_checks": [check_line(c) for c in s["open_checks"]],
         "approvals": [f"{a['n']} {a['card']}: {a['step']}" for a in s["approvals"]],
         "gates": s["gates"],
-        "attention": sorted(s["autopilot"]["attention"]),
-        "paused": s["autopilot"]["settings"]["paused_reason"],
+        "attention": {c: flat(why, 200, cell=False) for c, why in s["autopilot"]["attention"].items()},
+        "live": sorted(str(c) for c in s["autopilot"]["live"]),
+        "merge_lock": f"held by {merging['holder'] or 'a session that has not said who it is'}"
+                      + (f" since {merging['since']}" if merging["since"] else "") if merging else "",
+        "paused": str(s["autopilot"]["settings"]["paused_reason"] or ""),
         "commits": [f"{c['hash'][:7]} {c['subject']}" for c in s["commits"][:10]],
     }
+
+
+def like(saved, new: dict) -> dict | None:
+    """The last --wait's snapshot with new's fields in new's types; a field it lacks (say, from an older
+    supervisor) or holds in another type takes new's value, since it can't say what changed. None when
+    it is no snapshot at all."""
+    if not isinstance(saved, dict) or not isinstance(saved.get("status"), dict):
+        return None
+    return {k: saved[k] if isinstance(saved.get(k), type(v)) else v for k, v in new.items()}
 
 
 def changes(old: dict, new: dict) -> list:
@@ -1657,7 +1790,13 @@ def changes(old: dict, new: dict) -> list:
     out += [f"open check: {c}" for c in new.get("open_checks", []) if c not in old.get("open_checks", [])]
     out += [f"approval needed: {a}" for a in new.get("approvals", []) if a not in old.get("approvals", [])]
     out += [f"stage {g} finished and waits for your review" for g in new.get("gates", []) if g not in old.get("gates", [])]
-    out += [f"{c} needs you" for c in new.get("attention", []) if c not in old.get("attention", [])]
+    said = old.get("attention", {})
+    out += [f"{c} needs you: {why}" for c, why in new.get("attention", {}).items() if said.get(c) != why]
+    out += [f"{c} no longer needs you" for c in said if c not in new.get("attention", {})]
+    out += [f"{c}: a session started" for c in new.get("live", []) if c not in old.get("live", [])]
+    out += [f"{c}: its session ended" for c in old.get("live", []) if c not in new.get("live", [])]
+    if old.get("merge_lock", "") != new.get("merge_lock", ""):
+        out.append(f"merge lock: {old.get('merge_lock') or 'free'} → {new.get('merge_lock') or 'free'}")
     out += [f"new commit {c}" for c in new.get("commits", []) if c not in old.get("commits", [])][:5]
     if new.get("paused") and new.get("paused") != old.get("paused"):
         out.append(f"autopilot paused: {new['paused']}")
@@ -1680,7 +1819,8 @@ def main() -> None:
     parser.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     parser.add_argument("--interval", type=float, default=5, help="seconds between reads (5)")
     parser.add_argument("--stale-hours", type=float, default=4,
-                        help="a doing card with no commit or hand-off for this long is stalled (4)")
+                        help="a doing card with no sign of work for this long (a commit only its branch holds,"
+                             " its hand-off, its RESUME date, its session's output) is stalled (4)")
     args = parser.parse_args()
     tasks = find_tasks(args.tasks)
 
@@ -1692,7 +1832,10 @@ def main() -> None:
         shown, drawn = None, 0.0
         try:
             while True:
-                body = render(build(tasks, args.stale_hours))
+                try:
+                    body = render(build(tasks, args.stale_hours))
+                except Exception as error:  # shown in place of the view; the next read may succeed
+                    body = f"{tasks}\nsupervisor: could not read the state: {type(error).__name__}: {error}"
                 key = body.split("\n", 1)[1]
                 if key != shown or time.time() - drawn > 60:
                     sys.stdout.write("\033[2J\033[H" + body + f"\n\nwatching every {args.interval:g}s · Ctrl-C stops\n")
@@ -1704,10 +1847,11 @@ def main() -> None:
     elif args.serve:
         serve(tasks, args.port, args.stale_hours, args.open, args.autopilot)
     elif args.autopilot:
-        import threading
         import autopilot
         stop = threading.Event()
-        enable(tasks)
+        if enable(tasks):
+            print("Autopilot: new on this feature, so it starts paused; press Resume on the dashboard"
+                  " (supervisor.py … --serve) to let it run", flush=True)
         print(f"Autopilot: dispatching {tasks} (Ctrl-C stops; running sessions keep going)", flush=True)
         try:
             autopilot.loop(lambda: users(tasks), args.interval, stop, lambda line: print(line, flush=True))
@@ -1715,18 +1859,16 @@ def main() -> None:
             stop.set()
     elif args.wait:
         path = os.path.join(os.path.dirname(tasks), "state", ".supervisor.json")
-        try:
-            with open(path, encoding="utf-8") as handle:
-                old = json.load(handle)
-        except (OSError, ValueError):
-            old = None
+        saved, old = read_json(path, None), None
         while True:
             state = build(tasks, args.stale_hours)
             new = snapshot(state)
             if old is None:
-                old = new  # first run: this is the baseline
-                save(path, new)
-            elif new != old:
+                old = like(saved, new)
+                if old is None:  # first run, or a snapshot that is missing or broken: this is the baseline
+                    old = new
+                    save(path, new)
+            if new != old:
                 save(path, new)
                 print("Changed:")
                 print("\n".join(f"  {line}" for line in changes(old, new)) or "  (details only)")
@@ -1738,11 +1880,18 @@ def main() -> None:
         print(render(build(tasks, args.stale_hours)))
 
 
-def enable(tasks: str) -> None:
-    """--autopilot on a feature that has never used it: create its settings, switched on."""
+NEW_PAUSED = "new: press Resume to start"
+
+
+def enable(tasks: str) -> bool:
+    """--autopilot on a feature that has never used it: create its settings, paused, so the owner looks at
+    the dashboard first (or tries one card with its Start button) and presses Resume to let it run.
+    True when it created them."""
     path = os.path.join(os.path.dirname(tasks), "state", "autopilot.json")
-    if not os.path.exists(path):
-        save(path, {**{k: v for k, v in SETTINGS.items()}, "auto": True})
+    if os.path.exists(path):
+        return False
+    save(path, {**SETTINGS, "auto": False, "paused_reason": NEW_PAUSED})
+    return True
 
 
 def users(tasks: str) -> list:
@@ -1752,16 +1901,65 @@ def users(tasks: str) -> list:
                   if os.path.exists(os.path.join(os.path.dirname(p), "state", "autopilot.json")))
 
 
+MAX_BODY = 1 << 20  # the largest action the dashboard may post (its answers are a few hundred bytes)
+
+
+def finite(text: str) -> float:
+    """A JSON number the dashboard could have sent; ValueError for one that is not finite."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is not a finite number")
+    return value
+
+
+LOCKED = """<!doctype html><meta charset="utf-8"><title>Spec-Grill dashboard</title>
+<p style="font: 16px system-ui; margin: 2em">This dashboard opens only from the link printed in the terminal that
+started it (<code>supervisor.py … --serve</code>): the link carries this launch's key. Open that link, or start
+the supervisor with <code>--open</code>.</p>"""
+
+
 def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatch: bool = False) -> None:
     import secrets
-    import threading
+    import shutil
+    import tempfile
+    import traceback
+    from http.cookies import CookieError, SimpleCookie
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import parse_qs, urlparse
+    from urllib.parse import parse_qs, quote, urlparse
 
     specs = os.path.dirname(os.path.dirname(tasks))
     default = os.path.basename(os.path.dirname(tasks))
     page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
     token = secrets.token_urlsafe(24)  # the page carries it; other sites can't read it, so can't post
+    # This launch's key. The page (and so the token) goes only to a request that carries it: in the link
+    # printed to this terminal (?k=), or in the cookie that link sets. It never enters argv or the
+    # environment, so a card session can't fetch the page and post actions as the owner. Sessions run as
+    # the same OS user, though: this raises the bar, it is no sandbox.
+    key = secrets.token_urlsafe(24)
+    handed: list = []  # the private folder --open may forward the browser through; removed once used
+
+    def forget() -> None:  # (a request thread and the timer may both call it)
+        while True:
+            try:
+                folder = handed.pop()
+            except IndexError:
+                return
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def forwarder(link: str) -> str:
+        """A private page that sends the browser on to link, for a browser webbrowser starts with the link
+        on its command line (Linux, or $BROWSER), where `ps` would show the key for the browser's whole
+        life. Removed once the dashboard has loaded through it, or after a minute."""
+        folder = tempfile.mkdtemp(prefix="spec-grill-")  # only this user may enter it
+        path = os.path.join(folder, "dashboard.html")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={link}">'
+                         f'<a href="{link}">Open the dashboard</a>')
+        handed.append(folder)
+        timer = threading.Timer(60, forget)
+        timer.daemon = True
+        timer.start()
+        return "file://" + path
 
     def features() -> list:
         return sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(specs, "*", "tasks.md")))
@@ -1770,9 +1968,39 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
         name = name or default
         return os.path.join(specs, name, "tasks.md") if name in features() else None  # no paths from the URL
 
+    failed = [""]  # the last error a request met, printed once
+
     class Handler(BaseHTTPRequestHandler):
+        timeout = 30  # a request that sends less than its Content-Length gives its thread back after this
+
         def log_message(self, *args) -> None:
             pass
+
+        def do_POST(self) -> None:
+            self.guarded(self.post)
+
+        def do_GET(self) -> None:
+            self.guarded(self.get)
+
+        def guarded(self, answer) -> None:
+            """Answer a request; an error answers 500 with its text, instead of dropping the connection."""
+            try:
+                answer()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the page went away
+            except Exception as error:
+                said = f"{type(error).__name__}: {error}"
+                if said != failed[0]:
+                    failed[0] = said
+                    print(f"supervisor: {self.command} {self.path.split('?', 1)[0]} failed\n{traceback.format_exc()}",
+                          file=sys.stderr, flush=True)
+                try:  # the dashboard shows an action's answer as text; the GET API answers JSON
+                    if self.command == "POST":
+                        self.send(500, f"the supervisor failed: {said}", "text/plain; charset=utf-8")
+                    else:
+                        self.send(500, json.dumps({"error": said}), "application/json; charset=utf-8")
+                except OSError:
+                    pass
 
         def send(self, code: int, body: str, kind: str) -> None:
             data = body.encode("utf-8")
@@ -1795,7 +2023,22 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
                 return False
             return True
 
-        def do_POST(self) -> None:
+        def cookie(self) -> str:  # one per port: a browser sends 127.0.0.1's cookies to every port
+            return f"spec_grill_{self.server.server_address[1]}"
+
+        def owner(self, query: dict) -> bool:
+            """The request carries this launch's key: in the link printed to the terminal, or its cookie."""
+            given = query.get("k", [""])[0]
+            if not given:
+                jar = SimpleCookie()
+                try:
+                    jar.load(self.headers.get("Cookie") or "")
+                except CookieError:
+                    pass
+                given = jar[self.cookie()].value if self.cookie() in jar else ""
+            return secrets.compare_digest(given.encode(), key.encode())
+
+        def post(self) -> None:
             if not self.local():
                 return
             origin = self.headers.get("Origin")
@@ -1807,10 +2050,19 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
             if url.path != "/api/act":
                 return self.send(404, "not found", "text/plain")
             try:
-                length = min(int(self.headers.get("Content-Length") or 0), 65536)
-                data = json.loads(self.rfile.read(length) or b"{}")
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self.send(400, "bad Content-Length", "text/plain")
+            if length < 0:  # rfile.read(-1) would wait for the client to hang up
+                return self.send(400, "bad Content-Length", "text/plain")
+            if length > MAX_BODY:
+                return self.send(413, f"request too large (at most {MAX_BODY} bytes)", "text/plain")
+            try:  # Infinity, NaN and 1e999 are no JSON numbers: they would only reach act() to fail there
+                data = json.loads(self.rfile.read(length) or b"{}", parse_float=finite, parse_constant=finite)
             except ValueError:
                 return self.send(400, "bad JSON", "text/plain")
+            if not isinstance(data, dict):
+                return self.send(400, "bad JSON: the body must be an object", "text/plain")
             path = tasks_of(str(data.get("f", "")))
             if not path:
                 return self.send(404, "no such feature", "text/plain")
@@ -1824,13 +2076,27 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
                 return self.send(409, str(error), "text/plain; charset=utf-8")
             self.send(200, message, "text/plain; charset=utf-8")
 
-        def do_GET(self) -> None:
+        def get(self) -> None:
             if not self.local():
                 return
             url = urlparse(self.path)
             query = parse_qs(url.query)
             name = query.get("f", [""])[0]
             if url.path == "/":
+                if not self.owner(query):
+                    return self.send(403, LOCKED, "text/html; charset=utf-8")
+                if "k" in query:  # the key goes into a cookie, and out of the address bar
+                    forget()
+                    # Lax, not Strict: Chrome drops a Strict cookie on a redirect that began on another site
+                    # (the forwarder's file://), and the cookie only unlocks a page no other site can read
+                    self.send_response(303)
+                    self.send_header("Location", "/" + (f"?f={quote(name)}" if name else ""))
+                    self.send_header("Set-Cookie", f"{self.cookie()}={key}; HttpOnly; SameSite=Lax; Path=/")
+                    self.send_header("Cache-Control", "no-store")
+                    self.frame_guard()
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 html = read(page) or "dashboard.html is missing"
                 meta = f'<meta name="supervisor-token" content="{token}"><meta name="supervisor-dispatch" content="{int(dispatch)}">'
                 self.send(200, html.replace("</head>", meta + "</head>", 1), "text/html; charset=utf-8")
@@ -1892,33 +2158,46 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
             continue
     else:
         sys.exit(f"supervisor: ports {port}-{port + 19} are all busy")
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    # only this terminal sees the key (--open hands the link to the browser; on macOS via osascript's stdin)
+    url = f"http://127.0.0.1:{server.server_address[1]}/?k={key}"
     print(f"Dashboard: {url} (Ctrl-C stops)", flush=True)
     stop = threading.Event()
     if dispatch:
         import autopilot
-        enable(tasks)
+        if enable(tasks):
+            print("Autopilot: new on this feature, so it starts paused; press Resume on the dashboard to let it run",
+                  flush=True)
         worker = threading.Thread(target=autopilot.loop, daemon=True,
                                   args=(lambda: users(tasks), 5, stop, lambda line: print(line, flush=True)))
         worker.start()
         print("Autopilot: dispatching; running sessions keep going if this stops", flush=True)
     if open_browser:
         import webbrowser
-        webbrowser.open(url)
+        # macOS: webbrowser hands the link to osascript on its stdin; elsewhere it goes on a command line
+        direct = sys.platform == "darwin" and not os.environ.get("BROWSER")
+        webbrowser.open(url if direct else forwarder(url))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        forget()
         stop.set()
         if dispatch:
             worker.join(timeout=10)
 
 
 def save(path: str, data: dict) -> None:
+    """Write JSON whole: into a file beside path, then renamed over it, so no reader sees half of it."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=1)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):  # the write failed
+            os.remove(tmp)
 
 
 if __name__ == "__main__":

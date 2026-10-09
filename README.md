@@ -242,10 +242,10 @@ Add `--watch` instead for a live view in a terminal that redraws whenever the st
 Opening a session per card, pasting its line, picking its effort and watching it — the autopilot does all of that. Start it once, in your own terminal:
 
 ```bash
-python3 ~/.claude/skills/spec-grill/hooks/supervisor.py specs/004-webhook-retries --serve --autopilot --open
+python3 <skill dir>/hooks/supervisor.py specs/004-webhook-retries --serve --autopilot --open
 ```
 
-It needs the `claude` CLI logged in and the project folder trusted (run `claude` there once). Then it:
+It needs the `claude` CLI logged in and the project folder trusted (run `claude` there once). The first run on a feature starts paused: look around the dashboard, try one card with its Start button if you like, and press **Resume** when you want the autopilot to run the cards on its own. The dashboard opens only from the link the command prints, which carries a key for this launch (`--open` uses it), so a card session can't fetch the page and press its buttons. Then it:
 
 - **starts every ready card** in its own headless session (`claude -p`): the card's **Start with** line, its effort tier and model, the session named after the card, a dollar cap, and up to 3 sessions at once (at most one card or batch without `[P]`, since those share the integration worktree). A ready **batch** of small cards gets one session for all of them, in order, from the batch's own line. `[P]` cards and batches run side by side, but never two whose cards' **Touches** overlap (a card without Touches runs alone); each works in its own worktree and branch on its own dev-server port (`$SPEC_GRILL_PORT_OFFSET`), and merges back only while it holds the merge lock (`state/merge.lock`, shown on the dashboard), so two that finish together merge one at a time;
 - **asks you through the dashboard**, never in a chat: a step that needs your yes (a deploy, a paid run) becomes an Approve / Reject button, and the session resumes with your answer; open questions get an answer box with the recommended default filled in;
