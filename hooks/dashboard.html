@@ -534,8 +534,13 @@ const rich = (v) => esc(v).replace(/`([^`]+)`/g, "<code>$1</code>");
 const plain = (v) => String(v ?? "").replace(/`/g, "");
 const clock = () => new Date().toTimeString().slice(0, 5);
 const icon = (name) => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+// a poll that never answers would hold its single-flight guard for good: give up after ms
+const deadline = (ms) => { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal; };
 const blank = (v) => !v || v === "-" || v === "—";
 const finished = (s, id) => ["done", "waived"].includes(s.status[id]);
+// the deploy lock is free when its first word is: "free", "**Free**", "Free (since Monday)"; the server's flag wins
+const lockFree = (s) => typeof s.lock_free === "boolean" ? s.lock_free
+  : !s.lock || /^free\b/i.test(String(s.lock).replace(/[`*_~>#[\]]/g, "").trim());
 /* §5's batches: several small cards run in one session; a batch is not a card */
 const batchById = (s, id) => (s.batches || []).find((b) => b.id === id) || null;
 const batchOf = (s, id) => batchById(s, (s.batch_of || {})[id]);
@@ -710,22 +715,25 @@ function wantLog(s, id) {
   const key = run.session + "|" + run.ended + "|" + run.live;
   if (logs[id]?.key === key || logs[id]?.loading === key) return;
   logs[id] = { ...(logs[id] || {}), loading: key };
-  fetch(`/api/log?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}`, { cache: "no-store" })
+  const f = feature;
+  fetch(`/api/log?f=${encodeURIComponent(f)}&card=${encodeURIComponent(id)}`, { cache: "no-store" })
     .then((r) => r.text()).then((text) => {
+      if (f !== feature) return;  // another feature's card of the same id
       logs[id] = { key, text };
       if (state) { renderInbox(state); renderSessions(state); }
       if (selected === id && !$("#drawer").hidden) openDrawer(id, false);
     })
-    .catch(() => { logs[id] = { key, text: "" }; });
+    .catch(() => { if (f === feature) logs[id] = { key, text: "" }; });
 }
 
-function actionBlock(key, buttons) {
+function pendingBlock(key) {
   const p = pending[key];
-  if (p) {
-    const left = Math.max(0, Math.ceil((p.until - Date.now()) / 1000));
-    return `<div class="pending"><span class="drain" aria-hidden="true" style="animation-duration:${Math.max(0, p.until - Date.now())}ms"></span><span>${esc(p.label)} in <span data-countdown="${esc(key)}">${left}</span> s</span><button type="button" data-undo="${esc(key)}" data-fkey="undo-${esc(key)}">Undo</button></div>`;
-  }
-  return `<div class="actions">${buttons}</div>`;
+  if (!p) return "";
+  const left = Math.max(0, Math.ceil((p.until - Date.now()) / 1000));
+  return `<div class="pending"><span class="drain" aria-hidden="true" style="animation-duration:${Math.max(0, p.until - Date.now())}ms"></span><span>${esc(p.label)} in <span data-countdown="${esc(key)}">${left}</span> s</span><button type="button" data-undo="${esc(key)}" data-fkey="undo-${esc(key)}">Undo</button></div>`;
+}
+function actionBlock(key, buttons) {
+  return pending[key] ? pendingBlock(key) : `<div class="actions">${buttons}</div>`;
 }
 
 function inboxItems(s) {
@@ -770,15 +778,15 @@ function inboxItems(s) {
       <div class="what"><span class="mono">${esc(c)}</span> ${rich(b ? b.name : s.cards[c]?.title || "")}${b ? ` <span class="tag">batch ${progress(b)}</span>` : ""}</div>
       <div class="note">${rich(humanStuck(text))}</div>
       ${logs[logId]?.text ? `<div class="evidence"><h3>The session's last lines</h3>${lastLines(logId)}</div>` : ""}
-      <div class="actions">${DISPATCH ? btn(`data-act="retry" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-retry"`, "Retry", "primary") : ""}${btn(`data-act="takeover" data-card="${esc(c)}" data-fkey="${esc(key)}-take"`, "Take over")}${btn(`data-open="${esc(open)}"`, "Details", "quiet")}</div>` });
+      ${actionBlock(key, (DISPATCH ? btn(`data-act="retry" data-card="${esc(c)}" data-key="${esc(key)}" data-primary data-fkey="${esc(key)}-retry"`, "Retry", "primary") : "") + btn(`data-act="takeover" data-card="${esc(c)}" data-key="${esc(key)}" data-fkey="${esc(key)}-take"`, "Take over") + btn(`data-open="${esc(open)}"`, "Details", "quiet"))}` });
   });
-  s.blockers.filter((b) => b.cards.length).forEach((b, i) => {
-    const key = `blocker:${i}:${b.cards.join(",")}`;
+  s.blockers.filter((b) => b.cards.length).forEach((b) => {
+    const key = `blocker:${b.text}`;  // by its text, the way it is resolved: a pending Resolved survives another blocker going away
     items.push({ key, card: b.cards[0], kind: "Blocked", c: "--block", body: `
       <div class="what">${b.cards.map((c) => `<span class="mono">${esc(c)}</span> ${rich(s.cards[c]?.title || "")}`).join(", ")}</div>
       <div class="note">${rich(b.text)}</div>
       <div class="note">${a.used ? "Fix the cause, then mark it resolved: the card carries on by itself." : "Fix the cause, then mark it resolved."}</div>
-      <div class="actions">${btn(`data-act="resolve-blocker" data-text="${esc(b.text)}" data-primary data-fkey="${esc(key)}-ok"`, "Resolved", "primary")}${btn(`data-open="${esc(b.cards[0])}"`, "Details", "quiet")}</div>` });
+      ${actionBlock(key, btn(`data-act="resolve-blocker" data-text="${esc(b.text)}" data-key="${esc(key)}" data-primary data-fkey="${esc(key)}-ok"`, "Resolved", "primary") + btn(`data-open="${esc(b.cards[0])}"`, "Details", "quiet"))}` });
   });
   Object.entries(a.blocked_on || {}).filter(([c]) => !s.blockers.some((b) => unitCards(s, c).some((m) => b.cards.includes(m))) && !(a.queued || []).includes(c)
       && !a.live.includes(c) && !batchById(s, c)?.live && !a.attention[c]).forEach(([c]) => {
@@ -786,7 +794,7 @@ function inboxItems(s) {
     items.push({ key, card: open, kind: "Blocked", c: "--block", body: `
       <div class="what"><span class="mono">${esc(c)}</span> ${rich(b ? b.name : s.cards[c]?.title || "")}</div>
       <div class="note">Its session stopped on a blocker that names no card. When the cause is fixed, let it carry on.</div>
-      <div class="actions">${btn(`data-act="unblock" data-card="${esc(c)}" data-primary data-fkey="${esc(key)}-go"`, "Unblock and continue", "primary")}${btn(`data-open="${esc(open)}"`, "Details", "quiet")}</div>` });
+      ${actionBlock(key, btn(`data-act="unblock" data-card="${esc(c)}" data-key="${esc(key)}" data-primary data-fkey="${esc(key)}-go"`, "Unblock and continue", "primary") + btn(`data-open="${esc(open)}"`, "Details", "quiet"))}` });
   });
   s.yours.forEach((c) => {
     const key = `yours:${c}`;
@@ -800,12 +808,15 @@ function inboxItems(s) {
 
 function headsUp(s) {
   const a = s.autopilot, out = [];
-  s.blockers.filter((b) => !b.cards.length).forEach((b) => out.push(`Blocker: ${rich(b.text)} <button type="button" class="link" data-act="resolve-blocker" data-text="${esc(b.text)}">Resolved</button>`));
+  s.blockers.filter((b) => !b.cards.length).forEach((b) => {
+    const key = `blocker:${b.text}`;
+    out.push(`Blocker: ${rich(b.text)} ${pending[key] ? pendingBlock(key) : `<button type="button" class="link" data-act="resolve-blocker" data-text="${esc(b.text)}" data-key="${esc(key)}" data-fkey="${esc(key)}-ok">Resolved</button>`}`);
+  });
   s.stalled.forEach((x) => out.push(`<b>${esc(x.card)}</b> is doing but quiet for ${esc(x.quiet.replace(/ ago$/, ""))}: check its session.`));
   if (s.lopsided) out.push(`Balance: ${rich(s.lopsided.replace(/^./, (c) => c.toUpperCase()))}.`);
   (s.unbatched || []).forEach((u) => out.push(`Batching: ${rich(u.text)}.`));
   if (a.used && a.unkinded?.length) out.push(`No kind on ${a.unkinded.map(esc).join(", ")}: the autopilot starts only cards whose meta line says <code>kind backend</code>, <code>frontend</code>, <code>fullstack</code> or <code>owner</code>.`);
-  if (s.lock && s.lock.toLowerCase() !== "free") out.push(`Deploy lock: ${rich(s.lock)}`);
+  if (!lockFree(s)) out.push(`Deploy lock: ${rich(s.lock || "held")}`);
   return out;
 }
 
@@ -913,7 +924,7 @@ function renderSessions(s) {
     $("#next").innerHTML = `<div class="empty">Nothing is ready${s.doing.length ? `; waiting for ${s.doing.map(esc).join(", ")}` : ""}.</div>`;
     return;
   }
-  const startOrCopy = (id, line) => DISPATCH && a.dispatcher ? `<button type="button" data-act="start" data-card="${esc(id)}" data-fkey="start-${esc(id)}">Start now</button>`
+  const startOrCopy = (id, line) => DISPATCH && a.dispatcher ? pendingBlock(`start:${id}`) || `<button type="button" data-act="start" data-card="${esc(id)}" data-key="start:${esc(id)}" data-fkey="start-${esc(id)}">Start now</button>`
     : line ? `<button type="button" data-copy="${esc(line)}" data-label="Copy line">Copy line</button>` : "";
   const queuedTag = `<span class="tag p">queued${a.settings.auto ? "" : " · resume to start"}</span>`;
   $("#next").innerHTML = readyIds.map((id) => {
@@ -935,7 +946,7 @@ function renderSessions(s) {
 
 /* ---------- live sessions: polled every 2 s, updated in place ---------- */
 
-const live = {}, tx = { card: null, seq: 0, el: null, follow: true, tools: {} };
+const live = {}, tx = { card: null, seq: 0, el: null, follow: true, tools: {}, busy: null };
 let skew = 0;
 const ago = (sec) => sec < 60 ? `${Math.round(sec)}s` : sec < 3600 ? `${Math.floor(sec / 60)}m ${String(Math.round(sec % 60)).padStart(2, "0")}s` : `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
 const short = (text) => String(text || "").replace(/(?:\/[^\s/]+){3,}\/([^\s/]+\/[^\s/]+)/g, "…/$1");
@@ -959,12 +970,13 @@ function liveBody(id) {
 
 async function pollLive() {
   if (!state) return;
-  const ids = state.autopilot.live.filter(() => view === "now");
+  const ids = state.autopilot.live.filter(() => view === "now"), f = feature;
   await Promise.all(ids.map(async (id) => {
     try {
-      const r = await fetch(`/api/live?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}&events=0`, { cache: "no-store" });
+      const r = await fetch(`/api/live?f=${encodeURIComponent(f)}&card=${encodeURIComponent(id)}&events=0`, { cache: "no-store" });
       if (!r.ok) return;
       const v = await r.json();
+      if (f !== feature) return;
       skew = v.now_ts - Date.now() / 1000;
       const was = live[id];
       live[id] = v;
@@ -993,10 +1005,11 @@ function mountTranscript(id) {
     tx.el = document.createElement("div");
     tx.el.innerHTML = `<div class="todos-holder"></div><div class="tx" tabindex="0" aria-label="Session transcript" aria-live="off"><div class="empty">Loading…</div></div>
       <div class="tx-foot"><span class="tx-status"></span><button type="button" class="quiet" data-tx-latest hidden>Jump to latest</button></div>`;
-    const box = tx.el.querySelector(".tx");
+    const holder = tx.el, box = holder.querySelector(".tx");
     box.addEventListener("scroll", () => {
+      if (tx.el !== holder) return;  // a closed drawer's transcript
       tx.follow = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-      tx.el.querySelector("[data-tx-latest]").hidden = tx.follow;
+      holder.querySelector("[data-tx-latest]").hidden = tx.follow;
     });
     pullTranscript();
   }
@@ -1032,22 +1045,28 @@ function txEvent(e) {
 }
 
 async function pullTranscript() {
-  const id = tx.card;
-  if (!id || !tx.el) return;
+  const id = tx.card, holder = tx.el;
+  // one pull at a time per transcript: two in flight both ask from the same seq and append it twice
+  if (!id || !holder || tx.busy === holder) return;
+  tx.busy = holder;
   try {
-    const r = await fetch(`/api/live?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}&after=${tx.seq}`, { cache: "no-store" });
-    if (!r.ok || tx.card !== id) return;
+    const r = await fetch(`/api/live?f=${encodeURIComponent(feature)}&card=${encodeURIComponent(id)}&after=${tx.seq}`, { cache: "no-store", signal: deadline(15000) });
+    if (!r.ok || tx.el !== holder) return;
     const v = await r.json();
-    const box = tx.el.querySelector(".tx");
+    if (tx.el !== holder) return;
+    const box = holder.querySelector(".tx");
     if (tx.seq === 0) box.innerHTML = v.dropped ? `<div class="tx-e note">${v.dropped} earlier events not shown.</div>` : "";
-    v.events.forEach((e) => { const el = txEvent(e); if (el) box.appendChild(el); });
+    const fresh = v.events.filter((e) => e.seq > tx.seq);  // never show an event twice
+    fresh.forEach((e) => { const el = txEvent(e); if (el) box.appendChild(el); });
     if (!box.children.length) box.innerHTML = '<div class="empty">Nothing yet.</div>';
-    if (v.events.length) tx.seq = v.events[v.events.length - 1].seq;
+    if (fresh.length) tx.seq = fresh[fresh.length - 1].seq;
     if (tx.follow) box.scrollTop = box.scrollHeight;
     const todos = v.todos || [];
-    tx.el.querySelector(".todos-holder").innerHTML = todos.length ? `<ul class="todos-full" aria-label="The session's to-do list">${todos.map((t) => `<li class="${esc(t.status)}"><i></i><span>${esc(t.status === "in_progress" && t.doing ? t.doing : t.text)}</span></li>`).join("")}</ul>` : "";
-    tx.el.querySelector(".tx-status").textContent = v.run?.live ? `${v.tools} tool calls · context ${kTokens(v.context)} · following live` : v.final ? `Ended · $${v.final.cost.toFixed(2)}` : "";
-  } catch { /* retried on the next poll */ }
+    holder.querySelector(".todos-holder").innerHTML = todos.length ? `<ul class="todos-full" aria-label="The session's to-do list">${todos.map((t) => `<li class="${esc(t.status)}"><i></i><span>${esc(t.status === "in_progress" && t.doing ? t.doing : t.text)}</span></li>`).join("")}</ul>` : "";
+    holder.querySelector(".tx-status").textContent = v.run?.live ? `${v.tools} tool calls · context ${kTokens(v.context)} · following live` : v.final ? `Ended · $${v.final.cost.toFixed(2)}` : "";
+  } catch { /* retried on the next poll */ } finally {
+    if (tx.busy === holder) tx.busy = null;
+  }
 }
 
 /* ---------- board, map, screens, drift, feed ---------- */
@@ -1198,9 +1217,12 @@ async function openDrawer(id, fresh = true) {
   const approvals = s.approvals.filter((x) => x.card === id);
   if (run) wantLog(s, runId);
   const gate = s.gates.includes(id), pairs = gate ? stageShots(s, id) : (s.screens?.[id] ? [[id, s.screens[id]]] : []);
-  const sessionActions = run ? (run.live ? `<button type="button" class="danger" data-act="stop" data-card="${esc(id)}">Stop session</button>`
-    : manual ? `<button type="button" data-copy="claude --resume ${esc(run.session)}" data-label="Copy resume command">Copy resume command</button>${DISPATCH && !done ? `<button type="button" data-act="retry" data-card="${esc(id)}">Hand back to autopilot</button>` : ""}`
-    : done ? "" : `${DISPATCH && (cat === "blocked" || (a.blocked_on || {})[id] || (ob && (a.blocked_on || {})[ob.id])) ? `<button type="button" data-act="unblock" data-card="${esc(id)}">Unblock and continue</button>` : ""}${DISPATCH ? `<button type="button" data-act="retry" data-card="${esc(id)}">Retry</button>` : ""}<button type="button" data-act="takeover" data-card="${esc(id)}">Take over</button>`) : "";
+  // the same undo key as the card's inbox item when it has one, so a pending action shows in both places
+  const unitIn = (m) => m[id] ? id : ob && m[ob.id] ? ob.id : null, stuckU = unitIn(a.attention), heldU = unitIn(a.blocked_on || {});
+  const sKey = stuckU ? `stuck:${stuckU}` : heldU ? `unblock:${heldU}` : `session:${id}`, sk = `data-card="${esc(id)}" data-key="${esc(sKey)}"`;
+  const sessionActions = run ? (run.live ? `<button type="button" class="danger" data-act="stop" ${sk}>Stop session</button>`
+    : manual ? `<button type="button" data-copy="claude --resume ${esc(run.session)}" data-label="Copy resume command">Copy resume command</button>${DISPATCH && !done ? `<button type="button" data-act="retry" data-say="Handing ${esc(id)} back to the autopilot" ${sk}>Hand back to autopilot</button>` : ""}`
+    : done ? "" : `${DISPATCH && (cat === "blocked" || (a.blocked_on || {})[id] || (ob && (a.blocked_on || {})[ob.id])) ? `<button type="button" data-act="unblock" ${sk}>Unblock and continue</button>` : ""}${DISPATCH ? `<button type="button" data-act="retry" ${sk}>Retry</button>` : ""}<button type="button" data-act="takeover" ${sk}>Take over</button>`) : "";
   const note = cat !== "done" && cat !== "waived" ? why(s, id) : "";
   const drawer = $("#drawer"), focused = drawer.contains(document.activeElement) ? document.activeElement : null;
   const focusKey = focused ? (focused.id || focused.dataset.fkey || "") : "";
@@ -1219,7 +1241,7 @@ async function openDrawer(id, fresh = true) {
       ${done ? handoffBlock : ""}
       ${run ? `<dt>Sessions${run.batch ? ` (batch ${esc(run.batch)})` : ""}</dt><dd>${run.sessions} · $${run.cost.toFixed(2)} · ${run.live ? "running now" : `last ended ${esc(run.ended)}`}${run.error ? `<div class="note">${rich(run.error)}</div>` : ""}
         ${manual ? `<div class="note">You took this card over; the autopilot leaves it alone.</div>` : ""}
-        ${sessionActions ? `<div class="actions">${sessionActions}</div>` : ""}</dd><dt>${run.live ? "Live transcript" : "Transcript"}</dt><dd><div id="tx-slot"></div></dd>` : ""}
+        ${sessionActions || pending[sKey] ? actionBlock(sKey, sessionActions) : ""}</dd><dt>${run.live ? "Live transcript" : "Transcript"}</dt><dd><div id="tx-slot"></div></dd>` : ""}
       ${inBatch ? `<dt>Batch</dt><dd><span class="mono">${esc(inBatch.id)}</span> ${rich(inBatch.name)} · ${progress(inBatch)} finished${inBatch.effort ? ` · effort ${esc(inBatch.effort)}` : ""}<br>${inBatch.cards.map((x) => x === id ? `<span class="mono">${esc(x)}</span> <span class="hint">this card</span>` : link(x)).join("<br>")}${ob ? `<div class="note">One session runs these cards in order; start the batch, not the card.</div>` : ""}</dd>` : ""}
       ${ob && ob.start_with ? `<dt>Start with (batch ${esc(ob.id)})</dt><dd><div class="paste"><code>${esc(ob.start_with)}</code><button type="button" data-copy="${esc(ob.start_with)}" data-label="Copy">Copy</button></div></dd>`
         : !ob && !done && c.start_with ? `<dt>Start with</dt><dd><div class="paste"><code>${esc(c.start_with)}</code><button type="button" data-copy="${esc(c.start_with)}" data-label="Copy">Copy</button></div></dd>` : ""}
@@ -1276,28 +1298,36 @@ function toast(text, bad) {
   toastTimer = setTimeout(() => (el.className = "toast"), bad ? 6000 : 2500);
 }
 
-async function act(action, data, button) {
+async function act(action, data, button, f = feature) {
   if (button) button.disabled = true;
   try {
     const r = await fetch("/api/act", { method: "POST", cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Supervisor-Token": TOKEN },
-      body: JSON.stringify({ f: feature, action, ...data }) });
+      body: JSON.stringify({ f, action, ...data }) });
     const text = await r.text();
     toast(text, !r.ok);
-    if (r.ok) log(`You: ${text}`);
+    if (r.ok && f === feature) log(`You: ${text}`);  // the feed on screen is this feature's
+    else if (!r.ok) rerenderPending();  // refused: bring the buttons back in place of the spent countdown
   } catch {
     toast("Could not reach supervisor.py", true);
+    rerenderPending();
   }
   if (button) button.disabled = false;
   stateText = "";
-  tick();
+  tick(true);
 }
 
-function rerenderPending() { if (state) { renderInbox(state); if (!$("#drawer").hidden && selected) openDrawer(selected, false); } }
+function rerenderPending() { if (state) { renderInbox(state); renderSessions(state); if (!$("#drawer").hidden && selected) openDrawer(selected, false); } }
 function schedule(key, action, data, label) {
-  pending[key] = { action, data, label, until: Date.now() + UNDO_MS, timer: setTimeout(() => commit(key), UNDO_MS) };
+  if (pending[key]) clearTimeout(pending[key].timer);
+  pending[key] = { action, data, label, f: feature, until: Date.now() + UNDO_MS, timer: setTimeout(() => commit(key), UNDO_MS) };
   rerenderPending();
-  document.querySelector(`[data-undo="${CSS.escape(key)}"]`)?.focus();
+  focusFirst(`[data-undo="${CSS.escape(key)}"]`);
+}
+// the open drawer is a dialog: focus stays in it when the inbox shows the same key behind it
+function focusFirst(...selectors) {
+  const drawer = $("#drawer"), scopes = drawer.hidden ? [document] : [drawer, document];
+  for (const scope of scopes) for (const sel of selectors) { const el = scope.querySelector(sel); if (el) return el.focus(); }
 }
 function commit(key) {
   const p = pending[key];
@@ -1305,7 +1335,7 @@ function commit(key) {
   document.querySelector(`[data-item="${CSS.escape(key)}"]`)?.classList.add("leaving");
   clearTimeout(p.timer);
   delete pending[key];
-  act(p.action, p.data);
+  act(p.action, p.data, null, p.f);
 }
 function undo(key) {
   const p = pending[key];
@@ -1314,16 +1344,18 @@ function undo(key) {
   delete pending[key];
   toast(`Undone: ${p.label.charAt(0).toLowerCase() + p.label.slice(1)}`);
   rerenderPending();
-  document.querySelector(`[data-item="${CSS.escape(key)}"] [data-primary]`)?.focus();
+  const k = CSS.escape(key);
+  focusFirst(`[data-item="${k}"] [data-primary]`, `[data-key="${k}"]`);
 }
-function flushPending(beacon) {
-  Object.keys(pending).forEach((key) => {
-    const p = pending[key];
-    clearTimeout(p.timer);
-    delete pending[key];
-    if (beacon) fetch("/api/act", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json", "X-Supervisor-Token": TOKEN }, body: JSON.stringify({ f: feature, action: p.action, ...p.data }) });
-    else act(p.action, p.data);
-  });
+// switching features sends what waits now, to the feature it was meant for: the switch is the owner's own move
+function flushPending() {
+  Object.keys(pending).forEach(commit);
+}
+// leaving the page takes back what waits: sent unseen, a refusal could not be shown and Undo could not be
+// pressed, so the undo window would be a lie. beforeunload asks first, so nothing is dropped by surprise.
+function dropPending() {
+  Object.keys(pending).forEach((key) => { clearTimeout(pending[key].timer); delete pending[key]; });
+  rerenderPending();  // a page kept in the back/forward cache comes back without stale countdowns
 }
 setInterval(() => document.querySelectorAll("[data-countdown]").forEach((el) => {
   const p = pending[el.dataset.countdown];
@@ -1343,7 +1375,11 @@ function runAction(el) {
     return schedule(d.key, "decision", { n: d.n, answer }, `Answering decision ${d.n}: ${answer}`);
   }
   if (d.act === "owner-done") return schedule(d.key, "owner-done", { card: d.card }, `Marking ${d.card} done`);
-  if (d.act === "resolve-blocker") return act("resolve-blocker", { text: d.text }, el);
+  if (d.act === "resolve-blocker") return schedule(d.key, "resolve-blocker", { text: d.text }, "Marking the blocker resolved");
+  // what starts, stops or hands over a session waits UNDO_MS too, so a slip can be taken back
+  const verb = { stop: `Stopping ${d.card}'s session`, retry: `Retrying ${d.card}`, start: `Starting ${d.card}`,
+    takeover: `Taking over ${d.card}`, unblock: `Unblocking ${d.card}` }[d.act];
+  if (verb) return schedule(d.key || `session:${d.card}`, d.act, { card: d.card }, d.say || verb);
   if (d.act === "gate-off") { confirming = null; return act("settings", { gate_checkpoints: false }, el); }
   if (d.act === "chrome-on") { confirming = null; return act("settings", { chrome: true }, el); }
   const data = {};
@@ -1389,19 +1425,31 @@ function setLive(ok) {
   $("#banner").hidden = ok || !state;
 }
 
-async function tick() {
+// one poll at a time, and only the newest answer for the feature on screen counts: a slow answer that lands
+// after a feature switch or a newer poll would put the wrong cards and decisions under the buttons.
+// force (after an action, on a switch) starts a poll that supersedes the one in flight.
+let tickSeq = 0, ticking = 0;
+async function tick(force) {
+  if (ticking && !force) return;
+  const seq = ++tickSeq, f = feature, stale = () => seq !== tickSeq || f !== feature;
+  let got = false;
+  ticking = seq;
   try {
-    const r = await fetch(`/api/state?f=${encodeURIComponent(feature)}`, { cache: "no-store" });
+    const r = await fetch(`/api/state?f=${encodeURIComponent(f)}`, { cache: "no-store", signal: deadline(15000) });
     if (!r.ok) throw new Error(r.status);
     const text = await r.text();
+    if (stale()) return;
+    got = true;
     setLive(true);
     const s = JSON.parse(text);
     const key = (x) => JSON.stringify({ ...x, checked_at: 0, now: 0, last_handoff: 0, recent_handoffs: 0, stalled: x.stalled.map((y) => y.card), autopilot: { ...x.autopilot, beat: 0 } });
-    if (!state || key(s) !== stateText) {
+    const k = key(s);
+    if (!state || k !== stateText) {
       const old = state;
       if (old) diff(old, s);
-      state = s; stateText = key(s);
+      state = s; stateText = "";
       render(s);
+      stateText = k;  // only once drawn: a render that throws is tried again on the next poll
       if (old) celebrate(Object.keys(s.cards).filter((id) => finished(s, id) && old.cards[id] && !finished(old, id)),
                          s.ready.filter((id) => !old.ready.includes(id)));
     } else {
@@ -1410,8 +1458,12 @@ async function tick() {
       const status = apStatus(s);
       if ($("#ap-status").innerHTML !== status) $("#ap-status").innerHTML = status;
     }
-  } catch {
+  } catch (error) {
+    if (stale()) return;
+    if (got) console.error(error);  // the server answered: the page failed to draw it
     setLive(false);
+  } finally {
+    if (ticking === seq) ticking = 0;
   }
 }
 
@@ -1502,7 +1554,7 @@ document.addEventListener("keydown", (e) => {
     items[next].scrollIntoView({ block: "nearest" });
   } else if (e.key === "a" && current) {
     e.preventDefault();
-    current.querySelector("[data-primary]")?.click();
+    current.querySelector("[data-primary]")?.click();  // every primary waits in the undo window (runAction)
   } else if (e.key === "Enter" && current === e.target && current.dataset.cardOf) {
     e.preventDefault();
     select(current.dataset.cardOf);
@@ -1510,15 +1562,16 @@ document.addEventListener("keydown", (e) => {
 });
 
 $("#picker").addEventListener("change", (e) => {
-  flushPending(false);
+  flushPending();
   feature = e.target.value;
   history.replaceState(null, "", `?f=${encodeURIComponent(feature)}#${view}`);
   state = null; stateText = ""; selected = null; showAllDone = false; confirming = null;
-  Object.keys(logs).forEach((k) => delete logs[k]);
+  [logs, live].forEach((m) => Object.keys(m).forEach((k) => delete m[k]));
   seenItems = null;
-  closeDrawer(); loadFeed(); renderFeed(); tick();
+  closeDrawer(); loadFeed(); renderFeed(); tick(true);
 });
-window.addEventListener("pagehide", () => flushPending(true));
+window.addEventListener("beforeunload", (e) => { if (Object.keys(pending).length) { e.preventDefault(); e.returnValue = "Leaving drops what waits in the undo window."; } });
+window.addEventListener("pagehide", dropPending);
 
 function setThemeIcon() {
   const root = document.documentElement;
