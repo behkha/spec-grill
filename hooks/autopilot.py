@@ -385,10 +385,32 @@ def trusted(tasks: str, cfg: dict | None = None, s: dict | None = None) -> dict:
 
 
 def amount(value, zero_is_none: bool = False) -> float | None:
-    """A budget or count as a number (a total budget of 0 means none: infinite); None when it is not one."""
+    """A budget or count as a number (a total budget of 0 means none: infinite); None when it is not one,
+    or is an integer too large for a float (10**400)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
         return None
-    return float("inf") if zero_is_none and value == 0 else float(value)
+    try:
+        return float("inf") if zero_is_none and value == 0 else float(value)
+    except OverflowError:
+        return None
+
+
+def setting(cfg: dict, key: str) -> float:
+    """A numeric setting the dispatcher can compute with: its default when the file holds something else
+    (forbidden() pauses the autopilot over that; the stop checks still run meanwhile)."""
+    found = amount(cfg.get(key))
+    return found if found is not None else float(sv.SETTINGS[key])
+
+
+def whole_number(key: str, value, low: int) -> int:
+    """A whole-number setting from the dashboard, at least low. Refused when it is not one, or is too large
+    for a float to hold (10**400 would break every later comparison with a count or a budget)."""
+    try:
+        number = max(low, int(value))
+        float(number)
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(inf), float(10**400)
+        raise Refused(f"{key} must be a whole number") from None
+    return number
 
 
 def forbidden(cfg: dict) -> str:
@@ -1297,7 +1319,8 @@ def step(tasks: str) -> list:
             if run.get("kill_sent_ts"):
                 continue  # stopped already: SIGKILL follows below if it lingers
             view = live_view(tasks, run["card"], events=False)
-            if view.get("final") and view.get("last_output_ts") and now - view["last_output_ts"] > cfg["result_grace_s"]:
+            if (view.get("final") and view.get("last_output_ts")
+                    and now - view["last_output_ts"] > setting(cfg, "result_grace_s")):
                 if kill(run):
                     events.append(f"{run_unit(run)}: its session gave its result but did not exit; stopped it")
 
@@ -1306,10 +1329,10 @@ def step(tasks: str) -> list:
             path = os.path.join(state_dir(tasks), run["log"])
             quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
             started = dt.datetime.strptime(run["started"], "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc)
-            long = now - started.timestamp() > cfg["max_run_hours"] * 3600
-            if ((quiet > cfg["quiet_minutes"] * 60 or long) and run_unit(run) not in reg["attention"]
+            long = now - started.timestamp() > setting(cfg, "max_run_hours") * 3600
+            if ((quiet > setting(cfg, "quiet_minutes") * 60 or long) and run_unit(run) not in reg["attention"]
                     and not run.get("kill_sent_ts")):
-                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {cfg['max_run_hours']} h"
+                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {setting(cfg, 'max_run_hours'):g} h"
                 kill(run)
                 run["free_on_end"] = True  # its cards leave `doing` once it has ended (it may linger)
                 reg["attention"][run_unit(run)] = f"its session was stopped ({why}); see `state/{run['log']}`"
@@ -1747,10 +1770,7 @@ def act(tasks: str, action: str, data: dict) -> str:
                     changes[key] = bool(data[key])
             for key, low in (("max_parallel", 1), ("budget_per_card_usd", 1), ("budget_total_usd", 0)):
                 if key in data:
-                    try:
-                        changes[key] = max(low, int(data[key]))
-                    except (TypeError, ValueError):
-                        raise Refused(f"{key} must be a whole number") from None
+                    changes[key] = whole_number(key, data[key], low)
             if changes.get("auto"):
                 changes["paused_reason"] = ""
                 problem = confirm(tasks, s, cfg) if holds(tasks) else ""  # Resume here: the owner's yes to what it showed

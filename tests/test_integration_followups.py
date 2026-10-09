@@ -257,5 +257,51 @@ class Leftovers(Scratch):
         self.assertNotIn("leftovers_ts", reg["runs"][0])
 
 
+class HugeNumbers(Scratch):
+    """Item 5a: a number too large for a float, or none at all, is refused or paused on, never a crash."""
+
+    def test_the_dashboard_cannot_save_a_number_a_float_cannot_hold(self):
+        for value in (10 ** 400, float("inf"), float("-inf"), float("nan"), "9" * 400, [], None, "12x"):
+            with self.subTest(value=repr(value)[:20]):
+                with self.assertRaises(autopilot.Refused) as caught:
+                    autopilot.act(self.tasks, "settings", {"max_parallel": value})
+                self.assertEqual(str(caught.exception), "max_parallel must be a whole number")
+        self.assertEqual(autopilot.act(self.tasks, "settings", {"max_parallel": "4", "budget_total_usd": 1e300}),
+                         "settings saved")
+        self.assertEqual(autopilot.settings(self.tasks)["max_parallel"], 4)
+
+    def test_a_huge_or_non_numeric_setting_in_the_file_pauses_the_autopilot(self):
+        self.assertIsNone(autopilot.amount(10 ** 400))
+        path = os.path.join(autopilot.state_dir(self.tasks), "autopilot.json")
+        for key, value in (("max_parallel", 10 ** 400), ("quiet_minutes", "forty"), ("max_run_hours", None)):
+            with self.subTest(key=key):
+                autopilot.change_settings(self.tasks, auto=True, paused_reason="")
+                with open(path) as handle:
+                    cfg = json.load(handle)
+                with open(path, "w") as handle:  # by hand, or by a session
+                    json.dump({**cfg, key: value}, handle)
+                events = autopilot.step(self.tasks)  # no exception: the stop checks use the default meanwhile
+                said = autopilot.settings(self.tasks)
+                self.assertFalse(said["auto"])
+                self.assertIn(f"sets {key} to", said["paused_reason"])
+                self.assertTrue(any("autopilot paused" in e for e in events), events)
+                with open(path, "w") as handle:
+                    json.dump(cfg, handle)
+        self.settle()
+
+    def test_the_stop_checks_of_a_live_session_survive_a_broken_setting(self):
+        self.script_for({"T001": ["sleep"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        path = os.path.join(autopilot.state_dir(self.tasks), "autopilot.json")
+        with open(path) as handle:
+            cfg = json.load(handle)
+        with open(path, "w") as handle:
+            json.dump({**cfg, "quiet_minutes": "forty", "max_run_hours": 10 ** 400, "result_grace_s": []}, handle)
+        autopilot.step(self.tasks)  # no TypeError or OverflowError from the silence and run-time checks
+        self.assertFalse(autopilot.settings(self.tasks)["auto"])
+        self.assertEqual(len(autopilot.live(autopilot.registry(self.tasks))), 1, "the session runs on")
+
+
 if __name__ == "__main__":
     unittest.main()
