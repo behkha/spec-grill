@@ -1269,9 +1269,18 @@ def registry_of(found) -> dict:
             run["slot"] = max(0, int(number(run["slot"])))
         runs.append(run)
     reg["runs"] = runs
-    for key in ("account", "chrome_check"):  # read with .get(): an object, or nothing
-        if key in reg and not isinstance(reg[key], dict):
+    for key in ("account", "chrome_check"):  # the account and Chrome checks: an object, or nothing
+        found = reg.get(key)
+        if key in reg and not isinstance(found, dict):
             reg[key] = None
+        elif isinstance(found, dict):  # their times as numbers, their words as text, the kept names as a list
+            if "ts" in found:
+                found["ts"] = number(found["ts"])
+            for field in ("launcher", "email", "error", "detail", "url", "final_url", "account"):
+                if field in found and not isinstance(found[field], str):
+                    found[field] = "" if found[field] is None else str(found[field])
+            if "keep_env" in found and not isinstance(found["keep_env"], list):
+                found["keep_env"] = []
     return reg
 
 
@@ -2496,7 +2505,7 @@ def save(path: str, data, backup: bool = False) -> None:
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=1, ensure_ascii=False)
+            json.dump(data, handle, indent=1)  # ASCII: a lone surrogate in a session's text still writes
             handle.flush()
             os.fsync(handle.fileno())
         if backup:

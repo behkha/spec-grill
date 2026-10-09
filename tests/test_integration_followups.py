@@ -615,6 +615,28 @@ class ReviewFixesGiveUps(Scratch):
         autopilot.set_row(self.state(), "status", {"card": cid}, {"status": status})
 
 
+class ReviewFixesState(Scratch):
+    """The code review: the account and Chrome checks in runs.json, and text no UTF-8 file can hold."""
+
+    def test_odd_account_and_chrome_check_entries_never_crash_a_pass(self):
+        with open(os.path.join(autopilot.state_dir(self.tasks), "runs.json"), "w") as handle:
+            json.dump({"runs": [], "account": {"ts": "x", "launcher": "claude", "email": 5, "keep_env": "x"},
+                       "chrome_check": {"running": True, "ts": "x", "detail": None}}, handle)
+        reg = autopilot.registry(self.tasks)
+        self.assertEqual((reg["account"]["ts"], reg["account"]["email"], reg["account"]["keep_env"]), (0.0, "5", []))
+        self.assertEqual((reg["chrome_check"]["ts"], reg["chrome_check"]["detail"]), (0.0, ""))
+        self.assertFalse(autopilot.chrome_checking(reg["chrome_check"]), "a check from 1970 is no check under way")
+        autopilot.change_settings(self.tasks, chrome=True)
+        autopilot.step(self.tasks)  # no TypeError from the cached account's time or the check's
+        self.assertIsInstance(autopilot.registry(self.tasks)["account"]["ts"], float)
+
+    def test_a_lone_surrogate_in_a_sessions_words_is_still_saved(self):
+        reg = autopilot.registry(self.tasks)
+        reg["runs"].append({"card": "T001", "session": "s", "ended": "x", "result": json.loads('"broken \\ud83d"')})
+        autopilot.save_registry(self.tasks, reg)  # no UnicodeEncodeError: the dispatcher can go on
+        self.assertEqual(autopilot.registry(self.tasks)["runs"][0]["result"], "broken \ud83d")
+
+
 def doc(name: str) -> str:
     with open(os.path.join(HERE, "..", name), encoding="utf-8") as handle:
         return re.sub(r"\s+", " ", handle.read())
