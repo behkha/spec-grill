@@ -3,6 +3,8 @@
     python3 -m unittest discover -s tests -v
 """
 
+from __future__ import annotations  # `X | None` annotations on Python 3.9
+
 import json
 import os
 import re
@@ -1588,8 +1590,10 @@ class Server(unittest.TestCase):
         proc = subprocess.Popen([sys.executable, os.path.join(HERE, "..", "hooks", "supervisor.py"), tasks,
                                  "--serve", "--port", "18765"], stdout=subprocess.PIPE, text=True)
         try:
-            url = re.search(r"http://\S+/", proc.stdout.readline()).group(0)
-            page = urllib.request.urlopen(url).read().decode()
+            link = re.search(r"http://\S+", proc.stdout.readline()).group(0)  # it carries this launch's key
+            url = link.split("?", 1)[0]
+            browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+            page = browser.open(link).read().decode()
             token = re.search(r'name="supervisor-token" content="([^"]+)"', page).group(1)
             body = json.dumps({"f": "001-demo", "action": "decision", "n": "1", "answer": "Stripe"}).encode()
 
@@ -1604,7 +1608,7 @@ class Server(unittest.TestCase):
             self.assertEqual(post({}), 403)
             self.assertEqual(post({"X-Supervisor-Token": token, "Origin": "https://evil.example"}), 403)
             self.assertEqual(post({"X-Supervisor-Token": token}), 200)
-            headers = urllib.request.urlopen(url).headers
+            headers = browser.open(url).headers
             self.assertEqual(headers["X-Frame-Options"], "DENY")
             self.assertFalse(os.path.exists(os.path.join(folder, "state", "autopilot.json")),
                              "answering a decision does not switch the feature onto the autopilot")
