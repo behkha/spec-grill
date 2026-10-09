@@ -541,23 +541,45 @@ class ReviewFixesLogsAndGroups(Scratch):
         with open(os.path.join(logs, "T001-1.jsonl")) as handle:
             self.assertIn('"lost"', handle.read(), "the lost session's log is kept")
 
-    def test_a_run_from_another_dispatcher_with_an_old_log_is_not_signalled(self):
+    def test_only_a_run_seen_alive_lately_has_its_group_signalled(self):
         gone = subprocess.Popen(["true"])
         gone.wait()
         logs = os.path.join(autopilot.state_dir(self.tasks), "runs")
         os.makedirs(logs)
-        log = os.path.join(logs, "T001-1.jsonl")
-        open(log, "w").close()
-        for age, signalled in ((autopilot.GROUP_STALE + 60, False), (5, True)):
-            with self.subTest(age=age):
-                os.utime(log, (time.time() - age, time.time() - age))
+        open(os.path.join(logs, "T001-1.jsonl"), "w").close()  # a log that just moved says nothing about the pid
+        now = time.time()
+        for seen, killed, signalled in ((None, None, False), (now - autopilot.GROUP_STALE - 60, None, False),
+                                        (now - 5, None, True), (None, now - 5, True)):
+            with self.subTest(seen=seen, killed=killed):
                 reg = autopilot.registry(self.tasks)
-                reg["runs"] = [{"card": "T001", "session": "old", "pid": gone.pid, "log": "runs/T001-1.jsonl",
-                                "started": "2026-01-01 00:00Z", "ended": ""}]
+                run = {"card": "T001", "session": "old", "pid": gone.pid, "log": "runs/T001-1.jsonl",
+                       "started": "2026-01-01 00:00Z", "ended": ""}
+                run.update({k: v for k, v in (("seen_ts", seen), ("kill_sent_ts", killed)) if v})
+                reg["runs"] = [run]
                 sv.registry_of(reg)  # as registry() reads it
                 with mock.patch.object(autopilot, "signal_leftovers", return_value=False) as signal_it:
                     autopilot.reap(self.tasks, reg)
                 self.assertEqual(signal_it.called, signalled)
+
+    def test_a_live_run_is_marked_seen_on_each_pass(self):
+        self.script_for({"T001": ["sleep"]})
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        autopilot.step(self.tasks)
+        self.assertGreater(self.runs()[0]["seen_ts"], time.time() - 30)
+
+    def test_an_unnamed_log_older_than_the_backup_is_no_news(self):
+        logs = os.path.join(autopilot.state_dir(self.tasks), "runs")
+        os.makedirs(logs)
+        old = os.path.join(logs, "T003-2.jsonl")
+        open(old, "w").close()
+        os.utime(old, (time.time() - 86400, time.time() - 86400))
+        reg = autopilot.registry(self.tasks)
+        autopilot.save_registry(self.tasks, reg)
+        autopilot.save_registry(self.tasks, reg)  # now there is a runs.json.bak, written today
+        self.assertEqual(autopilot.unrecorded_logs(self.tasks, reg), [])
+        open(os.path.join(logs, "T001-1.jsonl"), "w").close()  # a session the .bak may have missed
+        self.assertEqual(autopilot.unrecorded_logs(self.tasks, reg), ["T001-1.jsonl"])
 
 
 class ReviewFixesGiveUps(Scratch):
@@ -613,6 +635,96 @@ class ReviewFixesGiveUps(Scratch):
 
     def set_row_status(self, cid: str, status: str) -> None:
         autopilot.set_row(self.state(), "status", {"card": cid}, {"status": status})
+
+
+class ReviewFixesRoundTwo(Scratch):
+    """The second code review, of the first round of fixes."""
+
+    def test_a_lone_surrogate_in_a_result_becomes_a_question_mark_where_it_enters(self):
+        self.assertEqual(autopilot.utf8("broken \ud83d!"), "broken ?!")
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        logs = os.path.join(autopilot.state_dir(self.tasks), "runs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "T001-1.jsonl"), "w") as handle:
+            handle.write('{"type": "result", "is_error": true, "subtype": "x\\udc80", "result": "broken \\ud83d"}\n')
+        reg = autopilot.registry(self.tasks)
+        reg["runs"] = [{"card": "T001", "session": "s", "pid": gone.pid, "log": "runs/T001-1.jsonl", "ended": ""}]
+        sv.registry_of(reg)
+        autopilot.reap(self.tasks, reg)
+        self.assertEqual((reg["runs"][0]["result"], reg["runs"][0]["error"]), ("broken ?", "x?: broken ?"))
+        autopilot.save_registry(self.tasks, reg)
+        reg["attention"]["T001"] = "the last said: \ud83d"  # written before this fix
+        autopilot.save_registry(self.tasks, reg)
+        json.dumps(self.state(), ensure_ascii=False).encode("utf-8", "replace")  # what the server sends
+
+    def test_max_attempts_zero_with_an_answered_approval_resumes_once(self):
+        self.script_for({"T001": ["approval", "done"]})
+        self.settle()
+        autopilot.change_settings(self.tasks, max_attempts=0)
+        autopilot.act(self.tasks, "approval", {"n": "A1", "card": "T001", "verdict": "approved"})
+        self.settle()  # no IndexError in plan(): an answer is sent at least once
+        self.assertEqual([r["reason"] for r in self.runs() if r["card"] == "T001"], ["start", "answer A1"])
+        self.assertEqual(self.status("T001"), "done")
+
+    def test_a_non_number_in_the_file_keeps_the_confirmed_limit(self):
+        autopilot.trusted(self.tasks, autopilot.settings(self.tasks))
+        autopilot.change_settings(self.tasks, quiet_minutes=120)  # confirmed by the owner's own change
+        path = os.path.join(autopilot.state_dir(self.tasks), "autopilot.json")
+        for value in ("x", None, -1, [], 10 ** 400):
+            with self.subTest(value=repr(value)[:10]):
+                with open(path) as handle:
+                    cfg = json.load(handle)
+                with open(path, "w") as handle:
+                    json.dump({**cfg, "quiet_minutes": value}, handle)
+                self.assertEqual(autopilot.limit(self.tasks, autopilot.settings(self.tasks), "quiet_minutes"), 120)
+
+    def test_the_owners_retry_starts_an_answers_count_afresh(self):
+        self.script_for({"T001": ["approval", "noconversation", "noconversation"]})
+        self.settle()
+        autopilot.act(self.tasks, "approval", {"n": "A1", "card": "T001", "verdict": "approved"})
+        self.settle()
+        reg, s, cfg = autopilot.registry(self.tasks), self.state(), autopilot.settings(self.tasks)
+        self.assertIn("could not take your answer", reg["attention"].pop("T001"))
+        self.assertEqual(autopilot.plan(self.tasks, s, reg, cfg), [], "given up on again without a Retry")
+        reg["attention"].pop("T001")
+        reg["retried"]["T001"] = 3  # what Retry records: the runs the unit had then
+        self.assertEqual([p[:2] for p in autopilot.plan(self.tasks, s, reg, cfg)], [("T001", "answer A1")])
+
+    def test_retry_records_where_the_count_starts(self):
+        self.script_for({"T001": ["doing"]})
+        autopilot.change_settings(self.tasks, auto=False)
+        self.assertTrue(autopilot.acquire(self.tasks))
+        autopilot.act(self.tasks, "start", {"card": "T001"})
+        self.assertEqual(autopilot.registry(self.tasks)["retried"], {"T001": 0})
+        self.settle()
+        autopilot.act(self.tasks, "retry", {"card": "T001"})
+        self.assertEqual(autopilot.registry(self.tasks)["retried"], {"T001": 1})
+        self.settle()
+
+    def test_a_card_of_a_live_batch_session_counts_as_live(self):
+        s = self.state()
+        reg = sv.registry_of({"runs": [{"card": "T002", "batch": "B1", "session": "x", "ended": ""}]})
+        self.assertTrue(autopilot.unit_live(s, reg, "T002"))
+        self.assertFalse(autopilot.unit_live(s, reg, "T003"))
+
+    def test_check_flags_are_true_only_when_true(self):
+        reg = sv.registry_of({"chrome_check": {"ok": "false", "running": "no", "ts": 1.0},
+                              "account": {"logged_in": 1, "email": "a@b"}})
+        self.assertEqual((reg["chrome_check"]["ok"], reg["chrome_check"]["running"]), (False, False))
+        self.assertIs(reg["account"]["logged_in"], False)
+
+    def test_an_owner_change_to_a_list_confirms_only_its_own_entries(self):
+        autopilot.trusted(self.tasks, autopilot.settings(self.tasks))
+        path = os.path.join(autopilot.state_dir(self.tasks), "autopilot.json")
+        with open(path) as handle:
+            cfg = json.load(handle)
+        with open(path, "w") as handle:
+            json.dump({**cfg, "approved_gates": ["CPX"]}, handle)  # a session's entry
+        autopilot.change_settings(self.tasks, approved_gates=["CPX", "CPA"])
+        self.assertEqual(autopilot.TRUSTED[self.tasks]["approved_gates"], ["CPA"])
+        autopilot.change_settings(self.tasks, approved_gates=["CPX"])  # the owner takes CPA back
+        self.assertEqual(autopilot.TRUSTED[self.tasks]["approved_gates"], [])
 
 
 class ReviewFixesState(Scratch):

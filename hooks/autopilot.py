@@ -292,17 +292,29 @@ def settings(tasks: str) -> dict:
 
 
 def change_settings(tasks: str, **changes) -> dict:
+    """Save changes to state/autopilot.json. This process makes them (the owner's dashboard, or the
+    dispatcher pausing itself), so the guardrails among them need no confirmation: they become the
+    confirmed ones (TRUSTED). For a list (approved_gates), only what this call adds or removes is
+    confirmed: an entry a session put in the file stays unconfirmed, and widened() still shows it."""
     with guard(tasks):
         current = settings(tasks)
         current.pop("exists", None)
+        before = dict(current)
         for key, value in changes.items():
             if key in sv.SETTINGS:
                 current[key] = value
         if "auto" in changes and "resume_after" not in changes:
             current["resume_after"] = 0  # the owner's Resume or Pause, or another pause, ends a usage limit's wait
         sv.save(os.path.join(state_dir(tasks), "autopilot.json"), current)
-        if tasks in TRUSTED:  # this process changed them (the owner's dashboard): no confirmation needed
-            TRUSTED[tasks].update({k: current[k] for k in changes if k in GUARDED and k in sv.SETTINGS})
+        with LOCK:
+            t = TRUSTED.get(tasks)
+            for key in [k for k in changes if t is not None and k in GUARDED and k in sv.SETTINGS]:
+                if key in LISTS and isinstance(current[key], list):
+                    was = before[key] if isinstance(before[key], list) else []
+                    had = t[key] if isinstance(t[key], list) else []
+                    t[key] = [x for x in had if x in current[key]] + [x for x in current[key] if x not in was + had]
+                else:
+                    t[key] = current[key]
         return current
 
 
@@ -368,7 +380,8 @@ def limit(tasks: str, cfg: dict, key: str) -> float:
     """A stop check's limit (quiet_minutes, max_run_hours, result_grace_s): the lower of the file's and the
     one this dispatcher confirmed, so a session that raises its own limit in the file is still stopped by
     the confirmed one, and an owner who lowers it by hand is heard at once."""
-    return min(setting(cfg, key), setting(trusted(tasks, cfg), key))
+    confirmed, found = setting(trusted(tasks, cfg), key), amount(cfg.get(key))
+    return confirmed if found is None else min(found, confirmed)  # garbage in the file lowers nothing
 
 
 def whole_number(key: str, value, low: int) -> int:
@@ -907,24 +920,24 @@ def reap(tasks: str, reg: dict) -> list:
         else:
             code = None if sv.run_alive(run) else -1
         if code is None:
+            run["seen_ts"] = time.time()  # alive on this pass
             continue
         PROCS.pop(run["session"], None)
-        # what it left running in its group (SIGKILL follows, step()): for a session this process started,
-        # or one whose log moved lately; after a dispatcher was down for long, the group id may be another's
-        last = sv.mtime(os.path.join(state_dir(tasks), run["log"])) if run["log"] else None
-        recent = ours or (last is not None and time.time() - last < GROUP_STALE)
+        # what it left running in its group (SIGKILL follows, step()): for a session this process started, or
+        # one seen alive lately; one that died while no dispatcher watched may have left its id to another
+        recent = ours or time.time() - max(run.get("seen_ts") or 0, run.get("kill_sent_ts") or 0) < GROUP_STALE
         if recent and signal_leftovers(run, signal.SIGTERM):
             run["leftovers_ts"] = time.time()
         found = result_of(os.path.join(state_dir(tasks), run["log"]))
         result = found["result"] or {}
-        text = str(result.get("result") or "")
+        text = utf8(str(result.get("result") or ""))
         run.update(ended=stamp(), exit=code, cost=sv.number(result.get("total_cost_usd")),
                    result=text[-600:], worked=found["worked"])
         if not result:
             run["error"] = run["error"] or (f"the session exited ({code}) without a result"
                                             + (f": {found['stray']}" if found["stray"] else ""))
         elif result.get("is_error"):
-            reason = result.get("terminal_reason") or result.get("subtype") or "error"
+            reason = utf8(str(result.get("terminal_reason") or result.get("subtype") or "error"))
             run["error"] = f"{reason}: {text[:300]}"
         run["capped"] = (result.get("subtype") == "error_max_budget_usd"
                          or result.get("terminal_reason") == "budget_exhausted")
@@ -938,6 +951,12 @@ def reap(tasks: str, reg: dict) -> list:
                 reg["handled"].remove(run["approval"])
         ended.append(run)
     return ended
+
+
+def utf8(text: str) -> str:
+    """Text a session's JSON gave, as UTF-8 can hold it: a lone surrogate (from a "\\ud83d" escape) becomes
+    "?", so runs.json, the report and the dashboard never fail to encode it."""
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def is_api_error(result: dict, found: dict) -> bool:
@@ -1078,9 +1097,14 @@ def give_up(s: dict, reg: dict, unit: str, why: str) -> None:
     every caller acts on runs that have ended (reaped), so no session of it can write RESUME after its
     cards were freed."""
     reg["attention"][unit] = why
-    mine = set(members(s, unit)) if is_unit(s, unit) else {unit}
-    if not any(run_unit(r) == unit or r["card"] in mine for r in live(reg)):
+    if not unit_live(s, reg, unit):
         free_worktree(s, [unit])
+
+
+def unit_live(s: dict, reg: dict, unit: str) -> bool:
+    """Whether a session of the unit, or one working on any of its cards (a batch's), is live."""
+    mine = set(members(s, unit)) if is_unit(s, unit) else {unit}
+    return any(run_unit(r) == unit or r["card"] in mine for r in live(reg))
 
 
 def notify(title: str, text: str) -> None:
@@ -1287,12 +1311,13 @@ def step(tasks: str) -> list:
 
         # sessions that gave their final result but did not exit hold a slot and hide a pause: stop them
         now = time.time()
+        grace, quiet_s, hours = (limit(tasks, cfg, k) for k in ("result_grace_s", "quiet_minutes", "max_run_hours"))
         for run in live(reg):
             if run.get("kill_sent_ts"):
                 continue  # stopped already: SIGKILL follows below if it lingers
             view = live_view(tasks, run["card"], events=False)
             if (view.get("final") and view.get("last_output_ts")
-                    and now - view["last_output_ts"] > limit(tasks, cfg, "result_grace_s")):
+                    and now - view["last_output_ts"] > grace):
                 if kill(run):
                     events.append(f"{run_unit(run)}: its session gave its result but did not exit; stopped it")
 
@@ -1301,10 +1326,10 @@ def step(tasks: str) -> list:
             path = os.path.join(state_dir(tasks), run["log"])
             quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
             started = run.get("started_ts") or sv.row_time(run["started"]) or now  # a hand-edited time: not long
-            long = now - started > limit(tasks, cfg, "max_run_hours") * 3600
-            if ((quiet > limit(tasks, cfg, "quiet_minutes") * 60 or long) and run_unit(run) not in reg["attention"]
+            long = now - started > hours * 3600
+            if ((quiet > quiet_s * 60 or long) and run_unit(run) not in reg["attention"]
                     and not run.get("kill_sent_ts")):
-                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {limit(tasks, cfg, 'max_run_hours'):g} h"
+                why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {hours:g} h"
                 kill(run)
                 run["free_on_end"] = True  # its cards leave `doing` once it has ended (it may linger)
                 reg["attention"][run_unit(run)] = f"its session was stopped ({why}); see `state/{run['log']}`"
@@ -1328,7 +1353,7 @@ def step(tasks: str) -> list:
         # a session the dispatcher stopped (silent, overlong) frees its cards' `doing` rows only now that it
         # has ended, so it can't write RESUME after its card was freed; once (the flag goes with it)
         stopped = [run_unit(r) for r in settling if r.pop("free_on_end", False)]
-        if stopped := [u for u in dict.fromkeys(stopped) if not any(run_unit(r) == u for r in live(reg))]:
+        if stopped := [u for u in dict.fromkeys(stopped) if not unit_live(s, reg, u)]:
             free_worktree(s, stopped)
             s = read_whole(tasks, events)
             if s is None:
@@ -1411,13 +1436,18 @@ def whole(tasks: str, s: dict, before, events: list) -> bool:
 
 
 def unrecorded_logs(tasks: str, reg: dict) -> list:
-    """Session logs in state/runs/ that no registry entry names: sessions a registry read from its .bak lost."""
+    """Session logs in state/runs/ that no registry entry names and that changed since runs.json.bak was
+    written: sessions a registry read from its .bak (one save behind) lost. An older unnamed log (one a
+    recovery lost before, kept rather than overwritten) is no news."""
     known = {os.path.normpath(r.get("log") or "") for r in reg["runs"]}
+    folder = os.path.join(state_dir(tasks), "runs")
+    since = sv.mtime(os.path.join(state_dir(tasks), "runs.json.bak")) or 0
     try:
-        names = os.listdir(os.path.join(state_dir(tasks), "runs"))
+        names = os.listdir(folder)
     except OSError:
         return []
-    return sorted(n for n in names if n.endswith(".jsonl") and os.path.normpath(os.path.join("runs", n)) not in known)
+    return sorted(n for n in names if n.endswith(".jsonl") and os.path.normpath(os.path.join("runs", n)) not in known
+                  and (sv.mtime(os.path.join(folder, n)) or 0) >= since - 1)
 
 
 def units(s: dict) -> list:
@@ -1488,12 +1518,10 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         if worked and answered:  # the owner answered: resume that conversation with the answer
             a = answered[0]
             # the answer never reached a working session (no such conversation, a crash at start): sent again
-            # only max_attempts times since the owner last started the unit (Retry), and once more for each
-            # Retry that waited for a slot (granted); then the owner decides
-            mine = unit_runs(reg, s, cid)
-            since = max((i for i, r in enumerate(mine) if str(r.get("reason") or "").endswith("(owner)")), default=-1)
-            lost = [r for r in mine[since + 1:] if r.get("approval") == approval_key(a) and sv.is_try(r)]
-            if len(lost) >= cfg["max_attempts"] + int(reg["granted"].get(cid, 0)):
+            # only max_attempts times since the owner's last Start or Retry, then the owner decides
+            since = int(reg["retried"].get(cid, 0))  # runs the unit had when the owner last pressed Retry
+            lost = [r for r in unit_runs(reg, s, cid)[since:] if r.get("approval") == approval_key(a) and sv.is_try(r)]
+            if lost and len(lost) >= cfg["max_attempts"]:
                 give_up(s, reg, cid, f"{len(lost)} sessions could not take your answer to {a['n']}; the last"
                                      f" ended with: {ending(lost[-1])[:200]}")
                 continue
@@ -1790,6 +1818,7 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(problem)
             why = room(s, reg, cfg, cid) or chrome_problem(tasks, s, reg, cfg)
             was_stuck = reg["attention"].pop(cid, None) is not None
+            reg["retried"][cid] = len(unit_runs(reg, s, cid))  # the owner's go: an answer's tries count anew
             if cid in reg["manual"]:
                 reg["manual"].remove(cid)
             if why:
@@ -1853,11 +1882,8 @@ def act(tasks: str, action: str, data: dict) -> str:
             gate = str(data.get("gate", ""))
             if gate not in s["gates"]:
                 raise Refused(f"{gate} is not waiting for a review")
-            with LOCK:
-                confirmed = TRUSTED[tasks]["approved_gates"] if tasks in TRUSTED else None
-                change_settings(tasks, approved_gates=sv.gates_approved(cfg) + [gate])
-                if tasks in TRUSTED:  # the owner approved this gate, not a gate a session added to the file
-                    TRUSTED[tasks]["approved_gates"] = sv.gates_approved({"approved_gates": confirmed}) + [gate]
+            # (change_settings confirms only the gate added here, not one a session added to the file)
+            change_settings(tasks, approved_gates=sv.gates_approved(cfg) + [gate])
             return f"stage {gate} approved"
         if action == "check-chrome":
             reg["chrome_check"] = None

@@ -1234,9 +1234,9 @@ def number(value) -> float:
 
 # runs.json: its tables and lists, and the fields of a run that are text or numbers
 REGISTRY_FIELDS = (("runs", list), ("attention", dict), ("handled", list), ("manual", list), ("notified", list),
-                   ("queued", list), ("granted", dict), ("blocked_on", dict))
+                   ("queued", list), ("granted", dict), ("blocked_on", dict), ("retried", dict))
 RUN_TEXT = ("card", "session", "batch", "reason", "approval", "started", "ended", "result", "error", "log")
-RUN_NUMBERS = ("cost", "started_ts", "kill_sent_ts", "killed_ts", "leftovers_ts")
+RUN_NUMBERS = ("cost", "started_ts", "kill_sent_ts", "killed_ts", "leftovers_ts", "seen_ts")
 
 
 def registry_of(found) -> dict:
@@ -1252,7 +1252,8 @@ def registry_of(found) -> dict:
     for key in ("handled", "manual", "notified", "queued"):
         reg[key] = [x for x in reg[key] if isinstance(x, str)]
     reg["attention"] = {str(k): "" if v is None else str(v) for k, v in reg["attention"].items()}
-    reg["granted"] = {str(k): max(0, int(number(v))) for k, v in reg["granted"].items()}
+    for key in ("granted", "retried"):  # counts per unit
+        reg[key] = {str(k): max(0, int(number(v))) for k, v in reg[key].items()}
     reg["blocked_on"] = {str(k): [str(x) for x in v] if isinstance(v, list) else []
                          for k, v in reg["blocked_on"].items()}
     runs = []
@@ -1270,17 +1271,20 @@ def registry_of(found) -> dict:
         runs.append(run)
     reg["runs"] = runs
     for key in ("account", "chrome_check"):  # the account and Chrome checks: an object, or nothing
-        found = reg.get(key)
-        if key in reg and not isinstance(found, dict):
+        entry = reg.get(key)
+        if key in reg and not isinstance(entry, dict):
             reg[key] = None
-        elif isinstance(found, dict):  # their times as numbers, their words as text, the kept names as a list
-            if "ts" in found:
-                found["ts"] = number(found["ts"])
+        elif isinstance(entry, dict):  # times as numbers, words as text, flags true only when true, names a list
+            if "ts" in entry:
+                entry["ts"] = number(entry["ts"])
             for field in ("launcher", "email", "error", "detail", "url", "final_url", "account"):
-                if field in found and not isinstance(found[field], str):
-                    found[field] = "" if found[field] is None else str(found[field])
-            if "keep_env" in found and not isinstance(found["keep_env"], list):
-                found["keep_env"] = []
+                if field in entry and not isinstance(entry[field], str):
+                    entry[field] = "" if entry[field] is None else str(entry[field])
+            for field in ("ok", "running", "logged_in"):  # "false" or "no" must not read as true
+                if field in entry:
+                    entry[field] = entry[field] is True
+            if "keep_env" in entry and not isinstance(entry["keep_env"], list):
+                entry["keep_env"] = []
     return reg
 
 
@@ -2309,7 +2313,7 @@ def serve(tasks: str, port: int, stale_hours: float, open_browser: bool, dispatc
                     pass
 
         def send(self, code: int, body: str, kind: str) -> None:
-            data = body.encode("utf-8")
+            data = body.encode("utf-8", "replace")  # a lone surrogate from a session's JSON: "?", not a 500
             self.send_response(code)
             self.send_header("Content-Type", kind)
             self.send_header("Cache-Control", "no-store")
