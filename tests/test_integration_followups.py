@@ -378,6 +378,29 @@ class HandEditedRegistry(Scratch):
         self.assertIsNone(autopilot.result_of(log)["result"])
 
 
+class Lessons(Scratch):
+    """Item 5d: --lessons reads costs and times as safely as the report does."""
+
+    def test_lessons_take_odd_costs_as_zero(self):
+        runs = [{"card": "T001", "session": "a", "cost": "n/a", "started": "2026-01-01 00:00Z", "ended": "2026-01-01 01:00Z",
+                 "reason": "start"},
+                {"card": "T002", "session": "b", "cost": float("nan"), "started": "2026-01-01 00:00Z",
+                 "started_ts": float("inf"), "ended": "2026-01-01 02:00Z", "reason": "start"},
+                {"card": "T003", "session": "c", "cost": float("inf"), "started": "x", "ended": "2026-01-01 00:30Z"},
+                {"card": "T004", "session": "d", "cost": 10 ** 400, "started_ts": "soon", "started": "2026-01-01 00:00Z",
+                 "ended": "2026-01-01 00:30Z"},
+                {"card": "T004", "session": "e", "cost": 1.25, "started": "2026-01-01 01:00Z", "ended": "2026-01-01 01:30Z"},
+                "not a run"]
+        with open(os.path.join(autopilot.state_dir(self.tasks), "runs.json"), "w") as handle:
+            json.dump({"runs": runs, "attention": "x"}, handle)
+        text = sv.lessons(self.state())
+        rows = {line.split(" | ")[0][2:]: line.split(" | ") for line in text.splitlines() if line.startswith("| T00")}
+        self.assertEqual([rows[c][8] for c in ("T001", "T002", "T003", "T004")], ["0.0", "0.0", "0.0", "1.25"])
+        self.assertEqual([rows[c][9] for c in ("T001", "T002", "T003", "T004")], ["1.0", "2.0", "0.0", "1.0"])
+        self.assertNotIn("nan", text.lower())
+        self.assertNotIn("inf", text.lower())
+
+
 class Pids(unittest.TestCase):
     """Item 5c: a pid of another account is alive; one no pid_t holds is no pid, never an OverflowError."""
 

@@ -1924,9 +1924,8 @@ def lessons(s: dict) -> str:
     """What each card really took (runs, tries, cost, hours) beside what the plan guessed (size, effort),
     as Markdown for the close card's retro and specs/lessons.md. Only measured numbers; a card the
     autopilot never ran shows "-"."""
-    registry = read_json(os.path.join(os.path.dirname(s["tasks"]), "state", "runs.json"), {})
-    registry = registry if isinstance(registry, dict) else {}
-    runs, attention = registry.get("runs", []), registry.get("attention", {})
+    registry = registry_of(read_json(os.path.join(os.path.dirname(s["tasks"]), "state", "runs.json"), {}))
+    runs, attention = registry["runs"], registry["attention"]
     resume = parse_resume(read(s["resume"]), list(s["cards"])) if s["resume"] else {"approvals": [], "decisions": []}
     utc = lambda v: dt.datetime.strptime(v, "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc).timestamp()  # noqa: E731
     def measure(mine: list) -> tuple:
@@ -1935,10 +1934,10 @@ def lessons(s: dict) -> str:
         hours = 0.0
         for r in mine:
             key = r.get("session") or id(r)
-            cost[key] = max(cost.get(key, 0.0), float(r.get("cost") or 0))
+            cost[key] = max(cost.get(key, 0.0), number(r.get("cost")))  # "n/a", NaN, infinity: 0
             try:
                 if r.get("ended"):
-                    began = float(r["started_ts"]) if r.get("started_ts") else utc(r["started"])
+                    began = number(r.get("started_ts")) or utc(r["started"])
                     hours += max(utc(r["ended"]) - began, 0) / 3600  # "ended" keeps minutes only
             except (KeyError, ValueError, TypeError):
                 pass
