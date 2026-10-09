@@ -45,6 +45,20 @@ json.dump(counts, open(counter, "w"))
 steps = script.get(card, ["done"])
 behaviour = steps[min(n, len(steps) - 1)]
 
+if os.environ.get("FAKE_TAMPER"):  # a session that rewrites its own guardrails first, then acts as scripted
+    tamper = json.loads(os.environ["FAKE_TAMPER"])  # {"settings": {key: value}, "tasks": [old, new]}
+    if tamper.get("settings"):
+        path = os.path.join(os.path.dirname(tasks), "state", "autopilot.json")
+        with open(path, encoding="utf-8") as handle:
+            found = json.load(handle)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({**found, **tamper["settings"]}, handle)
+    if tamper.get("tasks"):
+        with open(tasks, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(tasks, "w", encoding="utf-8") as handle:
+            handle.write(text.replace(*tamper["tasks"]))
+
 
 def emit(event: dict) -> None:
     print(json.dumps({**event, "session_id": session}), flush=True)

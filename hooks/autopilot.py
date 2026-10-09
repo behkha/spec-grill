@@ -221,7 +221,170 @@ def change_settings(tasks: str, **changes) -> dict:
             if key in sv.SETTINGS:
                 current[key] = value
         save_json(os.path.join(state_dir(tasks), "autopilot.json"), current)
+        if tasks in TRUSTED:  # this process changed them (the owner's dashboard): no confirmation needed
+            TRUSTED[tasks].update({k: current[k] for k in changes if k in GUARDED and k in sv.SETTINGS})
         return current
+
+
+# --- guardrails: what the sessions run with, as the owner confirmed it --------------------------
+#
+# Unattended sessions run in the repository and can write state/autopilot.json and tasks.md. So the
+# dispatcher keeps in memory the guardrails it found when it started (and those the owner accepted
+# since) and starts sessions with those. A change in the files that widens them pauses the autopilot
+# until the owner has seen it and pressed Resume (or Start again, after a Start showed it); a change
+# that narrows them is taken at once.
+
+PERMISSION_MODES = ("auto", "acceptEdits", "default", "manual", "dontAsk", "plan")  # never bypassPermissions
+NUMBERS = ("budget_per_card_usd", "budget_total_usd", "max_attempts", "max_parallel", "max_run_hours",
+           "quiet_minutes", "result_grace_s")  # more is wider (a total budget of 0 means none)
+SWITCHES = {"chrome": True, "gate_checkpoints": False, "notify": False}  # the value that widens
+LISTS = ("approved_gates", "keep_env")  # another entry widens
+GUARDED = ("claude", "permission_mode", *NUMBERS, *SWITCHES, *LISTS)
+TRUSTED: dict = {}  # tasks -> the guardrails this process confirmed, and what it last showed the owner
+NO_DENY = ("tasks.md §6 has no **Never unattended:** line; add one (for example `Bash(git push:*)`) "
+           "so unattended sessions cannot deploy or push")
+
+
+def guardrails(tasks: str, cfg: dict | None = None, s: dict | None = None) -> dict:
+    """The guardrails as the files say now: the GUARDED settings, and §6's Runs as launcher, App URL and
+    Never unattended list."""
+    cfg = settings(tasks) if cfg is None else cfg
+    if s is None:
+        text = sv.read(tasks)
+        runs, deny = sv.runs_as(text), sv.unattended_deny(text)
+    else:
+        runs, deny = s["autopilot"]["runs_as"], s["autopilot"]["deny"]
+    return {**{k: cfg.get(k, sv.SETTINGS.get(k)) for k in GUARDED}, "launcher": runs["launcher"],
+            "app_url": runs["app_url"], "deny": list(deny)}
+
+
+def trusted(tasks: str, cfg: dict | None = None, s: dict | None = None) -> dict:
+    """The guardrails this dispatcher confirmed: the files' when it first looks at the feature."""
+    with LOCK:
+        if tasks not in TRUSTED:
+            TRUSTED[tasks] = {**guardrails(tasks, cfg, s), "shown": {}}
+        return TRUSTED[tasks]
+
+
+def amount(value, zero_is_none: bool = False) -> float | None:
+    """A budget or count as a number (a total budget of 0 means none: infinite); None when it is not one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
+        return None
+    return float("inf") if zero_is_none and value == 0 else float(value)
+
+
+def forbidden(cfg: dict) -> str:
+    """A setting no session runs with, whoever wrote it ("" when there is none)."""
+    mode = cfg.get("permission_mode")
+    if mode not in PERMISSION_MODES:
+        return (f"state/autopilot.json sets permission_mode {mode!r}; unattended sessions run only with one of "
+                f"{', '.join(PERMISSION_MODES)}. Set one there, then press Resume")
+    for key in NUMBERS:
+        if amount(cfg.get(key, sv.SETTINGS[key])) is None:
+            return f"state/autopilot.json sets {key} to {cfg.get(key)!r}, not a number of 0 or more; fix it, then press Resume"
+    if not isinstance(cfg.get("claude"), str) or not cfg["claude"].strip():
+        return f"state/autopilot.json sets claude to {cfg.get('claude')!r}, not a program; fix it, then press Resume"
+    for key in LISTS:
+        found = cfg.get(key)
+        if found is not None and not (isinstance(found, list) and all(isinstance(n, str) for n in found)):
+            return f"state/autopilot.json sets {key} to {found!r}, not a list of names; fix it, then press Resume"
+    return ""
+
+
+def widened(tasks: str, s: dict, cfg: dict) -> list:
+    """What in the files widens the guardrails this dispatcher confirmed, one line each. What narrows
+    them (a lower budget, another Never unattended pattern, Chrome off) is confirmed on the way."""
+    show = lambda v: "(none)" if v in ("", None) else repr(v)  # noqa: E731  quoted: a session may have written it
+    names = lambda v: v if isinstance(v, list) else []  # noqa: E731
+    with LOCK:
+        t, now = trusted(tasks, cfg, s), guardrails(tasks, cfg, s)
+        out = []
+        for key, name in (("claude", "state/autopilot.json's claude"), ("permission_mode", "its permission_mode"),
+                          ("launcher", "tasks.md §6's Runs as launcher"), ("app_url", "tasks.md §6's App URL")):
+            if now[key] == t[key]:
+                continue
+            if key == "permission_mode" and t[key] not in PERMISSION_MODES:
+                t[key] = now[key]  # away from a mode no session runs with
+            else:
+                out.append(f"{name} {show(t[key])} → {show(now[key])}")
+        lost = [p for p in t["deny"] if p not in now["deny"]]
+        if lost:
+            out.append("tasks.md §6's Never unattended list lost " + ", ".join(f"`{p}`" for p in lost))
+        t["deny"] += [p for p in now["deny"] if p not in t["deny"]]
+        for key in NUMBERS:
+            old, new = (amount(v, key == "budget_total_usd") for v in (t[key], now[key]))
+            if new is None or new == old:
+                continue  # forbidden() says what is wrong with it
+            if old is None or new > old:
+                out.append(f"state/autopilot.json's {key} {show(t[key])} → {show(now[key])}")
+            else:
+                t[key] = now[key]
+        for key, wide in SWITCHES.items():
+            if bool(now[key]) == bool(t[key]):
+                continue
+            if bool(now[key]) == wide:
+                out.append(f"state/autopilot.json's {key} {show(t[key])} → {show(now[key])}")
+            else:
+                t[key] = now[key]
+        for key in LISTS:
+            added = [n for n in names(now[key]) if n not in names(t[key])]
+            if added:
+                out.append(f"state/autopilot.json's {key} added " + ", ".join(show(n) for n in added))
+            elif now[key] != t[key]:
+                t[key] = now[key]
+        return out
+
+
+def guardrail_problem(tasks: str, s: dict, cfg: dict) -> str:
+    """Why no session may start with the guardrails the files now name ("" when they may)."""
+    problem = forbidden(cfg)
+    if problem:
+        return problem
+    changes = widened(tasks, s, cfg)
+    if not changes:
+        return ""
+    return ("the guardrails changed since the autopilot started or you last accepted a change, and a session can "
+            f"write those files: {'; '.join(changes)}. If you made the change, press Resume on the dashboard that "
+            "runs the autopilot to accept it (or restart the autopilot); if not, undo it")
+
+
+def shown(tasks: str, s: dict, cfg: dict, *by: str) -> None:
+    """Remember the guardrails whose change the owner was just shown, for Resume and the buttons in by
+    ("start"): each accepts exactly that change, and no other."""
+    now = guardrails(tasks, cfg, s)
+    trusted(tasks, cfg, s)["shown"] = {b: now for b in ("resume", *by)}
+
+
+def confirm(tasks: str, s: dict, cfg: dict, by: str = "resume") -> str:
+    """The owner pressed Resume (by "resume") or Start (by "start") on this dispatcher's dashboard:
+    accept the guardrail change that button was shown. A change not shown to it yet is shown now and
+    returned, so nothing is accepted unseen; the values are compared, not the message."""
+    with LOCK:
+        problem = guardrail_problem(tasks, s, cfg)
+        if problem and (forbidden(cfg) or trusted(tasks, cfg, s)["shown"].get(by) != guardrails(tasks, cfg, s)):
+            shown(tasks, s, cfg, by)
+            return problem
+        TRUSTED[tasks] = {**guardrails(tasks, cfg, s), "shown": {}}
+        return ""
+
+
+def session_settings(deny: list) -> str:
+    """The --settings a session starts with: its deny list, and bypassPermissions switched off."""
+    return json.dumps({"permissions": {"deny": deny, "disableBypassPermissionsMode": "disable"}})
+
+
+def deny_list(tasks: str, s: dict, deny: list | None = None) -> list:
+    """What a session is denied: §6's Never unattended list (or what an approved step leaves of it),
+    any pattern the owner confirmed that §6 has lost since, and editing the files only the dispatcher
+    and the owner write. tasks.md stays open: sessions tick their cards and add §5 cards in it."""
+    confirmed = trusted(tasks, s=s)["deny"]
+    lost = [p for p in confirmed if p not in s["autopilot"]["deny"]]
+    specs = os.path.dirname(os.path.dirname(os.path.abspath(tasks)))
+    own = []
+    for folder in dict.fromkeys((specs, os.path.realpath(specs))):  # every feature's, so no session makes one
+        folder = re.sub(r"([*?\[\]\\])", r"\\\1", folder)  # a literal path in gitignore syntax; // is absolute
+        own += [f"Edit(/{folder}/*/state/autopilot.json)", f"Edit(/{folder}/*/state/runs.json)"]
+    return list(dict.fromkeys((s["autopilot"]["deny"] if deny is None else deny) + lost + own))
 
 
 def approval_key(a: dict) -> str:
@@ -466,11 +629,15 @@ def continue_prompt(s: dict, unit: str, last: dict) -> str:
 
 def permitted(deny: list, step: str) -> list:
     """The deny list for a session resumed to run an approved step: without the patterns that step
-    needs (`Bash(git push:*)` when the step says `git push …`), so the owner's yes can take effect."""
+    needs (`Bash(git push:*)` or `Bash(git push *)` when the step runs `git push …`), so the owner's yes
+    can take effect. The command must stand as a command in the step: "format the code" keeps
+    `Bash(rm:*)`; a pattern with a wildcard anywhere else (`Bash(*)`) is never lifted."""
     out = []
     for pattern in deny:
-        found = re.fullmatch(r"Bash\((.+?)(?::\*)?\)", pattern.strip())
-        if found and found.group(1).strip() and found.group(1).strip() in step:
+        found = re.fullmatch(r"Bash\((.+)\)", pattern.strip())
+        cmd = re.sub(r"(?::\*|\s+\*)$", "", found.group(1)).strip() if found else ""
+        if cmd and "*" not in cmd and re.search(r"(?:^|(?<=[\s`'\"(;&|]))" + r"\s+".join(map(re.escape, cmd.split()))
+                                               + r"(?=$|[\s`'\");&|]|[.,](?:\s|$))", step):
             continue
         out.append(pattern)
     return out
@@ -489,8 +656,7 @@ def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: boo
         cmd += ["--effort", info["effort"]]
     if info["model"]:
         cmd += ["--model", info["model"]]
-    if deny:
-        cmd += ["--settings", json.dumps({"permissions": {"deny": deny}})]
+    cmd += ["--settings", session_settings(deny)]
     rules = RULES.format(what=info["what"], work=info["work"], handoff=info["handoff"], tasks=s["tasks"])
     if unit_parallel(s, cid):
         rules += PARALLEL_RULES.format(work=info["work"], beside=", ".join(beside or []) or "none yet",
@@ -506,8 +672,17 @@ def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: boo
 def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, session: str = "",
           approval: str = "", deny: list | None = None) -> dict:
     """Start (no session) or resume (session) the session of a unit (a card, or a batch); record it in
-    the registry. A batch's run names the batch's first open card as its card."""
+    the registry. A batch's run names the batch's first open card as its card. The session gets the
+    guardrails the owner confirmed (trusted), whatever the files say by now."""
     cfg = settings(tasks)
+    confirmed = trusted(tasks, cfg, s)
+    for key in GUARDED:
+        if confirmed[key] is None:
+            cfg.pop(key, None)  # unset when confirmed (keep_env): unset now
+        else:
+            cfg[key] = confirmed[key]
+    if problem := forbidden(cfg):  # the last check (step and act checked first): nothing starts, nothing is recorded
+        return {"card": cid, "session": "", "error": problem}
     resume = bool(session)
     session = session or str(uuid.uuid4())
     attempt = len(unit_runs(reg, s, cid)) + 1
@@ -525,7 +700,7 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
     beside = running_units(s, reg, cid)
     env = {**os.environ, "SPEC_GRILL_AUTOPILOT": "1", "SPEC_GRILL_CARD": cid,
            "SPEC_GRILL_PORT_OFFSET": str(run["slot"])}
-    deny = s["autopilot"]["deny"] if deny is None else deny
+    deny = deny_list(tasks, s, deny)
     try:
         with open(log, "w", encoding="utf-8") as out:
             proc = subprocess.Popen(command(cfg, s, cid, session, prompt, resume, deny, run["slot"], beside),
@@ -661,9 +836,11 @@ def spent(reg: dict) -> float:
 
 def launcher(cfg: dict, s: dict) -> str:
     """The CLI the sessions start with: the settings' "claude" when the owner set one, else the launcher
-    §6's **Runs as:** names, else plain claude."""
-    chosen = cfg["claude"] if cfg["claude"] != "claude" else (s["autopilot"]["runs_as"]["launcher"] or "claude")
-    return os.path.expanduser(chosen)
+    §6's **Runs as:** names, else plain claude; as the owner confirmed them (trusted), so nothing runs a
+    program a session wrote into those files."""
+    t = trusted(s["tasks"], cfg, s)
+    chosen = t["claude"] if t["claude"] != "claude" else (t["launcher"] or "claude")
+    return os.path.expanduser(str(chosen))
 
 
 def check_account(reg: dict, cli: str, max_age: float) -> dict:
@@ -711,7 +888,9 @@ def probe_chrome(tasks: str, s: dict, cfg: dict, account: str = "") -> None:
     what = (f"open {url} in a new tab and wait for it to load." if url
             else "list the open tabs (this only checks that the Chrome tools work).")
     cmd = [launcher(cfg, s), "-p", "--chrome", "--output-format", "json", "--model", "haiku",
-           "--max-budget-usd", "0.5", "--permission-mode", "auto", PROBE.format(what=what)]
+           "--max-budget-usd", "0.5", "--permission-mode", "auto",
+           "--settings", session_settings(deny_list(tasks, s)),
+           PROBE.format(what=what)]
     result = {"ok": False, "detail": "", "ts": time.time(), "running": False, "url": url, "account": account}
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=240, cwd=repo_root(tasks),
@@ -805,10 +984,12 @@ def step(tasks: str) -> list:
         for cid in [c for c in reg["blocked_on"] if not is_unit(s, c) or unit_finished(s, c)]:
             del reg["blocked_on"][cid]
         if cfg["auto"] and not s["autopilot"]["deny"]:
-            cfg = change_settings(tasks, auto=False, paused_reason=(
-                "tasks.md §6 has no **Never unattended:** line; add one (for example `Bash(git push:*)`) "
-                "so unattended sessions cannot deploy or push"))
+            cfg = change_settings(tasks, auto=False, paused_reason=NO_DENY)
             events.append("autopilot paused: no Never unattended list")
+        if cfg["auto"] and (problem := guardrail_problem(tasks, s, cfg)):
+            shown(tasks, s, cfg)  # on the dashboard's pause line: Resume accepts it
+            cfg = change_settings(tasks, auto=False, paused_reason=problem)
+            events.append(f"autopilot paused: {problem}")
         if cfg["auto"]:
             problem = account_problem(s, reg, cfg, 60)
             if problem:
@@ -1019,6 +1200,7 @@ class Refused(Exception):
     pass
 
 
+SPLIT_END = re.compile(r"AUTOPILOT: SPLIT")  # a session's end that hands the rest of its card on (§1's Context budget)
 NEEDS_CARD = {"start", "retry", "stop", "takeover", "owner-done", "unblock"}
 UNIT_ACTIONS = {"start", "retry", "stop", "takeover", "unblock"}  # these accept a batch id too
 
@@ -1049,6 +1231,10 @@ def act(tasks: str, action: str, data: dict) -> str:
                         raise Refused(f"{key} must be a whole number") from None
             if changes.get("auto"):
                 changes["paused_reason"] = ""
+                problem = confirm(tasks, s, cfg) if holds(tasks) else ""  # Resume here: the owner's yes to what it showed
+                if problem:
+                    change_settings(tasks, auto=False, paused_reason=problem)
+                    raise Refused(problem)
             change_settings(tasks, **changes)
             return "settings saved"
         reg = registry(tasks)
@@ -1070,6 +1256,11 @@ def act(tasks: str, action: str, data: dict) -> str:
                 raise Refused(f"{cid} still waits for {', '.join(w['on'] for w in waits)}")
             if any(a["card"] in mem for a in s["approvals"]):
                 raise Refused(f"{cid} waits for your answer to its approval")
+            if not s["autopilot"]["deny"]:
+                raise Refused(NO_DENY)
+            problem = confirm(tasks, s, cfg, "start")  # a second Start accepts the change the first one showed
+            if problem:
+                raise Refused(problem if forbidden(cfg) else f"{problem}. Or press {action.title()} again to accept it")
             problem = account_problem(s, reg, cfg, 60)
             if problem:
                 save_registry(tasks, reg)
@@ -1088,6 +1279,8 @@ def act(tasks: str, action: str, data: dict) -> str:
                 when = "when a session slot frees up" if cfg["auto"] else "once you press Resume (or Start it when a slot is free)"
                 return f"{cid} queued: it starts {when}. ({why})"
             worked = unit_latest(reg, s, cid, worked=True)
+            if worked and SPLIT_END.search(worked.get("result") or ""):
+                worked = None  # a session that split its card handed the rest over: never resumed, start afresh
             if worked:
                 run = spawn(tasks, s, reg, cid, "continue (owner)",
                             continue_prompt(s, cid, unit_latest(reg, s, cid) or worked), worked["session"])

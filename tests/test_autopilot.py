@@ -186,7 +186,7 @@ class Feature(unittest.TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "high")
         self.assertEqual(args[args.index("-n") + 1], "001 T001 Re-verify and baseline")
         deny = json.loads(args[args.index("--settings") + 1])["permissions"]["deny"]
-        self.assertEqual(deny, ["Bash(git push:*)", "Bash(fly deploy:*)"])
+        self.assertEqual([d for d in deny if d.startswith("Bash(")], ["Bash(git push:*)", "Bash(fly deploy:*)"])
         self.assertIn("Follow", args[-1])
 
         self.settle()
@@ -331,7 +331,7 @@ class Feature(unittest.TestCase):
         autopilot.step(self.tasks)
         args = self.wait_calls(2)[1]["args"]
         deny = json.loads(args[args.index("--settings") + 1])["permissions"]["deny"]
-        self.assertEqual(deny, ["Bash(fly deploy:*)"])
+        self.assertEqual([d for d in deny if d.startswith("Bash(")], ["Bash(fly deploy:*)"])
 
     def test_owner_and_kindless_cards_are_never_started(self):
         self.set_meta("T002", "kind backend", "kind: owner")
