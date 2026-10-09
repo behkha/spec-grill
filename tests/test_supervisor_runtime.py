@@ -545,5 +545,15 @@ class ServerOpenedThroughAForwarder(Server):
         self.assertTrue(open(os.path.join(self.root, "opened")).read().startswith("file://"))
 
 
+class RowTime(unittest.TestCase):
+    def test_the_newest_time_in_a_date_cell_counts_not_the_first(self):
+        at = lambda *v: sv.dt.datetime(*v, tzinfo=sv.dt.timezone.utc).timestamp()  # noqa: E731
+        self.assertEqual(sv.row_time("2026-01-01 10:00Z, resumed 2026-02-01 11:00Z"), at(2026, 2, 1, 11, 0))
+        self.assertEqual(sv.row_time("2026-02-01 11:00Z (was 2026-01-01 10:00Z)"), at(2026, 2, 1, 11, 0))
+        self.assertEqual(sv.row_time("2026-01-01, 2026-02-01", day=True), at(2026, 2, 2))
+        self.assertIsNone(sv.row_time("2026-01-01"), "a bare day is no time of day")
+        self.assertIsNone(sv.row_time("2026-01-01 10:00Z", day=True))
+
+
 if __name__ == "__main__":
     unittest.main()

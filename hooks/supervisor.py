@@ -1208,10 +1208,10 @@ def row_time(cell: str, day: bool = False) -> float | None:
     for m in re.finditer(r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?", cell or ""):
         if (m.group(4) is None) != day:
             continue
-        try:
-            day = dt.datetime(*(int(x) for x in m.groups()[:3]), tzinfo=dt.timezone.utc)
-            at = (min(day + dt.timedelta(days=1), now()) if m.group(4) is None
-                  else day.replace(hour=int(m.group(4)), minute=int(m.group(5))))
+        try:  # (not named `day`: that is the flag every later match is checked against)
+            date = dt.datetime(*(int(x) for x in m.groups()[:3]), tzinfo=dt.timezone.utc)
+            at = (min(date + dt.timedelta(days=1), now()) if m.group(4) is None
+                  else date.replace(hour=int(m.group(4)), minute=int(m.group(5))))
         except ValueError:
             continue
         out.append(at.timestamp())
