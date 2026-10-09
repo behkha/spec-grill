@@ -36,18 +36,34 @@ import subprocess
 import sys
 import time
 
-ID = r"(?:T\d+(?:[A-Z]+\d*)*|CP[A-Z0-9]+)"  # T001, T012A, follow-ups like T042B2 and T042R2A; CPA, CP0, CPEND
+# T001, T012A, follow-ups like T042B2 and T042R2A; CPA, CP0, CPEND (no nested quantifier: no backtracking blow-up)
+ID = r"(?:T\d+[A-Z0-9]*|CP[A-Z0-9]+)"
 ID_RE = re.compile(rf"\b{ID}\b")
 RANGE_RE = re.compile(rf"\b({ID})\s*[–-]\s*({ID})\b")
-CHECK_RE = re.compile(rf"^- \[([ xX])\] ({ID})((?: \[P\])?)(?: (.+?))?(?: — fulfills .*)?\s*$", re.M)
+# "- [ ] T012 [P] Title", also indented, with "*", a tab, "T012: Title", or "[P]" after the title (group 5)
+CHECK_RE = re.compile(rf"^[ \t]*[-*][ \t]+\[([ xX])\][ \t]+({ID}):?((?:[ \t]+\[P\])?)(?:[ \t]+(.+?))?"
+                      rf"((?:[ \t]+\[P\])?)(?: — fulfills .*)?\s*$", re.M)
 SECTION_RE = re.compile(r"^#{2,3} (.+?)\s*$", re.M)
-COND_RE = re.compile(r"\(([^)]*\bif\b[^)]*)\)")  # "(T036 if German)": a dependency under a condition
+# "(T036 if German)", "(T036 (de) if German)": a dependency under a condition
+COND_RE = re.compile(r"\(((?:[^()]|\([^()]*\))*\bif\b(?:[^()]|\([^()]*\))*)\)")
 BEFORE_RE = re.compile(rf"\bbefore:?\s+({ID})")
-HEAD_RE = re.compile(rf"^#{{3,4}} ({ID})((?: \[P\])?) — (.+?)\s*$", re.M)
+# "#### T012 [P] — Title"; "-", "–" or ":" also separate the title, but "### T001 – T003 Setup" is a range
+HEAD_RE = re.compile(rf"^#{{3,4}}[ \t]+({ID})((?:[ \t]+\[P\])?)[ \t]*(?:—|[–:-](?![ \t]*{ID}\b))[ \t]+(.+?)\s*$",
+                     re.M)
+# a heading that starts with a card id (T only: "### CPU usage" is no card), parsed by HEAD_RE or not
+HEAD_LIKE_RE = re.compile(rf"^#{{3,4}}[ \t]+(T\d+[A-Z0-9]*)\b(?![ \t]*[—–-][ \t]*{ID}\b).*$", re.M)
+# a §5 card written inline: its meta line and fields indented under its checklist line, up to the next one
+INLINE_RE = re.compile(r"(?:\n(?![ \t]*[-*][ \t]+\[[ xX]\])[ \t]+\S[^\n]*)+")
+# a meta field written bold ("**after:** T001 · **S**"): read as plain text, so only other bold fields
+# ("**Start with:**") end the meta lines
+META_BOLD_RE = re.compile(r"\*\*((?i:after|blocks|fulfills|added by|effort|kind|model|size)\b[^*\n]*|[SML])\*\*")
 # "phase 11's T034", "Phase 10's T042A and T043", "phase 11's T021–T023": another feature's cards
-PHASE_RE = re.compile(rf"\b(?i:phase)\s+(\d+)['’]s\s+({ID}(?:\s*(?:[–-]|\band\b|\bor\b|&)\s*{ID})*)\b")
+# "phase 11's T034, T035": a comma list too, which split_phases ends where the ids turn local
+PHASE_RE = re.compile(rf"\b(?i:phase)\s+(\d+)['’]s\s+({ID}(?:\s*(?:[–,-]|\band\b|\bor\b|&)\s*{ID})*)\b")
 BATCH = r"B\d+"  # batches of small cards (a stage's, §5's): B1, B2, … (not cards: never in order or progress)
-BATCH_CHECK_RE = re.compile(rf"^- \[([ xX])\] ({BATCH})\b((?: \[P\])?)(?: (.+?))?\s*$", re.M)
+# "- [ ] B3 [P] name", as leniently as CHECK_RE; a "[P]" after the name counts too (group 5)
+BATCH_CHECK_RE = re.compile(rf"^[ \t]*[-*][ \t]+\[([ xX])\][ \t]+({BATCH})\b:?((?:[ \t]+\[P\])?)(?:[ \t]+(.+?))?"
+                            rf"((?:[ \t]+\[P\])?)\s*$", re.M)
 TOUCHES_RE = re.compile(r"\*\*Touches:?\*\*:?(.*?)(?=\s\*\*\w[^*\n]*\*\*|\n[ \t]*\n|\Z)", re.S)
 DO_RE = re.compile(r"\*\*Do:?\*\*:?(.*?)(?=\n[ \t]*\*\*\w[^*\n]*:\*\*|\Z)", re.S)
 # a card that always runs alone: one whose Do asks for the owner's yes, or a walk-through (title)
@@ -173,7 +189,11 @@ def find_tasks(arg: str | None) -> str:
         if not os.path.isfile(arg):
             sys.exit(f"supervisor: no such file: {arg}")
         return os.path.abspath(arg)
-    found = sorted(glob.glob(os.path.join("specs", "*", "tasks.md")))
+    def number(path: str) -> tuple:  # "9-x" before "10-x": by the folder's number, unnumbered ones first
+        n = re.match(r"\d+", os.path.basename(os.path.dirname(path)))
+        return (int(n.group(0)) if n else -1, path)
+
+    found = sorted(glob.glob(os.path.join("specs", "*", "tasks.md")), key=number)
     if not found:
         sys.exit("supervisor: no specs/*/tasks.md here; pass the path of a tasks.md")
     return os.path.abspath(found[-1])
@@ -204,13 +224,14 @@ def parse_tasks(text: str) -> tuple[dict, list]:
         return re.sub(r"\s*\(.*\)$", "", re.sub(r"^\d+\.\s*", "", name))
 
     inline = {}
-    for m in CHECK_RE.finditer(text):
+    lines = checklist(text)
+    for m in lines:
         c = card(m.group(2))
         c["ticked"] |= m.group(1).lower() == "x"
-        c["parallel"] |= bool(m.group(3))
+        c["parallel"] |= bool(m.group(3) or m.group(5))
         c["title"] = c["title"] or (m.group(4) or "").strip()  # a bare "- [x] T010B" under a card's heading
         # a §5 card written inline: its meta line and fields indented under the checklist line
-        block = re.match(r"(?:\n[ \t]+\S[^\n]*)+", text[m.end():])
+        block = INLINE_RE.match(text, m.end())
         if block:
             inline[m.group(2)] = (block.group(0), m.start())
 
@@ -233,28 +254,121 @@ def parse_tasks(text: str) -> tuple[dict, list]:
     for c in cards.values():
         c.pop("headed", None)
         # "phase 11's T034" names a card of another feature: never one of this file's
-        local = PHASE_RE.sub(" ", c["after_text"])
-        c["after"] = ids_in(local, order)
+        local = split_phases(c["after_text"], order)[0]
+        c["after"] = [x for x in ids_in(local, order) if x != c["id"]]  # waiting on itself: drift, dropped
         c["conditional"] = [x for x in ids_in(" ".join(COND_RE.findall(local)), order)
-                            if x not in c["after"]]
+                            if x not in c["after"] and x != c["id"]]
         c["after"] += c["conditional"]  # the condition cannot be read here; waiting is the safe side
-        c["external"] = external_deps(c["after_text"])
+        c["external"] = external_deps(c["after_text"], order)
     # "after: CPF, §5": the card waits for every backlog card too (the close waits for everything)
     backlog_at = re.search(r"^## 5\.", text, re.M)
     if backlog_at:
-        backlog = [m.group(2) for m in CHECK_RE.finditer(text) if m.start() > backlog_at.start()]
+        backlog = [m.group(2) for m in lines if m.start() > backlog_at.start()]
         backlog += [m.group(1) for m in HEAD_RE.finditer(text) if m.start() > backlog_at.start()]
         for c in cards.values():
             if "§5" in c["after_text"]:
                 c["after"] += [x for x in dict.fromkeys(backlog) if x != c["id"] and x not in c["after"]]
     for c in cards.values():  # "blocks: T009" on a backlog card makes T009 wait for it
-        for target in ids_in(PHASE_RE.sub(" ", c["blocks_text"]), order):
-            if target in cards and c["id"] not in cards[target]["after"]:
+        for target in ids_in(split_phases(c["blocks_text"], order)[0], order):
+            if target in cards and target != c["id"] and c["id"] not in cards[target]["after"]:
                 cards[target]["after"].append(c["id"])
     return cards, order
 
 
-def external_deps(text: str) -> list:
+def checklist(text: str) -> list:
+    """CHECK_RE's matches that are cards' own lines: an indented one inside a card heading's body naming
+    another card ("  - [x] T001 reviewed" under CPA's heading) is a note in that card, not T001's line."""
+    heads = list(HEAD_RE.finditer(text))
+    bounds = sorted([m.start() for m in heads] + [m.start() for m in re.finditer(r"^#{1,3} ", text, re.M)])
+    spans = []  # each card heading's body, as parse_tasks reads it: up to the next card or section heading
+    for m in heads:
+        spans.append((m.end(), next((b for b in bounds if b > m.start()), len(text)), m.group(1)))
+    out = []
+    for m in CHECK_RE.finditer(text):
+        if m.group(0)[:1] in " \t" and any(a <= m.start() < b and cid != m.group(2) for a, b, cid in spans):
+            continue
+        out.append(m)
+    return out
+
+
+def tasks_drift(text: str, cards: dict, order: list, status: dict) -> list:
+    """What parse_tasks read but could not use: a card heading it cannot parse (its after: and size go
+    unread), a card defined twice (read as one card), a card naming itself in after: or blocks:
+    (dropped), and open cards that wait on each other in a loop (none of them can start)."""
+    out = []
+    for m in HEAD_LIKE_RE.finditer(text):
+        if not HEAD_RE.match(m.group(0)):
+            out.append(f"{m.group(0).strip()!r} is not read as a card heading: write it "
+                       f"`#### {m.group(1)} — <title>`, or its after:, size and fields are ignored")
+    # a card has one heading and one checklist line at most (one of each is the usual pair)
+    for what, ids in (("card headings", [m.group(1) for m in HEAD_RE.finditer(text)]),
+                      ("checklist lines", [m.group(2) for m in checklist(text)])):
+        counts: dict = {}
+        for cid in ids:
+            counts[cid] = counts.get(cid, 0) + 1
+        out += [f"{cid} is defined {'twice' if n == 2 else f'{n} times'} ({what}); they are read as one card"
+                for cid, n in counts.items() if n > 1]
+    for cid in order:
+        c = cards[cid]
+        for field, said in (("after:", c["after_text"]), ("blocks:", c["blocks_text"])):
+            local = split_phases(said, order)[0]
+            if cid in ids_in(local + " " + " ".join(COND_RE.findall(local)), order):
+                out.append(f"{cid} names itself in {field}; ignored")
+    # a loop of after: (blocks: and §5 included) among open cards: walk their dependencies depth first.
+    # A finished card waits on nothing, so a loop through one holds nobody; every loop of open cards
+    # (each strongly connected group of them) has a back edge, so each deadlock is reported at least once.
+    open_cards = {cid for cid in order if status.get(cid) not in FINISHED}
+    seen: dict = {}  # 1: on the current path, 2: done
+    loops = []
+    for root in order:
+        if root in seen or root not in open_cards:
+            continue
+        path, stack = [root], [iter(cards[root]["after"])]
+        seen[root] = 1
+        while stack:
+            dep = next(stack[-1], None)
+            if dep is None:
+                seen[path.pop()] = 2
+                stack.pop()
+            elif dep not in open_cards:
+                continue
+            elif seen.get(dep) == 1:
+                loop = path[path.index(dep):]
+                start = min(loop, key=order.index)  # the same loop reads the same however it was reached
+                loop = loop[loop.index(start):] + loop[: loop.index(start)]
+                if loop not in loops:
+                    loops.append(loop)
+            elif dep not in seen:
+                seen[dep] = 1
+                path.append(dep)
+                stack.append(iter(cards[dep]["after"]))
+    out += [f"after: cycle {' → '.join(loop + loop[:1])} (each waits for the next): none of them can start"
+            for loop in loops]
+    return out
+
+
+def split_phases(text: str, order: list) -> tuple[str, list]:
+    """The text with its mentions of other features' cards blanked out, and those mentions as
+    (phase, ids). After a comma the list stays with the phase only while its ids are not defined in this
+    tasks.md (`order`) and are of the phase's first id's kind (T… or CP…): "phase 11's T034, T035" is
+    two of phase 11's cards, "phase 11's T034, T001" (T001 here) and "phase 11's T021–T023, CPD" end
+    at the comma, so T001 and CPD are this feature's."""
+    refs, parts, last = [], [], 0
+    for m in PHASE_RE.finditer(text):
+        ids, end = m.group(2), m.end()
+        kind = ids[:2] == "CP"
+        for comma in re.finditer(r",\s*", ids):
+            after = ID_RE.match(ids, comma.end())
+            if after and (after.group(0) in order or (after.group(0)[:2] == "CP") != kind):
+                ids, end = ids[: comma.start()], m.start(2) + comma.start()
+                break
+        parts += [text[last: m.start()], " "]
+        last = end
+        refs.append((m.group(1), ids))
+    return "".join(parts + [text[last:]]), refs
+
+
+def external_deps(text: str, order: list = ()) -> list:
     """The other features' cards an `after:` names: "phase 11's T034" -> {"phase": "11", "card": "T034"};
     a range "phase 11's T021–T023" keeps its end as "through" (build() expands it with that feature's
     cards). Like ids_in, a mention in brackets is no dependency unless it names a condition, "(… if …)":
@@ -262,33 +376,35 @@ def external_deps(text: str) -> list:
     out: list = []
 
     def take(part: str, conditional: bool) -> None:
-        for m in PHASE_RE.finditer(part):
-            for piece in re.split(r"\s*(?:\band\b|\bor\b|&)\s*", m.group(2)):
+        for phase, ids in split_phases(part, order)[1]:
+            for piece in re.split(r"\s*(?:\band\b|\bor\b|&|,)\s*", ids):
                 ends = ID_RE.findall(piece)
                 if not ends:
                     continue
-                dep = {"phase": m.group(1), "card": ends[0], "conditional": conditional}
+                dep = {"phase": phase, "card": ends[0], "conditional": conditional}
                 if len(ends) > 1:
                     dep["through"] = ends[-1]
                 if not any(d["phase"] == dep["phase"] and d["card"] == dep["card"] for d in out):
                     out.append(dep)
 
-    take(re.sub(r"\([^)]*\)", " ", text), False)
+    take(unbracket(text), False)
     take(" ".join(COND_RE.findall(text)), True)
     return out
 
 
 def read_meta(c: dict, body: str) -> None:
     """A card's fields from its body: the meta line(s) before the first bold field, and Start with."""
-    meta = body.split("**", 1)[0]  # the lines before the first bold field
-    if found := re.search(r"\bafter:\s*([^·\n]*)", meta):
+    # the lines before the first bold field; a bold meta field ("**after:** T001 · **S**") is no such field
+    meta = META_BOLD_RE.sub(r"\1", body).split("**", 1)[0]
+    # "after:", also "After:"; "effort high" or "Effort: high"; "· S ·" or "Size: S"
+    if found := re.search(r"(?i:\bafter):\s*([^·\n]*)", meta):
         c["after_text"] = found.group(1).strip()
-    if found := re.search(r"\bblocks:?\s*([^·\n]*)", meta):
+    if found := re.search(r"(?i:\bblocks):?\s*([^·\n]*)", meta):
         c["blocks_text"] = found.group(1).strip()
-    if found := re.search(r"·\s*([SML])\s*(?:·|$)", meta, re.M):
+    if found := re.search(r"(?:·|(?i:\bsize):?)\s*([SML])\s*(?:·|$)", meta, re.M):
         c["size"] = found.group(1)
-    if found := re.search(r"\beffort\s+(\w+)", meta):
-        c["effort"] = found.group(1)
+    if found := re.search(r"(?i:\beffort):?\s+(\w+)", meta):
+        c["effort"] = found.group(1).lower()
     # "· kind frontend ·", "kind: owner", "model `opus`": a field that starts a segment or a line
     if found := re.search(r"(?:^|·)\s*kind\s*:?\s*`?([A-Za-z]+)", meta, re.M | re.I):
         c["kind"] = found.group(1).lower()
@@ -385,7 +501,7 @@ def parse_batches(text: str, cards: dict, order: list) -> tuple[list, list]:
         b = found.setdefault(m.group(2), {"id": m.group(2), "name": "", "named": [], "effort": "",
                                           "start_with": "", "ticked": False, "row": False, "parallel": False})
         b["ticked"] |= m.group(1).lower() == "x"
-        b["parallel"] |= bool(m.group(3))
+        b["parallel"] |= bool(m.group(3) or m.group(5))  # "B3 [P] name", or "B3 name [P]"
         b["name"] = b["name"] or (m.group(4) or "").strip()
     drift, owner = [], {}
     batches = []
@@ -564,8 +680,17 @@ def unattended_deny(text: str) -> list:
     return re.findall(r"`([^`]+)`", found.group(1)) if found else []
 
 
+def unbracket(text: str) -> str:
+    """The text without its brackets, nested ones too: "(beside (x) T004)" leaves no "T004)" behind."""
+    while True:
+        out = re.sub(r"\([^()]*\)", " ", text)
+        if out == text:
+            return out
+        text = out
+
+
 def ids_in(text: str, order: list) -> list:
-    text = re.sub(r"\([^)]*\)", " ", text)  # "(beside T002)" is not a dependency
+    text = unbracket(text)  # "(beside T002)" is not a dependency
     out = []
     for m in RANGE_RE.finditer(text):
         a, b = m.group(1), m.group(2)
@@ -1187,6 +1312,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         for dep in cards[cid]["after"]:
             if dep not in cards:
                 drift.append(f"{cid} waits for {dep}, which tasks.md does not define")
+    drift += tasks_drift(text, cards, order, status)
     drift += batch_drift
     # features whose templates have a Checks table: a pinning test changed by any card but its writer is
     # drift until a checkpoint reviews it, and every done card shows its checks with their evidence
