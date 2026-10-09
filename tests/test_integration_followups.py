@@ -485,6 +485,39 @@ class Docs(unittest.TestCase):
         self.assertNotIn("open its URL", skill)
         self.assertIn("the bare URL shows a locked page", skill)
 
+    def test_the_autopilot_docs_cover_guardrails_the_paused_first_run_keep_env_and_resume_after(self):
+        readme = doc("README.md").split("### The autopilot", 1)[1].split("## What you get", 1)[0]
+        skill = doc("SKILL.md").split("### Autopilot", 1)[1].split("## Templates", 1)[0]
+        for text in (readme, skill):
+            self.assertIn("starts paused" if text is readme else f'paused ("{sv.NEW_PAUSED}")', text)
+            self.assertIn("`keep_env`", text)
+            self.assertIn("`resume_after`", text)
+            self.assertIn("**Resume**", text)
+        self.assertIn("an edit to the files that widens them, by a session or by you, pauses it until you press "
+                      "**Resume** on its dashboard", readme)
+        self.assertIn("An edit that widens them", skill)
+        self.assertIn("pauses the autopilot until the owner presses **Resume** on the dashboard that runs it", skill)
+        guarded = skill.split("**Guardrails.**", 1)[1].split("An edit that widens them", 1)[0]
+        for key in autopilot.GUARDED:  # every setting the dispatcher guards is named (budgets and limits by family)
+            named = {"budget_per_card_usd": "budget_*", "budget_total_usd": "budget_*", "max_attempts": "max_*",
+                     "max_parallel": "max_*", "max_run_hours": "max_*"}.get(key, key)
+            self.assertIn(f"`{named}`", guarded, key)
+        for name in ("Runs as", "App URL", "Never unattended"):
+            self.assertIn(name, guarded)
+        modes = ", ".join(f"`{m}`" for m in autopilot.PERMISSION_MODES[:-1]) + f" or `{autopilot.PERMISSION_MODES[-1]}`"
+        self.assertIn(modes, skill)
+        self.assertIn("resume_after", sv.SETTINGS)
+        self.assertNotIn("keep_env", sv.SETTINGS, "unset unless the owner writes it")
+
+    def test_the_readme_says_what_the_parser_reads_and_flags(self):
+        readme = doc("README.md")
+        self.assertIn("`phase 3's T007, T009`", readme)
+        self.assertNotIn("not a comma", readme)
+        self.assertEqual([d["card"] for d in sv.external_deps("phase 3's T007, T009", ["T001", "T002"])], ["T007", "T009"])
+        self.assertEqual([d["card"] for d in sv.external_deps("phase 3's T007, T002", ["T001", "T002"])], ["T007"])
+        self.assertIn("no sign of work for 4 hours", readme)
+        self.assertNotIn("no commit or hand-off for 4 hours", readme)
+
 
 if __name__ == "__main__":
     unittest.main()
