@@ -121,7 +121,7 @@ class Rules(unittest.TestCase):
         said = "the last rollout card, or the last checkpoint when there is no rollout"
         self.assertIn(said.replace("the last rollout card", "last rollout card"), BLOCK)
         self.assertIn(said, FLAT)
-        results = re.search(r"#### T0nn — Results\n(after: [^\n]*)", BLOCK).group(1)
+        results = re.search(r"#### T009 — Results\n(after: [^\n]*)", BLOCK).group(1)
         self.assertIn("§5", results)
         text = ("# Tasks: X\n\n## 4. Cards\n\n- [x] CPA Stage\n- [ ] T009 Results\n\n"
                 "#### T009 — Results\n" + results.replace("<last rollout card, or the last checkpoint when there is"

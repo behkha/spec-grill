@@ -1,6 +1,6 @@
 ---
 name: spec-grill
-description: Turns a vague feature or project idea into a rigorous constitution.md, spec.md, plan.md, and tasks.md through relentless one-at-a-time interviewing ("grilling") before any code is written. Combines Spec-Driven Development (SDD) phase structure with a decision-tree interview method where every question comes with a recommended answer and nothing is written until the user confirms. Use this skill ONLY when the user explicitly asks to "spec this out," "grill me," invokes spec-driven development, or names this skill directly. Also use it when the user asks to supervise, track, report on or automate the progress of an existing spec-grill tasks.md ("what's done," "what's next," "who is waiting for whom," "start the supervisor," "show the dashboard," "run the cards on autopilot") — that runs the long-lived supervisor session or the autopilot, not the interview. Do NOT trigger proactively on ordinary feature requests, bug fixes, or small changes — this is an opt-in, heavyweight process.
+description: Turns a vague feature or project idea into a rigorous constitution.md, spec.md, plan.md, and tasks.md through relentless one-at-a-time interviewing ("grilling") before any code is written. Combines Spec-Driven Development (SDD) phases with a decision-tree interview where every question comes with a recommended answer and nothing is written until the user confirms. Use only when the user explicitly asks to "spec this out," "grill me," invokes spec-driven development or names this skill, or asks to supervise, track, report on or automate an existing spec-grill tasks.md ("what's done," "what's next," "who is waiting for whom," "start the supervisor," "show the dashboard," "run the cards on autopilot"), which runs the supervisor or the autopilot, not the interview. Do NOT trigger proactively on ordinary feature requests, bug fixes, or small changes: this is an opt-in, heavyweight process.
 ---
 
 # Spec-Grill
@@ -10,7 +10,7 @@ Spec-Grill turns an unspecified idea into a chain of approved artifacts — `con
 - **Grilled phases** (constitution, spec): Claude interviews the user relentlessly, one question at a time, walking a decision tree, always proposing a recommended answer, and never proceeding until the user confirms. These phases are subjective/high-stakes (goals, constraints, requirements), so the cost of getting them wrong via assumption is high.
 - **Drafted phases** (plan, tasks): Claude autonomously drafts the full artifact from the approved spec/plan, then presents it for holistic review and approval — not question-by-question. These phases are more mechanical derivations where interviewing would be exhausting and low-value.
 
-Every phase ends with an explicit approval gate. Nothing is written to disk as final until the user approves it.
+Every phase ends with an explicit approval gate. Nothing is written to disk as final until the user approves it; until then a grilled phase keeps its progress in a draft file (grilling rule 8), so an interrupted interview loses nothing.
 
 After the artifacts are approved, the **supervisor** (see "Supervisor mode") keeps track of the implementation for the user: one long-lived session that watches the feature's state files and reports what finished, who waits for whom, and what to run next. The **autopilot** goes one step further: it starts each card's session itself, at the card's effort, as soon as the card is ready, and turns everything the owner must do into buttons on the dashboard.
 
@@ -21,8 +21,10 @@ A feature with a user interface is designed, prototyped and looked at, not only 
 ```
 specs/
 ├── constitution.md              # project-wide, created once, reused across features
+├── constitution.draft.md        # only while the constitution grill is unfinished (not approved)
 ├── lessons.md                   # project-wide, what past features' cards really took (written by each close)
 └── 001-feature-slug/
+    ├── spec.draft.md            # only while the spec grill is unfinished (not approved)
     ├── spec.md
     ├── plan.md
     ├── ux.md                    # features with a user interface: screens, states, tokens
@@ -39,7 +41,7 @@ specs/
         └── .supervisor.json     # the supervisor's last-seen snapshot
 ```
 
-Feature folder names are auto-derived: an incrementing zero-padded number + kebab-case slug of the feature name (e.g. `specs/002-payment-retries/`). This is a lookup/derivation, not a decision — don't ask the user for it. Check the `specs/` directory for the next available number before creating.
+Feature folder names are auto-derived: an incrementing zero-padded number + kebab-case slug of the feature name (e.g. `specs/002-payment-retries/`). This is a lookup/derivation, not a decision — don't ask the user for it. Check the `specs/` directory for the next available number before creating, after checking that the feature has no folder yet (Phase 0 step 1).
 
 ## The grilling method (applies to constitution + spec phases)
 
@@ -52,24 +54,27 @@ Non-negotiable rules for grilled phases:
 5. **"I don't know" is a valid answer.** Log it verbatim into the artifact's Open Questions section and move on — never block the interview waiting for certainty.
 6. **Walk the decision tree in dependency order.** Some questions only make sense once an earlier one is answered (e.g. don't ask about API contract shape before the user has confirmed there's an API at all). Resolve prerequisites first.
 7. **Nothing is final until explicitly confirmed.** At the end of the phase, show the complete drafted file and ask for explicit approval before writing it / advancing.
+8. **Keep a draft, so an interruption loses nothing.** After each confirmed answer, update the phase's draft: `specs/constitution.draft.md` or the feature folder's `spec.draft.md` (the Spec Grill creates the folder, and takes its number, once the feature is named). It holds the answers confirmed so far (question, answer, who decided), the Open Questions logged, and the branches of the decision tree still open, with the next question first. A draft is not an approved artifact: no later phase, card or session reads it as one. On approval, write the final file and delete the draft. When a draft exists at the start of an interview, show a short summary of it and continue from its next open branch (Phase 0 step 1).
 
 ## Phase 0 — Constitution check
 
-On any `spec-grill` invocation:
+When an interview starts: a feature to spec out, or a constitution amendment. Supervisor mode, the dashboard, the autopilot and a tasks.md upgrade skip this phase; they never interview.
 
-1. Check whether `specs/constitution.md` exists.
-2. **If it doesn't exist**: run the Constitution Grill (below) before anything else — a feature spec built with no stated principles/constraints has nothing to be checked against.
+1. **Resume what exists.** A `specs/constitution.draft.md` resumes the Constitution Grill first, before any feature. Then, when the user names a feature, look for its folder in `specs/` (by slug or name) before deriving a new number; when a `specs/*/spec.draft.md` exists under another name, ask whether this is that feature (recommend yes when the topics match). If there is a folder, resume instead of starting over: a `spec.draft.md` resumes the Spec Grill at its next open branch; otherwise continue after the latest approved artifact (`spec.md` → Plan, `plan.md` → Tasks, `tasks.md` → Handoff). A `*.draft.md` file is never an approved artifact. Say in one line what you found and where you resume. Never overwrite a `tasks.md` whose cards have started (a ticked line, or a RESUME status row past `todo`): offer "Upgrading a tasks.md" (Supervisor mode) or §5 cards instead.
+2. Check whether `specs/constitution.md` exists. **If it doesn't exist**: run the Constitution Grill (below) before anything else — a feature spec built with no stated principles/constraints has nothing to be checked against.
 3. **If it exists**: read it. As the feature spec later takes shape, watch for conflicts or gaps against the constitution's Constraints and Quality Standards. If one appears, stop, flag it explicitly to the user, and grill specifically on whether/how to amend the constitution before continuing the feature spec. Don't silently proceed past a detected conflict, and don't ask about amendment when nothing conflicts.
 4. The user can also invoke constitution amendment directly (e.g. "amend the constitution," "update our project principles") without a feature in progress — same grill, just entered directly instead of via conflict detection.
+5. **No git.** Look up whether the project is a git repository. The cards rely on git (T001's worktree, branches, `[P]`, the merge lock, the supervisor's commit checks). When it isn't one and the constitution doesn't already say so, ask once, recommending `git init` (inside the Constitution Grill's Constraints when step 2 runs it; otherwise now); if the owner declines, record `No git: one card at a time, no [P], no worktrees` in the constitution's Constraints (an amendment when the constitution exists). Under it, Phase 4 drafts the cards without git steps (no worktree, branch, merge or commit; the checkpoints review the files changed since the last checkpoint instead of a diff) and says so in the header.
 
 ## Phase 1 — Constitution Grill
 
 Grill toward these fixed sections (spec-kit standard):
 
 - **Core Principles** — the non-negotiable values/priorities for the project (e.g. "correctness over speed," "no external dependencies without approval")
-- **Constraints** — tech stack, language/framework choices, forbidden dependencies, platform targets
+- **Constraints** — tech stack, language/framework choices, forbidden dependencies, platform targets; and git, when the project has no repository (Phase 0 step 5)
 - **Quality Standards** — testing bar, code review requirements, performance/security baselines. When the project has a user interface, also the **UX & design standard**: the design system or visual style, the accessibility level (recommend WCAG 2.2 AA), the screen sizes supported, and that every interface card is verified by looking at it (screenshots at phone and desktop width), not by tests alone
 - **Governance** — how the constitution itself may be amended in future (who approves, what triggers a review)
+- **Open Questions** — anything deferred or answered "I don't know" during grilling (accumulated throughout, not asked about)
 
 Walk these in order — Governance depends on knowing what's actually being governed, so grill it last. For each section, ask targeted one-at-a-time questions with a recommended answer (e.g. "Should the constitution require test coverage before merge? Recommendation: yes, given most projects invoking this skill care about correctness — but confirm."). Stop and present the full draft `constitution.md` for approval before writing it.
 
@@ -78,10 +83,10 @@ Walk these in order — Governance depends on knowing what's actually being gove
 Grill toward these fixed sections (spec-kit standard):
 
 - **User Scenarios / User Stories** — who's using this and what are they trying to accomplish
-- **Functional Requirements** — what the system must do, numbered and testable
+- **Functional Requirements** — what the system must do, testable, with ids `FR-1`, `FR-2`, … so cards can cite them
 - **Experience** — only when the feature has a user interface (skip it, without asking, when it has none): every screen or view, the flow through them for each user scenario, each screen's states (empty, loading, error, success, and permission-denied where it applies), and what it should feel like, with references (a product, a screenshot, an existing screen in this app). Ids `UX-1`, `UX-2`, … so cards can cite them. Grill it as hard as the requirements: the interface is what users meet, and a back end that works behind screens nobody designed is a failed feature
-- **Non-Functional Requirements** — performance, security, scalability, accessibility, etc.
-- **Success Criteria** — how you'll know this is done and working
+- **Non-Functional Requirements** — performance, security, scalability, accessibility, etc. Ids `NFR-1`, `NFR-2`, …
+- **Success Criteria** — how you'll know this is done and working. Ids `SC-1`, `SC-2`, …
 - **Out of Scope** — what this explicitly does NOT cover (prevents scope creep mid-implementation)
 - **Open Questions** — anything deferred, unresolved, or answered "I don't know" during grilling
 
@@ -122,12 +127,12 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
 ### Cutting the cards
 
 1. **One card = one session.** Size each card S, M or L against one session's context budget; split every L. Also split where the work waits on someone else — an owner's decision, a paid step, an external party, a deploy — as a suffixed card (`T012A`), so no session idles while it waits.
-2. **Stages.** Group cards into numbered stages in dependency order (typical: re-verify and baseline; pure contracts; storage; services; API; UI; docs; rollout; close). **When the feature has an interface, cut stages by user scenario instead of by layer:** each build stage delivers one scenario (or a few small ones) end to end — its storage, its API and its screens — so the interface is built and seen from the first build stage, not squeezed in at the end. Never let a stage close with a scenario's back end done and its screens unbuilt. End every build stage with a **checkpoint card** (`CPA`, `CPB`, …) that merges the stage, runs the full checks and pinning tests, reviews the stage's diff at high effort, turns each confirmed finding into a §5 backlog card, and batches §5's open small cards (rule 11).
+2. **Stages.** Group cards into numbered stages in dependency order (typical: re-verify and baseline; pure contracts; storage; services; API; UI; docs; rollout; close). **When the feature has an interface, cut stages by user scenario instead of by layer:** each build stage delivers one scenario (or a few small ones) end to end — its storage, its API and its screens — so the interface is built and seen from the first build stage, not squeezed in at the end. Never let a stage close with a scenario's back end done and its screens unbuilt. End every build stage with a **checkpoint card** (`CPA`, `CPB`, …) that merges the stage, runs the full checks and pinning tests, reviews the stage's diff at high effort, turns each confirmed finding into a §5 backlog card, and batches §5's open small cards (rule 11). Every card whose `after:` names no card that comes after the latest checkpoint before it (a stage's first cards, the first rollout card) names that checkpoint too (in the first build stage, CP0, or T001 when there is no CP0): the owner's stage review holds only the cards that name the checkpoint and the cards that wait on them, so a card waiting only on an earlier stage's card would skip it. A card that waits on another feature's card names it as `phase 11's T034` (or `phase 11's T021–T023`; the number is that feature's folder number); the supervisor reads that feature's tasks.md and RESUME for it.
 3. **First card re-verifies.** The plan was written against older code: card T001 locates every fact the plan relies on *by symbol* on today's code, writes a code map, measures baselines (every number with the command that produced it), creates the state file and any worktree. When the spec has Open Questions that block cards, add `CP0` — one plain-words page for the owner, each question with a recommended default and the card that waits for it.
 4. **Last cards close.** A close card records the results against the success criteria in a Checks table (a report, if the project keeps one), then `CPEND` checks every card is ticked or waived and writes the **retro**: it runs `supervisor.py <tasks.md> --lessons` (each card's kind, size, effort and model beside the runs, tries, cost and hours it really took, and a summary per effort tier) and appends to `specs/lessons.md` a dated section for the feature: the measured table, then a few lines on what to do differently (tiers that were too low or too high, card shapes that overran, failures that came back, checks that were hard to evidence). Measured numbers only; a card run by hand says so, and a batch's cards are measured together, as their batch. The next feature's Phase 4 reads it.
-5. **`[P]` only when the cards' Touches lists don't overlap.** Each `[P]` card names whom it may run beside; parallel cards work in their own worktree and branch and merge back at the end of the card.
+5. **`[P]` only when the cards' Touches lists don't overlap.** Each `[P]` card names whom it may run beside; parallel cards work in their own worktree and branch and merge back at the end of the card. No `[P]` at all when the constitution says no git (Phase 0 step 5).
 6. **Code by symbol, never by line number.** Lines move between the plan and the session.
-7. **Every card names its effort tier** (and, when the environment has one, the command that sets it), **its kind** — `kind backend`, `kind frontend`, `kind fullstack`, or `kind owner` for a card only the owner can do (sign, pay, call someone; the autopilot never starts it) — and, when a cheaper or stronger model fits, `model <name>`. The autopilot reads all three from the meta line.
+7. **Every card names its effort tier** (and, when the environment has one, the command that sets it), **its kind** — `kind backend`, `kind frontend`, `kind fullstack`, or `kind owner` for a card only the owner can do (sign, pay, call someone; the autopilot never starts it) — and, when a cheaper or stronger model fits, `model <name>`. The autopilot reads all three from the meta line, and never starts a card without a `kind` (once the feature uses the autopilot, the supervisor lists such cards under "Needs you").
 8. **Interface cards prove themselves visually.** A `kind frontend` or `kind fullstack` card's **Verify** runs the app, drives its screens in a browser through every state the card builds, saves screenshots at phone and desktop width to `state/screens/T0nn/` (names like `login-error-phone.png`), checks the browser console is clean and an accessibility check passes, and compares the result with `ux.md` and the prototype. Its **Done when** includes the screenshots; its **Read** includes the `ux.md` sections and the prototype screens it builds. Give interface cards effort high: they are judged by how they look and behave, which tests do not catch.
 9. **Owner actions.** Any step the constitution or spec reserves for the owner (deploys, production writes, paid runs, new dependencies, outward messages) is a protocol rule: the session asks in that session, then runs it after a yes — or hands over the exact commands when it can't. A session the autopilot started asks through RESUME's Approvals table and stops until the answer comes. List such steps' commands on §6's **Never unattended** line so the autopilot's sessions cannot run them on their own.
 10. **Diverging from the plan.** When a card splits, merges or reorders plan items, list each change and its reason in the header's "Where the cards differ from plan.md".
@@ -148,8 +153,8 @@ Once `plan.md` is approved, autonomously draft `tasks.md`. It is not a to-do lis
 ### Checks before presenting
 
 - Every FR/NFR maps to at least one card (§3 table); every `UX-n` screen maps to the frontend or fullstack card that builds it, and every user scenario has at least one; no build stage ends with only back-end cards when its scenario has screens; every success criterion names the card that measures it; every Open Question is a decisions row with the card it must be answered before; every rule that needs a pinning test names the test file and the card that writes it. Flag any gap to the user explicitly.
-- Every card has: Start with, Read, Do, Done when, Verify, Touches, and a `kind` on its meta line. No card says "see above" — a card must stand alone. Every **Done when** criterion is observable (rule 14): rewrite any that only a judgment could pass.
-- Every card's meta line has an `after:` field naming the cards it waits for by id (ranges like `T002–T005` are fine; notes go in parentheses, such as `(beside T002)`), because the supervisor builds the waiting graph from it. Run `hooks/supervisor.py` on the draft and check its "Waiting" and "Ready" lists match the stage outline.
+- Every card, checkpoints and the close included, has: Start with, Read, Do, Done when, Verify, Touches, and a `kind` on its meta line. No card says "see above" — a card must stand alone. Every **Done when** criterion is observable (rule 14): rewrite any that only a judgment could pass.
+- Every card's meta line has an `after:` field naming the cards it waits for by id (ranges like `T002–T005` are fine; notes go in parentheses, such as `(beside T002)`), because the supervisor builds the waiting graph from it. Every card that waits on no card after the latest checkpoint names that checkpoint (rule 2); another feature's card is named `phase 11's T034`. Run `hooks/supervisor.py` on the draft and check its "Waiting" and "Ready" lists match the stage outline.
 - Batches (rule 11): every S card that is not on the always-alone list is in a batch, unless the header says why not. Run `hooks/supervisor.py` on the draft and confirm the ready and waiting batches match the stage outline (a stage's batch is ready when the cards before it are done, and its cards never show as ready alone), the drift list says nothing about batches (an always-alone card, an L, more than 4 by size, a card outside a batch sitting between two of its cards), and the report has no "small cards are in no batch" heads-up.
 
 ### Presenting
@@ -160,10 +165,10 @@ Present the complete draft for holistic approval, revise as needed, then write `
 
 Once `tasks.md` is approved, make sure the project registers the **card-rename hook**, then stop.
 
-**The card-rename hook.** Rule 1 of the session protocol (rename the session to its card) is easy to forget, so a hook enforces it. `hooks/card-rename.py` (next to this file; standard library only) runs on every prompt; when the prompt is a card's **Start with** line, it finds that `tasks.md` (absolute path, or a `…/` path resolved from the session's directory and from the main checkout of a git worktree), reads the name pattern from §1 and the card's title from the checklist, and tells Claude to rename the session before anything else. Every other prompt passes through. Check the project's `.claude/settings.local.json` (git-ignored; `.claude/settings.json` if the team shares the hook) for a `UserPromptSubmit` entry whose command runs `card-rename.py`. If none is there, ask the user, and after a yes merge this entry into the existing hooks (never replace the file):
+**The card-rename hook.** Rule 1 of the session protocol (rename the session to its card) is easy to forget, so a hook enforces it. `hooks/card-rename.py` (in this skill's directory; standard library only) runs on every prompt; when the prompt is a card's **Start with** line, it finds that `tasks.md` (absolute path, or a `…/` path resolved from the session's directory and from the main checkout of a git worktree), reads the name pattern from §1 and the card's title from the checklist, and tells Claude to rename the session before anything else. Every other prompt passes through. Check the project's `.claude/settings.local.json` (git-ignored; `.claude/settings.json` if the team shares the hook) for a `UserPromptSubmit` entry whose command runs `card-rename.py`. If none is there, ask the user, and after a yes merge this entry into the existing hooks (never replace the file), with `<skill dir>` replaced by the absolute path of the directory holding this SKILL.md (looked up in Phase 4; it may be `~/.claude/skills/spec-grill`, a project's `.claude/skills/spec-grill` or `~/.agents/skills/spec-grill`, so never assume one):
 
 ```json
-{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 ~/.claude/skills/spec-grill/hooks/card-rename.py", "timeout": 10}]}]}}
+{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 <skill dir>/hooks/card-rename.py", "timeout": 10}]}]}}
 ```
 
 Test it before saying it works: pipe `{"cwd": "<project>", "prompt": "<T001's Start with line>"}` into the command and check the name it prints.
@@ -188,6 +193,8 @@ When the user asks only to see the dashboard, start `--serve` in the background,
 
 **Entering supervisor mode** (the user asks to supervise, track or report on a feature, or pastes §6's **Start with** line): find the feature's `tasks.md` (the one the user names; otherwise the newest `specs/NNN-*/tasks.md`, asking only when several are in progress). If it has a §6, follow it. If it predates §6, or its §6 predates the autopilot (no "Never unattended" line), follow the §6 template below with its paths filled in, and offer to update §6 in the file. Supervisor mode never interviews and never edits the artifacts.
 
+Several features: a card may wait on another feature's card (`after: phase 11's T034`), which the supervisor reads from that feature's folder. `--autopilot` dispatches every feature in `specs/` that has a `state/autopilot.json`, not only the one named (whose file it creates); each runs only while its own settings say on, so say so when siblings have one, and pause a sibling on its dashboard to keep it out.
+
 "Never sleeps" has two layers and the user should know which is which: `supervisor.py --watch` or `--serve` in a terminal tab costs nothing and runs until the tab closes; the supervisor session sleeps between events and is woken by each `--wait` exit, so it spends tokens only when something changed. It lasts as long as the session stays open (on desktop, the app's keep-awake setting stops the machine sleeping under it). If it is closed, a new session started from §6's line picks up from the files with nothing lost.
 
 ### Upgrading a tasks.md drafted with an older template
@@ -197,7 +204,7 @@ When the user asks to bring an existing `tasks.md` up to the current template (a
 1. Make sure no card session works on the feature: the autopilot is paused and `runs.json` has no live run, or the owner confirms no session is open. Copy the file (and RESUME) to a backup first.
 2. §1: add what the template's §1 has and the file lacks, inside the matching items (start, scope, context budget, owner's yes, finish), keeping the file's numbering. The autopilot's unattended rules name §1's items by their titles (the Preconditions, scope, Context budget, Owner's yes and Finish items), not by number: when one of the file's items has a different title, say which and offer to rename it.
 3. §2: add the hand-off template's missing lines and its Checks table; add RESUME's missing sections to the RESUME template.
-4. The checkpoint routine, the Results and CPEND cards, §5's Batches heading, and a batch table for each stage whose cards are not started yet (rule 11): as in the template, cards not started only. Never edit a done card, a ticked line, or a card that is `doing`.
+4. The checkpoint routine, the Results and CPEND cards, §5's Batches heading, and a batch table for each stage whose cards are not started yet (rule 11): as in the template, cards not started only. Give every card not yet started that lacks them a `kind` on its meta line and a **Touches** line: the autopilot never starts a card without a `kind`, and a card without Touches overlaps everything. Never edit a done card, a ticked line, or a card that is `doing`.
 5. When cards are already done, add `**Checks from:** <today>` under §2's hand-off template: cards finished before that day are exempt from the evidence checks (their hand-offs predate the Checks table). Write `Pins reviewed up to <HEAD's commit>` in RESUME, so the pin check starts from today instead of reporting the feature's whole history.
 6. Run `supervisor.py` on the file before and after; the ready and waiting lists must not change, and new drift must be only what the upgrade intends. Show the owner a short summary of what changed.
 
@@ -250,6 +257,9 @@ With the autopilot on, the supervisor session still reports and answers; it neve
 
 ## Governance
 - ...
+
+## Open Questions
+- ...
 ```
 
 ### spec.md
@@ -260,7 +270,7 @@ With the autopilot on, the supervisor session still reports and answers; it neve
 - ...
 
 ## Functional Requirements
-1. ...
+- FR-1: ...
 
 ## Experience
 (features with a user interface)
@@ -269,10 +279,10 @@ With the autopilot on, the supervisor session still reports and answers; it neve
 - Look and feel: <references>
 
 ## Non-Functional Requirements
-- ...
+- NFR-1: ...
 
 ## Success Criteria
-- ...
+- SC-1: ... (measures FR-1)
 
 ## Out of Scope
 - ...
@@ -534,7 +544,7 @@ Checklist (ticked by the session that finishes the card):
 - [ ] B1 <batch name>
 - [ ] CPA <stage> merged and pinned
 - [ ] …
-- [ ] T0nn Close: results against the success criteria
+- [ ] T009 Close: results against the success criteria
 - [ ] CPEND Feature done
 
 **Who may run beside whom:** Stage 2: B1 ∥ T003; …
@@ -542,7 +552,10 @@ Checklist (ticked by the session that finishes the card):
 Each card: **fulfills · after · size · effort · kind** (`backend`, `frontend`, `fullstack`, `owner`; then
 `· model <name>` when the card needs a particular model), **Start with** (paste as the session's first message),
 **Read**, **Do**, **Done when**, **Verify**, **Hand-off extras**, **Touches** (files, to see which cards
-may run side by side), and **Never** where a card has its own.
+may run side by side), and **Never** where a card has its own. A card without a `kind` is never started
+by the autopilot. A card that waits on no card after the latest checkpoint (a stage's first cards)
+names that checkpoint in `after:`, because the owner's stage review holds only the cards that name it
+and the cards that wait on them. A card that waits on another feature's card names it as `phase 11's T034` (that feature's folder number).
 
 **Batches** (`B1`, `B2`, …; chosen by the rules under §5's Batches): cards that run in one session, in
 the listed order. A stage's batches are in a table under the stage's heading (batch | name | cards, in
@@ -583,7 +596,9 @@ fulfills <baselines> · after: <precondition> · M · effort high · kind fullst
 **Read:** <spec and plan sections; every code reference in the plan, as a list to locate>.
 **Do:**
 1. Create the integration worktree and branch; create RESUME from §2's template with a status row per
-   card of §4.
+   card of §4. No git repository: create RESUME only and, unless the constitution says "no git", ask the
+   owner (`git init`, or record no git in the constitution) in a RESUME decisions row naming T001, and stop. Under "no git" there is no worktree, branch or
+   commit: cards run one at a time in the project folder, none `[P]`.
 2. Locate every code fact the plan relies on by symbol on today's code; write the code map (fact → file
    and symbol now; moved, renamed or gone). A missing contract blocks the feature: write it in RESUME and
    tell the owner.
@@ -603,6 +618,9 @@ after: T001 · S · effort low · kind backend
 card that waits for it. Put each in RESUME's decisions table (question, recommended, needed before);
 the owner answers there or on the dashboard, and each card waits only for its own questions.
 **Done when:** every question is a decisions row with its recommendation and its waiting card.
+**Verify:** `python3 <skill dir>/hooks/supervisor.py <absolute path>/tasks.md` lists each question under
+"Needs you" and each waiting card as waiting for it.
+**Touches:** `specs/<NNN-slug>/state/` (RESUME's decisions table).
 
 ### Stage 2 — <user scenario> (end to end: storage, API, screens)
 
@@ -652,6 +670,10 @@ after: T002–T004 · S · effort high · kind fullstack
 **Read:** RESUME; the hand-offs' "next card must know" lines; plan <checkpoint>.
 **Do:** The checkpoint routine. Pins: <rules>. Review against spec §<n>; design review of <screens>.
 **Done when:** green; the pins listed; the findings recorded as §5 cards and batched.
+**Verify:** <the full check command> and the stage's pinning tests on the integration branch;
+`python3 <skill dir>/hooks/supervisor.py <absolute path>/tasks.md` shows no drift and no open checks
+for the stage's cards.
+**Touches:** the whole repository (it merges the stage), so it runs alone; state files; §5 of this file.
 
 ### Stage N — Rollout
 
@@ -660,16 +682,24 @@ verify on the deployed system, the rollback path.>
 
 ### Close
 
-#### T0nn — Results
+#### T009 — Results
 after: <last rollout card, or the last checkpoint when there is no rollout>, §5 · M · effort medium · kind fullstack
 
+**Start with:** `<Feature> · T009. Follow <absolute path>/tasks.md §1, then card T009.`
+**Read:** spec Success Criteria; §3's success-criteria line; RESUME; the hand-offs of the cards that
+measure them.
 **Do:** every success criterion with its measured number and source, as a Checks table in the
 hand-off (criterion | verdict | evidence | correction)<; the project's phase report>.
 **Done when:** every SC has a row with its number and evidence; none is left out because it failed.
+**Verify:** every `SC-n` in spec.md has a row in `state/handoff/T009.md`'s Checks table; re-run each
+row's command and get the number it records.
+**Touches:** `specs/<NNN-slug>/state/`<, the project's phase report>.
 
 #### CPEND — Feature done
-after: T0nn · S · effort low · kind fullstack
+after: T009 · S · effort low · kind fullstack
 
+**Start with:** `<Feature> · CPEND. Follow <absolute path>/tasks.md §1, then card CPEND.`
+**Read:** RESUME; hand-off T009; `specs/lessons.md` when it exists.
 **Do:** every card ticked or waived in RESUME; switches in their final state; locks released. Retro:
 run `python3 <skill dir>/hooks/supervisor.py <absolute path>/tasks.md --lessons` and append a dated
 section for this feature to `specs/lessons.md` (create it with a `# Lessons` heading if missing): the
@@ -677,6 +707,9 @@ table it prints, then at most ten lines on what the next feature should do diffe
 a number in the table or a hand-off (tiers too low or too high, card shapes that overran, failures
 that came back, checks that were hard to evidence). Tell the owner what comes next.
 **Done when:** every card finished; `specs/lessons.md` has this feature's section.
+**Verify:** `python3 <skill dir>/hooks/supervisor.py <absolute path>/tasks.md` shows every card but CPEND
+finished and no drift; `specs/lessons.md` has a section dated today with the `--lessons` table.
+**Touches:** `specs/<NNN-slug>/state/`, `specs/lessons.md`.
 
 ---
 
@@ -704,7 +737,11 @@ these and for a stage's batches:
 | B2 | <name> | T0nnB, T0mmC | high | `<Feature> · B2. Follow <absolute path>/tasks.md §1, then the cards of batch B2 (§5, Batches) in order.` |
 
 Add cards here in the same format, numbered `T0nnB`, `T0nnC` after the card they split from (`A` is
-taken by planned splits), with a one-line reason and a meta line `added by T0nn · after: T0nn ·
+taken by planned splits). A checkpoint's findings split from no card: they are numbered after the last
+planned card of the stage it reviews (CPA after T004: `T004B`, `T004C`, …), and only the checkpoint
+session numbers them; a design-review line turned into a card is numbered after the card it names. The
+session adding a card takes the next suffix that no card in this file and no RESUME row uses yet (B, C,
+… Z, then B2, C2, …). Each card comes with a one-line reason and a meta line `added by T0nn · after: T0nn ·
 blocks: T0nn · S · effort <tier> · kind <kind>` (the supervisor reads `after:` and `blocks:`). Add the card's row to
 RESUME's status table in the same session. When done, add under the heading:
 `- [x] T0nnB done <date> (<commit>; hand-off T0nnB.md)`. A short backlog card may also be written inline: its
