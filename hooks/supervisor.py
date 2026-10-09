@@ -145,7 +145,8 @@ def run_alive(run: dict) -> bool:
     if run.get("ended") or not pid_alive(run.get("pid")):
         return False
     try:
-        args = subprocess.run(["ps", "-o", "args=", "-p", str(int(run["pid"]))],
+        # -ww: without a TTY procps cuts args= at 80 columns, before the session id
+        args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(int(run["pid"]))],
                               capture_output=True, text=True, timeout=3).stdout
     except Exception:
         return True

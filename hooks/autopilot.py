@@ -93,6 +93,8 @@ RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\
                          r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\b(?:\s*\(([\w/+-]+)\))?", re.I)  # "resets 3:10pm (Europe/London)"
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 CARDS_SEEN: dict = {}  # tasks -> (cards, has a Never unattended list) of the last read, to spot one mid-write
+KILL_GRACE = 30  # seconds a stopped session gets to exit on SIGTERM before its process group gets SIGKILL
+CHECK_STALE = 300  # seconds after which a Chrome check still "running" is taken for one that died
 
 RULES = """You are running unattended: the Spec-Grill autopilot started this session for {what} of
 {tasks}. Nobody reads this conversation while it runs, so never wait for a reply; the files are your
@@ -533,7 +535,8 @@ def merge_lock_path(tasks: str) -> str:
 def clear_merge_lock(tasks: str, s: dict, reg: dict) -> str:
     """Remove a merge lock its holder left behind ("" when it stays): one whose holder unit has no live
     session. It stays while a just-taken lock has no holder line yet (2 minutes), and while the holder is a
-    unit the owner runs by hand (taken over, or never run by the autopilot and `doing`)."""
+    unit the owner runs by hand (taken over, or never run by the autopilot and `doing`). A batch's session
+    may name any card of its batch (§1's rules say "your card": the one it is working on)."""
     held = sv.merge_lock(state_dir(tasks))
     if not held:
         return ""
@@ -541,11 +544,13 @@ def clear_merge_lock(tasks: str, s: dict, reg: dict) -> str:
     if not who:
         if held["ts"] and time.time() - held["ts"] < 120:
             return ""
-    elif any(run_unit(r) == who or r["card"] == who for r in live(reg)):
+    elif any(run_unit(r) == who or r["card"] == who or who in members(s, run_unit(r)) for r in live(reg)):
         return ""
-    elif who in reg["manual"] or (is_unit(s, who) and not unit_runs(reg, s, who)
-                                  and any(s["status"].get(c) == "doing" for c in members(s, who))):
-        return ""
+    else:
+        unit = unit_of(s, who) if who in s["cards"] else who  # a card of an unfinished batch runs with it
+        if unit in reg["manual"] or (is_unit(s, unit) and not unit_runs(reg, s, unit)
+                                     and any(s["status"].get(c) == "doing" for c in members(s, unit))):
+            return ""
     shutil.rmtree(merge_lock_path(tasks), ignore_errors=True)
     return f"cleared the merge lock {who or 'nobody'} held: no live session of it is left"
 
@@ -812,15 +817,31 @@ def resume_after(runs: list, now: float) -> float:
     return max(now + RESUME_MIN_S, *(reset_time(t) or now + RESUME_DEFAULT_S for t in texts))
 
 
-def kill(run: dict) -> bool:
-    """Stop a session's process group, only after checking the pid still is that session."""
-    if not sv.run_alive(run):
+def kill(run: dict, sig: int = signal.SIGTERM) -> bool:
+    """Signal a session's process group, only after checking the pid still is that session: the child
+    this process started (not reaped yet, so its pid is not reused), else what `ps` says. The first
+    SIGTERM is recorded on the run (kill_sent_ts): step() sends SIGKILL once it outlives KILL_GRACE."""
+    proc = PROCS.get(run.get("session"))
+    ours = proc is not None and proc.pid == run.get("pid") and proc.poll() is None
+    if not ours and not sv.run_alive(run):
         return False
     try:
-        os.killpg(int(run["pid"]), signal.SIGTERM)
-        return True
+        os.killpg(int(run["pid"]), sig)
     except (OSError, TypeError, ValueError):
         return False
+    if sig == signal.SIGTERM:
+        run.setdefault("kill_sent_ts", time.time())
+    return True
+
+
+def free_worktree(s: dict, units: list) -> None:
+    """Set the `doing` cards of units the dispatcher stopped back to `todo`, as the owner's Stop does: a
+    stopped card no longer holds the integration worktree, so the other cards may go on."""
+    for unit in units:
+        for c in members(s, unit) if is_unit(s, unit) else []:
+            if s["status"].get(c) == "doing" and c in s["rows"]:
+                with contextlib.suppress(Refused):
+                    set_row(s, "status", {"card": c}, {"status": "todo"})
 
 
 def notify(title: str, text: str) -> None:
@@ -920,14 +941,16 @@ Chrome, {what} Then close any tab you opened. Reply with one line of JSON and no
 instead of the app."""
 
 
-def probe_chrome(tasks: str, s: dict, cfg: dict, account: str = "") -> None:
-    """Check once, in the background, that the sessions' Chrome reaches the app signed in."""
+def probe_chrome(tasks: str, s: dict, cfg: dict, account: str = "", started: float = 0.0) -> None:
+    """Check once, in the background, that the sessions' Chrome reaches the app signed in. started is the
+    ts of the check's "running" mark: the result is dropped when a newer check (or Check again) replaced it."""
     url = s["autopilot"]["runs_as"]["app_url"]
     what = (f"open {url} in a new tab and wait for it to load." if url
             else "list the open tabs (this only checks that the Chrome tools work).")
     cmd = [launcher(cfg, s), "-p", "--chrome", "--output-format", "json", "--model", "haiku",
            "--max-budget-usd", "0.5", "--permission-mode", "auto", PROBE.format(what=what)]
-    result = {"ok": False, "detail": "", "ts": time.time(), "running": False, "url": url, "account": account}
+    result = {"ok": False, "detail": "the check stopped before it answered", "ts": time.time(), "running": False,
+              "url": url, "account": account}
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=240, cwd=repo_root(tasks),
                              env=session_env(cfg, SPEC_GRILL_PROBE="1"))
@@ -936,15 +959,24 @@ def probe_chrome(tasks: str, s: dict, cfg: dict, account: str = "") -> None:
         answer = json.loads(found.group(0)) if found else {}
         result.update(ok=bool(answer.get("ok")), detail=str(answer.get("detail") or text)[:300],
                       final_url=str(answer.get("final_url") or ""))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except Exception as error:  # an answer of the wrong shape too: the check must end with a result
         result["detail"] = f"the check could not run: {error}"
-    with guard(tasks):
-        reg = registry(tasks)
-        reg["chrome_check"] = result
-        save_registry(tasks, reg)
-        if not result["ok"] and settings(tasks)["auto"]:
-            change_settings(tasks, auto=False, paused_reason=f"Chrome check failed: {result['detail']} "
-                            "Fix it (sign the sessions' Chrome in to the app), then press Check again.")
+    finally:
+        with guard(tasks):
+            reg = registry(tasks)
+            if not started or (reg.get("chrome_check") or {}).get("ts") == started:
+                reg["chrome_check"] = result
+                save_registry(tasks, reg)
+                if not result["ok"] and settings(tasks)["auto"]:
+                    change_settings(tasks, auto=False, paused_reason=f"Chrome check failed: {result['detail']} "
+                                    "Fix it (sign the sessions' Chrome in to the app), then press Check again.")
+
+
+def chrome_checking(check) -> bool:
+    """A Chrome check is under way: one marked running less than CHECK_STALE seconds ago (the probe
+    itself gives up after 240). An older one died with its thread or its dispatcher: it holds nothing."""
+    check = check or {}
+    return bool(check.get("running")) and time.time() - float(check.get("ts") or 0) < CHECK_STALE
 
 
 def chrome_problem(tasks: str, s: dict, reg: dict, cfg: dict) -> str:
@@ -953,12 +985,14 @@ def chrome_problem(tasks: str, s: dict, reg: dict, cfg: dict) -> str:
         return ""
     check = reg.get("chrome_check") or {}
     account = (reg.get("account") or {}).get("email", "")
-    fresh = check and time.time() - check.get("ts", 0) < 6 * 3600 and check.get("account") == account
-    if check.get("running") and time.time() - check.get("ts", 0) < 300:
+    fresh = (check and not check.get("running") and time.time() - float(check.get("ts") or 0) < 6 * 3600
+             and check.get("account") == account)
+    if chrome_checking(check):
         return "checking that the sessions' Chrome reaches the app signed in"
     if not fresh:
         reg["chrome_check"] = {"running": True, "ts": time.time(), "account": account}
-        threading.Thread(target=probe_chrome, args=(tasks, s, cfg, account), daemon=True).start()
+        threading.Thread(target=probe_chrome, args=(tasks, s, cfg, account, reg["chrome_check"]["ts"]),
+                         daemon=True).start()
         return "checking that the sessions' Chrome reaches the app signed in"
     return "" if check.get("ok") else f"the Chrome check failed: {check.get('detail', '')}"
 
@@ -1006,10 +1040,12 @@ def step(tasks: str) -> list:
         # sessions that gave their final result but did not exit hold a slot and hide a pause: stop them
         now = time.time()
         for run in live(reg):
+            if run.get("kill_sent_ts"):
+                continue  # stopped already: SIGKILL follows below if it lingers
             view = live_view(tasks, run["card"], events=False)
             if view.get("final") and view.get("last_output_ts") and now - view["last_output_ts"] > cfg["result_grace_s"]:
-                kill(run)
-                events.append(f"{run_unit(run)}: its session gave its result but did not exit; stopped it")
+                if kill(run):
+                    events.append(f"{run_unit(run)}: its session gave its result but did not exit; stopped it")
 
         # silent or overlong sessions
         for run in live(reg):
@@ -1017,26 +1053,41 @@ def step(tasks: str) -> list:
             quiet = now - (os.path.getmtime(path) if os.path.exists(path) else now)
             started = dt.datetime.strptime(run["started"], "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc)
             long = now - started.timestamp() > cfg["max_run_hours"] * 3600
-            if (quiet > cfg["quiet_minutes"] * 60 or long) and run_unit(run) not in reg["attention"]:
+            if ((quiet > cfg["quiet_minutes"] * 60 or long) and run_unit(run) not in reg["attention"]
+                    and not run.get("kill_sent_ts")):
                 why = f"silent for {int(quiet // 60)} min" if not long else f"ran over {cfg['max_run_hours']} h"
                 kill(run)
+                run["free_on_end"] = True  # its cards leave `doing` once it has ended (it may linger)
                 reg["attention"][run_unit(run)] = f"its session was stopped ({why}); see `state/{run['log']}`"
                 events.append(f"{run_unit(run)}: stopped its session ({why})")
 
+        # sessions that outlived their SIGTERM (ignored it, or the owner's Stop did not take): SIGKILL
+        for run in live(reg):
+            sent = run.get("kill_sent_ts")
+            if sent and now - sent > KILL_GRACE and kill(run, signal.SIGKILL) and not run.get("killed_ts"):
+                run["killed_ts"] = now
+                events.append(f"{run_unit(run)}: its session outlived the stop by {KILL_GRACE} s; sent it SIGKILL")
+
         save_registry(tasks, reg)
-        before = signature(tasks)
-        s = sv.build(tasks, 4)
-        if not whole(tasks, s, before, events):
+        s = read_whole(tasks, events)
+        if s is None:
             return events  # tasks.md was read mid-write: prune, pause and start nothing on what it said
-        # the sessions that ended on this pass, or on one that waited for a whole read: judged once the files
+        # the sessions that ended on this pass, or on one that waited for a whole read: settled once the files
         # are read whole (judge() may run on them again after a pass that waits; what it does is the same)
         settling = [r for r in reg["runs"] if r.get("unsettled")]
+        # a session the dispatcher stopped (silent, overlong) frees its cards' `doing` rows only now that it
+        # has ended, so it can't write RESUME after its card was freed; once (the flag goes with it)
+        if stopped := [run_unit(r) for r in settling if r.pop("free_on_end", False)]:
+            free_worktree(s, stopped)
+            s = read_whole(tasks, events)
+            if s is None:
+                save_registry(tasks, reg)
+                return events
         said, ticked = judge(tasks, s, reg, settling)
         events += said
         if ticked:  # it marked a split card done: read the files again
-            before = signature(tasks)
-            s = sv.build(tasks, 4)
-            if not whole(tasks, s, before, events):
+            s = read_whole(tasks, events)
+            if s is None:
                 save_registry(tasks, reg)
                 return events
         if cleared := clear_merge_lock(tasks, s, reg):  # its holder's session ended without releasing it
@@ -1072,14 +1123,20 @@ def step(tasks: str) -> list:
         if cfg["auto"]:
             events += dispatch(tasks, s, reg, cfg)
             save_registry(tasks, reg)
-            before = signature(tasks)
-            s = sv.build(tasks, 4)
-            if not whole(tasks, s, before, events):
+            s = read_whole(tasks, events)
+            if s is None:
                 return events
             cfg = settings(tasks)  # dispatch may have paused (the budget, a launcher that cannot start)
         events += alert(tasks, s, reg, cfg)
         save_registry(tasks, reg)
     return events
+
+
+def read_whole(tasks: str, events: list) -> dict | None:
+    """The supervisor's picture of tasks, or None when tasks.md was caught mid-write (whole())."""
+    before = signature(tasks)
+    s = sv.build(tasks, 4)
+    return s if whole(tasks, s, before, events) else None
 
 
 def whole(tasks: str, s: dict, before, events: list) -> bool:
@@ -1302,7 +1359,7 @@ def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
     running = live(reg)
     if len(running) >= cfg["max_parallel"]:
         return f"{len(running)} sessions are running (the limit is {cfg['max_parallel']})"
-    if cfg.get("chrome") and (reg.get("chrome_check") or {}).get("running"):
+    if cfg.get("chrome") and chrome_checking(reg.get("chrome_check")):
         return "checking that the sessions' Chrome reaches the app signed in"
     if cfg.get("chrome") and running:
         return f"{len(running)} sessions are running (with Chrome, the limit is 1: they share one browser)"
@@ -1374,17 +1431,26 @@ def alert(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
 
 
 def loop(features, interval: float, stop: threading.Event, say=print) -> None:
-    """Run step() for every feature that uses the autopilot until stop is set."""
+    """Run step() for every feature that uses the autopilot until stop is set. Nothing that fails in a
+    pass ends the loop: under --serve it is a daemon thread, and the dashboard would go on without it."""
     seen = set()
+
+    def tell(line: str) -> None:
+        with contextlib.suppress(Exception):  # a closed stdout (BrokenPipe) must not stop the dispatcher
+            say(line)
+
     try:
         while not stop.is_set():
-            for tasks in features():
-                seen.add(tasks)
-                try:
-                    for line in step(tasks):
-                        say(f"{time.strftime('%H:%M:%S')} {os.path.basename(os.path.dirname(tasks))} {line}")
-                except Exception as error:  # one broken feature must not stop the others
-                    say(f"{time.strftime('%H:%M:%S')} {tasks}: {error!r}")
+            try:
+                for tasks in features():
+                    seen.add(tasks)
+                    try:
+                        for line in step(tasks):
+                            tell(f"{time.strftime('%H:%M:%S')} {os.path.basename(os.path.dirname(tasks))} {line}")
+                    except Exception as error:  # one broken feature must not stop the others
+                        tell(f"{time.strftime('%H:%M:%S')} {tasks}: {error!r}")
+            except Exception as error:  # finding the features failed: try again on the next pass
+                tell(f"{time.strftime('%H:%M:%S')} autopilot: {error!r}")
             stop.wait(interval)
     finally:
         for tasks in seen:
@@ -1720,10 +1786,11 @@ def absorb(view: dict, event: dict) -> None:
                 if name == "TodoWrite" and isinstance(arg.get("todos"), list):
                     view["todos"] = [{"text": str(t.get("content", "")), "doing": str(t.get("activeForm", "")),
                                       "status": str(t.get("status", "pending"))} for t in arg["todos"]][:50]
+                    view["task_ids"] = {}  # the to-dos TaskCreate added are gone
                 elif name == "TaskCreate":
+                    view["task_ids"][block.get("id", "")] = len(view["todos"])  # tool id -> its to-do
                     view["todos"].append({"text": str(arg.get("subject", "")), "doing": str(arg.get("activeForm", "")),
                                           "status": "pending", "id": ""})
-                    view["task_ids"].append(block.get("id", ""))
                 elif name == "TaskUpdate":
                     for todo in view["todos"]:
                         if todo.get("id") and todo["id"] == str(arg.get("taskId", "")) and arg.get("status"):
@@ -1736,8 +1803,9 @@ def absorb(view: dict, event: dict) -> None:
                 tool_id = block.get("tool_use_id", "")
                 view["pending"].pop(tool_id, None)
                 text = result_text(block.get("content"))
-                if tool_id in view["task_ids"] and (found := re.search(r"#(\d+)", text)):
-                    view["todos"][view["task_ids"].index(tool_id)]["id"] = found.group(1)
+                at = view["task_ids"].get(tool_id, -1)
+                if 0 <= at < len(view["todos"]) and (found := re.search(r"#(\d+)", text)):
+                    view["todos"][at]["id"] = found.group(1)
                 add({"kind": "result", "id": tool_id, "error": bool(block.get("is_error")), "text": text[:3000]})
     elif kind == "result":
         view["final"] = {"error": bool(event.get("is_error")), "cost": float(event.get("total_cost_usd") or 0),
@@ -1761,7 +1829,7 @@ def live_view(tasks: str, cid: str, after: int = 0, events: bool = True) -> dict
         if view is None or view["session"] != run["session"] or view["inode"] != _inode(path):
             view = LIVE[path] = {"session": run["session"], "inode": _inode(path), "offset": 0, "rest": b"",
                                  "events": [], "dropped": 0, "tools": 0, "output_tokens": 0, "context": 0,
-                                 "pending": {}, "todos": [], "task_ids": [], "said": "", "final": None}
+                                 "pending": {}, "todos": [], "task_ids": {}, "said": "", "final": None}
         try:
             with open(path, "rb") as handle:
                 handle.seek(view["offset"])
@@ -1773,9 +1841,11 @@ def live_view(tasks: str, cid: str, after: int = 0, events: bool = True) -> dict
         view["rest"] = lines.pop()  # a line still being written
         for line in lines:
             try:
-                absorb(view, json.loads(line))
+                event = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(event, dict):  # stderr is merged into the log: a line may be any JSON at all
+                absorb(view, event)
         try:
             last = os.path.getmtime(path)
         except OSError:
