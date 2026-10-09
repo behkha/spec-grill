@@ -548,10 +548,13 @@ def unbatched(cards: dict, order: list, status: dict, doing: list, batch_of: dic
 def runs_as(text: str) -> dict:
     """tasks.md §6: "**Runs as:** owner@example.com via `~/.local/bin/claude-work`" (the account the
     feature's sessions must use, and the CLI launcher logged in as it) and "**App URL:** http://…" (the
-    page a Chrome check opens)."""
+    page a Chrome check opens). The launcher is the first backticked word after a "via" on that line, or
+    the bare word right after "<email> via"; a note around it ("(work account)") is not part of it."""
     out = {"email": "", "launcher": "", "app_url": ""}
-    if found := re.search(r"\*\*Runs as\s*:?\*\*:?\s*`?([^\s`]+@[^\s`]+?)`?(?:\s+via\s+`?([^\s`]+)`?)?\s*$", text, re.M | re.I):
-        out["email"], out["launcher"] = found.group(1).strip(".,;"), (found.group(2) or "").strip(".,;")
+    if found := re.search(r"\*\*Runs as\s*:?\*\*:?[ \t]*`?([^\s`]+@[^\s`]+?)`?[.,;]?(?=[ \t]|$)([^\n]*)", text, re.M | re.I):
+        out["email"], rest = found.group(1).strip(".,;"), found.group(2)
+        launcher = re.search(r"\bvia[ \t]+`([^\s`]+)`", rest) or re.match(r"[ \t]+via[ \t]+([^\s`]+)", rest)
+        out["launcher"] = launcher.group(1).strip(".,;") if launcher else ""
     if found := re.search(r"\*\*App URL\s*:?\*\*:?\s*`?(https?://[^\s`]+)`?", text, re.I):
         out["app_url"] = found.group(1).rstrip(".,;")
     return out
@@ -588,7 +591,7 @@ def sections(text: str) -> dict:
     for line in text.splitlines():
         if m := re.match(r"^##\s+(.+?)\s*$", line):
             current = m.group(1).lower()
-            out[current] = []
+            out.setdefault(current, [])  # a heading written twice: the second adds to the first
         elif current is not None:
             out[current].append(line)
     return out
@@ -602,18 +605,42 @@ def cells(line: str) -> list:
     return [cell.strip() for cell in PIPE_RE.split(line.strip().strip("|"))]
 
 
-def table(lines: list) -> list:
-    rows = [line.strip() for line in lines if line.strip().startswith("|")]
-    if not rows:
-        return []
-    head = [h.lower() for h in cells(rows[0])]
-    out = []
-    for row in rows[1:]:
-        values = cells(row)
-        if all(set(v) <= set("-: ") for v in values):
-            continue
-        out.append(dict(zip(head, values)))
+def tables(lines: list) -> list:
+    """Each Markdown table in lines, as (its lowercased header, its rows as dicts by that header). A
+    table ends at the first line that is not a table line; a run of `|` lines without a separator under
+    its first line continues the table before it (a blank line slipped in), one with it starts a new one."""
+    runs, run = [], []
+    for line in lines + [""]:
+        if line.strip().startswith("|"):
+            run.append(line.strip())
+        elif run:
+            runs.append(run)
+            run = []
+    out: list = []
+    for run in runs:
+        if not out or (len(run) > 1 and separator(run[1])):
+            out.append(([h.lower() for h in cells(run[0])], []))
+            run = run[1:]
+        head, rows = out[-1]
+        for row in run:
+            values = cells(row)
+            if all(set(v) <= set("-: ") for v in values):
+                continue
+            rows.append(dict(zip(head, values)))
     return out
+
+
+def table(lines: list) -> list:
+    """The rows of the first table in lines."""
+    found = tables(lines)
+    return found[0][1] if found else []
+
+
+def rows_of(lines: list, *names: str) -> list:
+    """The rows of every table in lines whose header has each of the named columns (a section written
+    twice, or a second table of the same kind under it, still counts; a table of other columns not)."""
+    return [row for head, rows in tables(lines) if all(any(h.startswith(n) for h in head) for n in names)
+            for row in rows]
 
 
 def column(row: dict, name: str) -> str:
@@ -830,34 +857,74 @@ def pin_drift(tasks: str, cards: dict, rows: dict, pins: dict, reviewed: str) ->
     return out
 
 
-def parse_resume(text: str) -> dict:
+# a status cell's words for todo/doing/done/…: what sessions write besides the bare word (an ambiguous
+# one, "pending review" or "open PR", is left out: drift asks for the word, and the card's tick stands in)
+STATUS_SYNONYMS = {
+    "to do": "todo", "to-do": "todo", "not started": "todo",
+    "in progress": "doing", "in-progress": "doing", "inprogress": "doing", "wip": "doing", "started": "doing",
+    "ongoing": "doing", "in review": "doing", "review": "doing", "reviewing": "doing", "testing": "doing",
+    "on hold": "blocked", "stuck": "blocked",
+    "complete": "done", "completed": "done", "finished": "done", "merged": "done",
+}
+
+
+def status_word(cell: str) -> str:
+    """A status cell as one of STATUSES when it says one ("**Doing**", "in progress", "Done (merged)"),
+    else the cell as written, lowercased ("" when empty or a dash): build() reports that as drift."""
+    words = re.sub(r"[`*_~]", " ", cell).lower().split()
+    if not words:
+        return ""
+    two = " ".join(words[:2]).strip(".,;:!()")
+    word = words[0].strip(".,;:!()").strip("-–—")
+    said = STATUS_SYNONYMS.get(two) or STATUS_SYNONYMS.get(word, word)
+    return said if said in STATUSES or not said else " ".join(words)
+
+
+def resume_ids(text: str, order: "list | None") -> list:
+    """The cards a RESUME cell or line names, a range ("T005–T008") as every card in it by the order;
+    with the order, only the cards tasks.md defines ("CPU" or "CPP" is a word, not a card)."""
+    found = list(dict.fromkeys(ids_in(text, order or []) + ID_RE.findall(text)))  # ids_in skips "(…)"
+    return [x for x in found if x in order] if order else found
+
+
+def lock_free(lock: str) -> bool:
+    """The deploy lock is free when it is unset or its first word is "free" ("free (released by T009)")."""
+    words = re.sub(r"[`*_~]", " ", lock).lower().split()
+    return not words or words[0].strip(".,;:!()") == "free"
+
+
+def parse_resume(text: str, order: "list | None" = None) -> dict:
+    """RESUME.md's tables and lists. With tasks.md's card order, ranges expand to its cards and only
+    the cards it defines count as a decision's or blocker's subject."""
     secs = sections(text)
     status = {}
-    for row in table(section(secs, "status")):
-        found = ID_RE.search(column(row, "card"))
-        if not found:
-            continue
-        words = column(row, "status").lower().split()
+    for row in rows_of(section(secs, "status"), "card", "status"):
+        found = ID_RE.search(column(row, "card"))  # one tasks.md lacks ("CPU") is drift, never a card's status
+        if not found or found.group(0) in status:
+            continue  # a card's first row counts, the one autopilot.set_row edits
         status[found.group(0)] = {
-            "status": words[0] if words else "",
+            "status": status_word(column(row, "status")),
             "branch": column(row, "branch").strip("`"),
             "commit": column(row, "commit").strip("`"),
             "date": column(row, "date"),
         }
     decisions = []
-    for row in table(section(secs, "decisions")):
+    for row in rows_of(section(secs, "decisions"), "question"):
+        n, question = column(row, "#"), column(row, "question")
+        if n.startswith("<") or question.startswith("<") or not (n or question):
+            continue  # the template's placeholder row, or an empty one
         answer = column(row, "answer")
         plain = answer.lower().strip(" .")
         decisions.append({
-            "n": column(row, "#"),
-            "question": column(row, "question"),
-            "before": ID_RE.findall(column(row, "needed")),
+            "n": n,
+            "question": question,
+            "before": resume_ids(column(row, "needed"), order),
             "recommended": column(row, "recommend"),
             "answer": answer,
             "open": plain in OPEN_ANSWERS or plain.startswith("deferred"),
         })
     approvals = []
-    for row in table(section(secs, "approvals")):
+    for row in rows_of(section(secs, "approvals"), "step"):
         n = column(row, "#")
         if not n or n.startswith("<"):
             continue
@@ -880,23 +947,38 @@ def parse_resume(text: str) -> dict:
             continue
         if any(b["text"] == item for b in blockers):
             continue  # the same blocker written twice blocks once
-        blockers.append({"text": item, "cards": blocker_subjects(item)})
-    lock = next((line.strip() for line in section(secs, "deploy lock") if line.strip()), "")
+        blockers.append({"text": item, "cards": blocker_subjects(item, order)})
+    lock, inside = "", False
+    for line in text.splitlines():  # the first line under the last "## Deploy lock" (sections() joins them)
+        if heading := re.match(r"^##\s+(.+?)\s*$", line):
+            inside = heading.group(1).lower().startswith("deploy lock")
+            lock = "" if inside else lock
+        elif inside and not lock and line.strip():
+            lock = line.strip()
     reviewed = REVIEWED_RE.findall(text)  # a checkpoint's "Pins reviewed up to <commit>"; the last one counts
     return {"status": status, "decisions": decisions, "approvals": approvals, "blockers": blockers, "lock": lock,
-            "pins_reviewed": reviewed[-1] if reviewed else ""}
+            "lock_free": lock_free(lock), "pins_reviewed": reviewed[-1] if reviewed else ""}
 
 
-def blocker_subjects(item: str) -> list:
-    """The cards a blocker holds up: the card it opens with ("T037 (date): …", "T016C: …"), else the
-    cards after "before" ("<precondition> before T005"), else the card it opens with, else none."""
-    lead = re.match(rf"\s*({ID})\b(\s*[(:])?", item)
-    if lead and lead.group(2):
-        return [lead.group(1)]
-    before = BEFORE_RE.findall(item)
+def blocker_subjects(item: str, order: "list | None" = None) -> list:
+    """The cards a blocker holds up: the card (or range) it opens with ("T037 (date): …", "T016C: …",
+    "T005–T008: …"), else the cards after "before" ("<precondition> before T005"), else the card it
+    opens with, else the one card it names outside parentheses ("waiting on the API key for T005"), else none.
+    With the order, only cards tasks.md defines count ("CPU quota exceeded" names no card)."""
+    lead = re.match(rf"\s*({ID}(?:\s*[–-]\s*{ID})?)\b(\s*[(:])?", item)
+    if lead and lead.group(2) and (named := resume_ids(lead.group(1), order)):
+        return named
+    before = []
+    for m in BEFORE_RE.finditer(item):
+        span = RANGE_RE.match(item, m.start(1))  # "before T005–T008": all of them
+        before += resume_ids(span.group(0) if span else m.group(1), order)
     if before:
         return list(dict.fromkeys(before))
-    return [lead.group(1)] if lead else []
+    if lead and (named := resume_ids(lead.group(1), order)):
+        return named
+    # "(T003 shipped the stub)" is an aside, not the card held up: a blocker on a finished card is history
+    anywhere = resume_ids(re.sub(r"\([^)]*\)", " ", item), order)
+    return anywhere if len(anywhere) == 1 else []
 
 
 # --- the picture ----------------------------------------------------------------------
@@ -927,8 +1009,10 @@ def recent_commits(folder: str, cards: dict, rows: dict, limit: int = 25) -> lis
         return []
     recorded = {}
     for cid, row in rows.items():
-        commit = re.sub(r"[^0-9a-f]", "", (row.get("commit") or "").lower())
-        if len(commit) >= 7:
+        if cid not in cards:
+            continue  # a row for a card tasks.md does not define: drift, not a commit's owner
+        # whole hashes only (SHA-1 or SHA-256): "merged a1b2c3d" is a1b2c3d, not "merged"'s hex letters too
+        for commit in re.findall(r"\b[0-9a-f]{7,64}\b", (row.get("commit") or "").lower()):
             recorded[commit[:7]] = cid
     items = []
     for line in out.splitlines():
@@ -982,7 +1066,7 @@ def phase_cards(folder: str, phase: str, cache: dict) -> dict:
         if number and int(number.group(1)) == int(phase) and name[number.end():][:1] in ("-", "_", " ", ".", "") \
                 and os.path.isfile(path):
             cards, order = parse_tasks(read(path))
-            resume = parse_resume(read(os.path.join(parent, name, "state", "RESUME.md")))
+            resume = parse_resume(read(os.path.join(parent, name, "state", "RESUME.md")), order)
             found = {"folder": os.path.join(parent, name), "order": order,
                      "status": card_status(cards, order, resume)}
             break
@@ -999,7 +1083,7 @@ def build(tasks: str, stale_hours: float) -> dict:
     state_dir = os.path.join(folder, "state")
     resume_path = os.path.join(state_dir, "RESUME.md")
     has_resume = os.path.isfile(resume_path)
-    resume = parse_resume(read(resume_path))
+    resume = parse_resume(read(resume_path), order)
     handoff_dir = os.path.join(state_dir, "handoff")
     handoffs = {}
     for path in glob.glob(os.path.join(handoff_dir, "*.md")):
@@ -1174,6 +1258,9 @@ def build(tasks: str, stale_hours: float) -> dict:
             row = resume["status"].get(cid)
             if not row:
                 drift.append(f"{cid} is in tasks.md but has no row in RESUME's status table")
+            elif row["status"] and row["status"] not in STATUSES:  # its tick in tasks.md stands in for it
+                drift.append(f"{cid} has unknown status '{row['status']}' in RESUME"
+                             f" (one of {', '.join(sorted(STATUSES))})")
             elif cards[cid]["ticked"] and row["status"] not in FINISHED:
                 drift.append(f"{cid} is ticked in tasks.md but RESUME says {row['status'] or 'nothing'}")
             elif row["status"] in FINISHED and not cards[cid]["ticked"]:
@@ -1226,9 +1313,10 @@ def build(tasks: str, stale_hours: float) -> dict:
                 open_checks.append({"card": cid, "criterion": flat(r["criterion"], 120, cell=False),
                                     "verdict": said, "note": note})
     lock = resume["lock"]
-    holder = ID_RE.search(lock or "")
-    if holder and status.get(holder.group(0)) in FINISHED:
-        drift.append(f"the deploy lock is still held by {holder.group(0)}, which is {status[holder.group(0)]}")
+    # "free (released by T009)" is free: the card it names let go of it
+    holder = "" if resume["lock_free"] else next((x for x in ID_RE.findall(lock) if x in cards), "")
+    if holder and status.get(holder) in FINISHED:
+        drift.append(f"the deploy lock is still held by {holder}, which is {status[holder]}")
     merging = merge_lock(state_dir)
     if merging and merging["holder"]:
         who = merging["holder"]
@@ -1313,6 +1401,7 @@ def build(tasks: str, stale_hours: float) -> dict:
         "open_decisions": open_decisions,
         "blockers": active_blockers,
         "lock": lock,
+        "lock_free": resume["lock_free"],
         "merge_lock": merging,
         "stalled": stalled,
         "drift": drift,
@@ -1493,7 +1582,7 @@ def render(s: dict) -> str:
     lines.append("")
     lines.append("Needs you:")
     lines += [f"  {n}" for n in needs] or ["  nothing"]
-    if s["lock"] and s["lock"].lower() != "free":
+    if not s["lock_free"]:
         lines.append(f"Deploy lock: {s['lock']}")
     if s.get("merge_lock"):
         m = s["merge_lock"]
@@ -1532,7 +1621,7 @@ def lessons(s: dict) -> str:
     registry = read_json(os.path.join(os.path.dirname(s["tasks"]), "state", "runs.json"), {})
     registry = registry if isinstance(registry, dict) else {}
     runs, attention = registry.get("runs", []), registry.get("attention", {})
-    resume = parse_resume(read(s["resume"])) if s["resume"] else {"approvals": [], "decisions": []}
+    resume = parse_resume(read(s["resume"]), list(s["cards"])) if s["resume"] else {"approvals": [], "decisions": []}
     utc = lambda v: dt.datetime.strptime(v, "%Y-%m-%d %H:%MZ").replace(tzinfo=dt.timezone.utc).timestamp()  # noqa: E731
     def measure(mine: list) -> tuple:
         """runs, tries, cost and hours of some runs (each session's cost once, at its highest report)."""
