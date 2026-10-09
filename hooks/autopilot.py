@@ -36,6 +36,7 @@ tasks.md. Standard library only; macOS and Linux.
 import contextlib
 import datetime as dt
 import fcntl
+import glob
 import json
 import os
 import re
@@ -55,10 +56,15 @@ LOCK = threading.RLock()  # the dispatcher thread and the dashboard's requests w
 LOCAL = threading.local()
 PROCS: dict = {}  # session id -> Popen, for the sessions this process started
 HELD: dict = {}  # tasks -> the open dispatcher lock file this process holds
+# read only in the CLI's own words (an API-error message it wrote, or what it printed outside the stream),
+# never in a session's result: a card about a login page or a budget is no API error
 API_ERROR = re.compile(r"authenticat|oauth|log ?in|rate.?limit|usage limit|session limit|limit_reached|hit your|"
                        r"overloaded|credit balance|quota", re.I)
+API_STATUS = {401, 403, 429, 529}  # api_error_status of an expired login, a usage limit, an overload
 ACCOUNT_AGE = 300  # seconds an account check stays good for display; spawning re-checks after 60
-BUDGET = re.compile(r"budget", re.I)
+# what reap() put before a capped run's error (its subtype or terminal_reason), for the runs it recorded
+# before it kept "capped"
+BUDGET = re.compile(r"^(?:error_max_budget_usd|budget_exhausted|max_budget):")
 
 RULES = """You are running unattended: the Spec-Grill autopilot started this session for {what} of
 {tasks}. Nobody reads this conversation while it runs, so never wait for a reply; the files are your
@@ -70,7 +76,7 @@ only channel to the owner.
   `| # | card | step | why | status | answer |` if it is missing): a number of your card's own, `<card>.<n>` (T012.1, T012.2, …, so two sessions never collide);
   your card; the exact step or commands; why, and what happens if the owner says no; status
   `pending`; answer empty. Write a `|` inside a cell as `\\|`. Leave your status row `doing`, then end
-  your turn with the line `AUTOPILOT: WAITING FOR APPROVAL A<n>`. This session is resumed with the
+  your turn with the line `AUTOPILOT: WAITING FOR APPROVAL <card>.<n>`. This session is resumed with the
   owner's answer.
 - A choice only the owner can make (a design pick, an open question the card asks them): don't wait
   for it in this chat and don't mark the card blocked. Add a row to RESUME's Decisions table (the next
@@ -80,16 +86,17 @@ only channel to the owner.
   `doing`, and end with `AUTOPILOT: WAITING FOR DECISION <n>`. This session is resumed once the owner
   has answered.
 - Blocked (§1's Preconditions item): record the blocker as §1 says, then end with `AUTOPILOT: BLOCKED`.
-- Context running out (§1's Context budget item): hand off and add the remainder card as §1 says, then end with
+- Context running out (§1's Context budget item): write the hand-off, mark your card done (its status row
+  and its tick), add the remainder as a new §5 card with `after: <your card>` as §1 says, then end with
   `AUTOPILOT: SPLIT`.
 - Helper agents (the Agent tool) run in the foreground only (`run_in_background: false`): this session
   ends when your turn ends, and background agents end with it, before they report.
 - Never `git stash`: the stash is shared by every worktree, and another session may be working in the
   repo. Save a patch with `git diff` instead.
 - Merging any branch into the integration branch (a [P] card's or batch's at a checkpoint, too) happens
-  only while you hold the merge lock: `mkdir state/merge.lock` (next to tasks.md) takes it and fails
-  while another session holds it; write your card and the time into `state/merge.lock/holder`, merge,
-  then `rm -rf state/merge.lock` at once, also when a step failed.
+  only while you hold the merge lock: `mkdir {lock}` takes it and fails while another session holds it;
+  write your card and the time into `{lock}/holder`, merge, then `rm -rf {lock}` at once, also when a
+  step failed.
 - Never edit a card's Verify or Done when, a pinning test, or any other check to obtain a pass, and
   never record a waiver yourself: only the owner waives. A check that still fails after the card's one
   fix goes to `state/design-review.md` (§1's scope item) and to your hand-off's Checks table as `fail`.
@@ -113,8 +120,11 @@ You are a [P] {work}: other sessions may run beside you (running now: {beside}).
   `mkdir {lock}` takes it, and fails while another session holds it: then wait a minute and try again
   (after 30 minutes, record a blocker and stop). Once it is yours, run
   `echo "{unit} $(date -u +%Y-%m-%dT%H:%MZ)" > {lock}/holder`; merge the integration branch into your
-  branch, run the full check, merge your branch into the integration branch, and `rm -rf {lock}` at
-  once, also when a step failed. Never remove the lock while another session holds it.
+  branch, run the full check, then run `git status --short --untracked-files=no` in the integration
+  worktree: when it shows uncommitted changes (a session without [P] is working there) or git refuses the merge, back off:
+  `rm -rf {lock}`, wait a few minutes and try again. Otherwise merge your branch into the integration
+  branch, and `rm -rf {lock}` at once, also when a step failed. Never remove the lock while another
+  session holds it.
 """
 
 CHROME_RULES = """
@@ -141,6 +151,8 @@ in the batch's order, following tasks.md §1 (its one-card-or-batch item and its
 say for a batch). If something prevents finishing,
 record it as a blocker and stop."""
 BLOCKED = re.compile(r"AUTOPILOT: BLOCKED")
+WAITS = re.compile(r"AUTOPILOT: WAITING FOR (?:DECISION|APPROVAL)")
+SPLIT = sv.SPLIT  # the card is finished with a remainder card: never resumed, never a failed try
 UNBLOCKED = """The autopilot resumed this session: the blocker you recorded for {what} has been cleared
 ({how}). Re-read RESUME, set your status row back to `doing`, and carry on with {what} from where it
 stopped, following tasks.md §1. If it is still blocked, record that and stop again."""
@@ -491,7 +503,8 @@ def command(cfg: dict, s: dict, cid: str, session: str, prompt: str, resume: boo
         cmd += ["--model", info["model"]]
     if deny:
         cmd += ["--settings", json.dumps({"permissions": {"deny": deny}})]
-    rules = RULES.format(what=info["what"], work=info["work"], handoff=info["handoff"], tasks=s["tasks"])
+    rules = RULES.format(what=info["what"], work=info["work"], handoff=info["handoff"], tasks=s["tasks"],
+                         lock=merge_lock_path(s["tasks"]))
     if unit_parallel(s, cid):
         rules += PARALLEL_RULES.format(work=info["work"], beside=", ".join(beside or []) or "none yet",
                                        where=own_worktree(s, cid), offset=slot, unit=cid,
@@ -544,19 +557,27 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
 
 
 def result_of(path: str) -> dict:
-    """The final "result" event of a stream-json log, and whether the session did any work."""
-    out = {"result": None, "worked": False}
+    """The final "result" event of a stream-json log, whether the session did any work, and the CLI's own
+    words: the text of its API-error messages (api) and the lines it printed outside the stream (stray:
+    its stderr, which the log takes too)."""
+    out = {"result": None, "worked": False, "api": "", "stray": ""}
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 flat = line.replace(" ", "")
                 if '"type":"assistant"' in flat and "is_api_error_message" not in flat:
                     out["worked"] = True
-                if '"type":"result"' in flat:
+                if line.strip() and not line.lstrip().startswith("{"):
+                    out["stray"] = (out["stray"] + " " + line.strip()).strip()[-300:]
+                elif '"type":"result"' in flat:
                     try:
                         out["result"] = json.loads(line)
                     except ValueError:
                         pass
+                elif '"is_api_error_message":true' in flat:
+                    with contextlib.suppress(ValueError, AttributeError, TypeError):
+                        words = [b.get("text", "") for b in json.loads(line)["message"]["content"] if isinstance(b, dict)]
+                        out["api"] = " ".join([out["api"], *words]).strip()[-300:]
     except OSError:
         pass
     return out
@@ -582,23 +603,46 @@ def reap(tasks: str, reg: dict) -> list:
         run.update(ended=stamp(), exit=code, cost=float(result.get("total_cost_usd") or 0),
                    result=text[-600:], worked=found["worked"])
         if not result:
-            run["error"] = run["error"] or f"the session exited ({code}) without a result"
+            run["error"] = run["error"] or (f"the session exited ({code}) without a result"
+                                            + (f": {found['stray']}" if found["stray"] else ""))
         elif result.get("is_error"):
             reason = result.get("terminal_reason") or result.get("subtype") or "error"
             run["error"] = f"{reason}: {text[:300]}"
-        if is_api_error(run):
+        run["capped"] = (result.get("subtype") == "error_max_budget_usd"
+                         or result.get("terminal_reason") == "budget_exhausted")
+        if is_api_error(result, found):
             run["api_error"] = True
         if run.get("approval") and (run.get("api_error") or not run["worked"]):
-            # the answer never reached a working session: deliver it again on the next resume
+            # the answer never reached a working session: deliver it again on the next resume. Unless it
+            # was an API error (which pauses), such a run is a try (sv.is_try), and plan() sends the
+            # answer at most max_attempts times: a resume that cannot start would fail every pass
             if run["approval"] in reg["handled"]:
                 reg["handled"].remove(run["approval"])
         ended.append(run)
     return ended
 
 
-def is_api_error(run: dict) -> bool:
-    error = run.get("error") or ""
-    return bool(error) and (error.startswith("api_error") or bool(API_ERROR.search(error)))
+def is_api_error(result: dict, found: dict) -> bool:
+    """A session that failed on the API (an expired login, a usage limit), not in its own work: by the
+    result's fields (terminal_reason, api_error_status), else by the CLI's own words (its API-error
+    messages; what it printed outside the stream when it gave no result). Never by the result's text:
+    that is the session's own prose."""
+    if result and not result.get("is_error"):
+        return False  # it ended well, whatever API errors the CLI retried past
+    if str(result.get("terminal_reason") or "").startswith("api_error"):
+        return True
+    with contextlib.suppress(TypeError, ValueError):
+        status = int(result.get("api_error_status") or 0)
+        if status in API_STATUS or status >= 500:
+            return True
+    # without a result, the CLI's stderr; with one from a session that never worked, its text is the CLI's too
+    words = " " + found["stray"] if not result else (" " + str(result.get("result") or "") if not found["worked"] else "")
+    return bool(API_ERROR.search(found["api"] + words))
+
+
+def hit_cap(run: dict) -> bool:
+    """A session that stopped at the per-session dollar cap (--max-budget-usd)."""
+    return bool(run.get("capped")) or bool(BUDGET.match(run.get("error") or ""))
 
 
 def kill(run: dict) -> bool:
@@ -787,6 +831,10 @@ def step(tasks: str) -> list:
 
         save_registry(tasks, reg)
         s = sv.build(tasks, 4)
+        said, ticked = judge(tasks, s, reg, ended)
+        events += said
+        if ticked:
+            s = sv.build(tasks, 4)
         if cleared := clear_merge_lock(tasks, s, reg):  # its holder's session ended without releasing it
             events.append(cleared)
         reg["queued"] = [c for c in reg["queued"] if is_unit(s, c) and not unit_finished(s, c)]
@@ -863,6 +911,17 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         if cid in reg["attention"]:
             continue  # stuck or stopped by the owner: only the owner's Retry starts it again
         worked = unit_latest(reg, s, cid, worked=True)
+        if worked and SPLIT.search(worked.get("result") or ""):
+            worked = None  # a split session ran out of context: never resumed; a new session goes on
+        if worked and cid not in reg["queued"] and resumed_by_hand(tasks, reg, worked["session"]):
+            reg["attention"][cid] = (f"its session {worked['session']} was continued outside the autopilot (its"
+                                     " transcript changed after the autopilot's last run of it); press Take over"
+                                     " if you are running it, or Retry to let the autopilot go on with it")
+            continue  # resuming it here too would run a second process on the same conversation
+        # sessions that stopped to wait for the owner, split their card, or never reached the API are not
+        # failed tries
+        tries = sum(1 for r in unit_runs(reg, s, cid) if sv.is_try(r))
+        spent_tries = tries >= cfg["max_attempts"] + int(reg["granted"].get(cid, 0))
         if cid in reg["blocked_on"]:
             still = naming_of(s, cid)
             recorded = reg["blocked_on"][cid]
@@ -881,6 +940,12 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         answered = [a for a in s["approvals_answered"] if a["card"] in mem and approval_key(a) not in reg["handled"]]
         if worked and answered:  # the owner answered: resume that conversation with the answer
             a = answered[0]
+            lost = [r for r in unit_runs(reg, s, cid) if r.get("approval") == approval_key(a) and sv.is_try(r)]
+            if len(lost) >= cfg["max_attempts"]:  # the answer never reached a working session (no such
+                # conversation, a crash at start): sent again only that often, then the owner decides
+                reg["attention"][cid] = (f"{len(lost)} sessions could not take your answer to {a['n']}; the last"
+                                         f" ended with: {ending(lost[-1])[:200]}")
+                continue
             approved = a["status"] == "approved"
             prompt = ANSWER.format(n=a["n"], card=a["card"], step=a["step"], verdict=a["status"],
                                    note=f" Note: {a['answer']}" if a["answer"] else "",
@@ -898,18 +963,20 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
             if is_ready(s, cid):
                 out.append((cid, "start", start_line(s, cid), "", "", None))
             continue
-        if BUDGET.search(last["error"] or ""):
+        capped = sum(1 for r in unit_runs(reg, s, cid) if hit_cap(r))
+        if hit_cap(last) and not (cid in reg["queued"] and int(reg["granted"].get(cid, 0)) >= capped):
+            # queued by the owner's Retry, which grants it one more session: it starts as the owner said
             reg["attention"][cid] = f"its session hit the ${cfg['budget_per_card_usd']} cap per session"
             continue
-        # sessions that stopped to wait for the owner, or never reached the API, are not failed tries
-        tries = sum(1 for r in unit_runs(reg, s, cid) if sv.is_try(r))
-        if tries >= cfg["max_attempts"] + int(reg["granted"].get(cid, 0)):
+        if spent_tries:
             reg["attention"][cid] = (f"{tries} sessions ended without finishing it"
+                                     + ("; RESUME had no pending approval or open decision for the wait the last"
+                                        " one reported" if last.get("unbacked") else "")
                                      + (f"; the last said: {last['result'][-200:]}" if last["result"] else ""))
             continue
         if worked:
             out.append((cid, "continue", continue_prompt(s, cid, last), worked["session"], "", None))
-        elif is_ready(s, cid):
+        elif is_ready(s, cid):  # never worked, or a split batch's other cards: a new session
             out.append((cid, "start", start_line(s, cid), "", "", None))
     queue = reg["queued"]
     out.sort(key=lambda item: queue.index(item[0]) if item[0] in queue else len(queue))
@@ -917,6 +984,77 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
 
 
 ROOM_WAITS = {"worktree", "touches"}  # waits that last only while another unit runs: room() decides them
+
+
+def owner_holds(s: dict, reg: dict, mem: list) -> bool:
+    """Whether RESUME holds these cards for the owner: a pending approval (or an answer not delivered
+    yet), or an open decision needed before one of them."""
+    return (any(a["card"] in mem for a in s["approvals"])
+            or any(a["card"] in mem and approval_key(a) not in reg["handled"] for a in s["approvals_answered"])
+            or any(c in d["before"] for d in s["open_decisions"] for c in mem))
+
+
+def judge(tasks: str, s: dict, reg: dict, ended: list) -> tuple:
+    """Hold what the sessions that just ended said against the files; return (events, whether a card was
+    ticked). A session that says it waits for the owner while RESUME holds nothing for it is "unbacked": a
+    try (sv.is_try), or it would be resumed, say it waits, and be resumed again for ever. A session that
+    split its card (AUTOPILOT: SPLIT) finished it with a remainder card: when it left the card open but
+    wrote its hand-off in that session, the card is marked done here; with no such hand-off, the owner
+    decides."""
+    events, ticked = [], False
+    for run in ended:
+        unit, said = run_unit(run), run.get("result") or ""
+        if not is_unit(s, unit) or run.get("api_error"):
+            continue
+        mem = members(s, unit)
+        if WAITS.search(said) and not owner_holds(s, reg, mem):
+            run["unbacked"] = True
+        if not SPLIT.search(said) or unit_finished(s, unit):
+            continue
+        since = float(run.get("started_ts") or 0)
+        wrote = []
+        for c in mem:
+            with contextlib.suppress(OSError):
+                if since and os.path.getmtime(os.path.join(state_dir(tasks), "handoff", f"{c}.md")) >= since:
+                    wrote.append(c)
+        left = [c for c in wrote if s["status"][c] not in sv.FINISHED]
+        doing = [c for c in mem if s["status"][c] == "doing" and c not in left]
+        if wrote and not left and not doing:
+            continue  # it marked the card done itself, as §1 says
+        if len(left) == 1 and not doing:
+            with contextlib.suppress(Refused):
+                set_row(s, "status", {"card": left[0]}, {"status": "done", "date": stamp()})
+                tick(tasks, left[0])
+                if batch(s, unit) and all(s["status"][c] in sv.FINISHED for c in mem if c != left[0]):
+                    tick(tasks, unit)
+                ticked = True
+                events.append(f"{unit}: its session split {left[0]} and wrote its hand-off; marked {left[0]} done")
+                continue
+        still = left + doing
+        reg["attention"][unit] = (f"its session ended with AUTOPILOT: SPLIT but left {', '.join(still) or 'its card'}"
+                                  " open" + ("" if left else " without writing its hand-off") + "; check the remainder"
+                                  " card in §5 and the hand-off, then mark the split card done in RESUME and tasks.md")
+    return events, ticked
+
+
+def resumed_by_hand(tasks: str, reg: dict, session: str) -> bool:
+    """Whether someone went on with a session after the autopilot's last run of it: its transcript (Claude
+    Code keeps it as projects/<folder>/<session>.jsonl in its config folder) changed over a minute after
+    that run's last output. The owner resumed it in a terminal without Take over; resuming it here too
+    would run a second process on the same conversation."""
+    ours = [r for r in reg["runs"] if r.get("session") == session and r.get("ended")]
+    if not ours:
+        return False
+    try:
+        until = os.path.getmtime(os.path.join(state_dir(tasks), ours[-1]["log"]))
+    except OSError:
+        return False
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    for path in glob.glob(os.path.join(glob.escape(home), "projects", "*", f"{glob.escape(session)}.jsonl")):
+        with contextlib.suppress(OSError):
+            if os.path.getmtime(path) > until + 60:
+                return True
+    return False
 
 
 def room(s: dict, reg: dict, cfg: dict, cid: str) -> str:
