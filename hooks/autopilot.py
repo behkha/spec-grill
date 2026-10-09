@@ -1028,6 +1028,18 @@ def free_worktree(s: dict, units: list) -> None:
                     set_row(s, "status", {"card": c}, {"status": "todo"})
 
 
+def give_up(s: dict, reg: dict, unit: str, why: str) -> None:
+    """Hand a unit to the owner ("needs you": only their Retry starts it again) and free its `doing` cards
+    (free_worktree): a card its last session left `doing` would otherwise hold the integration worktree,
+    and every card without [P] would wait for the owner too. Only once no session of the unit is live:
+    every caller acts on runs that have ended (reaped), so no session of it can write RESUME after its
+    cards were freed."""
+    reg["attention"][unit] = why
+    mine = set(members(s, unit)) if is_unit(s, unit) else {unit}
+    if not any(run_unit(r) == unit or r["card"] in mine for r in live(reg)):
+        free_worktree(s, [unit])
+
+
 def notify(title: str, text: str) -> None:
     try:
         if sys.platform == "darwin" and shutil.which("osascript"):
@@ -1430,8 +1442,8 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
             lost = [r for r in unit_runs(reg, s, cid) if r.get("approval") == approval_key(a) and sv.is_try(r)]
             if len(lost) >= cfg["max_attempts"]:  # the answer never reached a working session (no such
                 # conversation, a crash at start): sent again only that often, then the owner decides
-                reg["attention"][cid] = (f"{len(lost)} sessions could not take your answer to {a['n']}; the last"
-                                         f" ended with: {ending(lost[-1])[:200]}")
+                give_up(s, reg, cid, f"{len(lost)} sessions could not take your answer to {a['n']}; the last"
+                                     f" ended with: {ending(lost[-1])[:200]}")
                 continue
             approved = a["status"] == "approved"
             prompt = ANSWER.format(n=a["n"], card=a["card"], step=a["step"], verdict=a["status"],
@@ -1453,13 +1465,13 @@ def plan(tasks: str, s: dict, reg: dict, cfg: dict) -> list:
         capped = sum(1 for r in unit_runs(reg, s, cid) if hit_cap(r))
         if hit_cap(last) and not (cid in reg["queued"] and int(reg["granted"].get(cid, 0)) >= capped):
             # queued by the owner's Retry, which grants it one more session: it starts as the owner said
-            reg["attention"][cid] = f"its session hit the ${cfg['budget_per_card_usd']} cap per session"
+            give_up(s, reg, cid, f"its session hit the ${cfg['budget_per_card_usd']} cap per session")
             continue
-        if spent_tries:
-            reg["attention"][cid] = (f"{tries} sessions ended without finishing it"
-                                     + ("; RESUME had no pending approval or open decision for the wait the last"
-                                        " one reported" if last.get("unbacked") else "")
-                                     + (f"; the last said: {last['result'][-200:]}" if last["result"] else ""))
+        if spent_tries:  # failed tries, unbacked waits among them
+            give_up(s, reg, cid, f"{tries} sessions ended without finishing it"
+                                 + ("; RESUME had no pending approval or open decision for the wait the last"
+                                    " one reported" if last.get("unbacked") else "")
+                                 + (f"; the last said: {last['result'][-200:]}" if last["result"] else ""))
             continue
         if worked:
             out.append((cid, "continue", continue_prompt(s, cid, last), worked["session"], "", None))
@@ -1518,6 +1530,8 @@ def judge(tasks: str, s: dict, reg: dict, ended: list) -> tuple:
                 events.append(f"{unit}: its session split {left[0]} and wrote its hand-off; marked {left[0]} done")
                 continue
         still = left + doing
+        # not given up on (give_up): the card is probably all but done, and stays `doing` until the owner has
+        # checked the split and marks it done
         reg["attention"][unit] = (f"its session ended with AUTOPILOT: SPLIT but left {', '.join(still) or 'its card'}"
                                   " open" + ("" if left else " without writing its hand-off") + "; check the remainder"
                                   " card in §5 and the hand-off, then mark the split card done in RESUME and tasks.md")

@@ -142,5 +142,41 @@ class Merged(Scratch):
         self.settle()
 
 
+class GiveUp(Scratch):
+    """Item 1: a unit the dispatcher hands to the owner after its attempts no longer holds the worktree."""
+
+    def test_a_serial_card_that_runs_out_of_attempts_lets_the_next_serial_card_start(self):
+        self.serial_t002()
+        self.script_for({"T002": ["doing"], "T003": ["done"], "T004": ["done"]})  # T002 never finishes
+        events = self.steps_until(lambda: "T004" in self.launched_cards())
+        self.assertEqual(self.launched_cards().count("T002"), 2, "max_attempts sessions, then the owner")
+        self.assertIn("2 sessions ended without finishing it", autopilot.registry(self.tasks)["attention"]["T002"])
+        self.assertEqual(self.status("T002"), "todo", "given up on: it leaves `doing`")
+        self.assertTrue(all(r["ended"] for r in self.runs() if r["card"] == "T002"), "freed only once reaped")
+        self.assertIn("T004: start · effort medium", " ".join(events))
+        self.settle()
+        self.assertEqual(self.status("T004"), "done")
+        self.assertEqual(self.status("T002"), "todo", "still the owner's: only Retry starts it again")
+
+    def test_unbacked_waits_that_run_out_of_attempts_free_the_card_too(self):
+        self.serial_t002()
+        self.script_for({"T002": ["claimapproval"], "T003": ["done"], "T004": ["done"]})  # says it waits; no row
+        self.steps_until(lambda: "T004" in self.launched_cards())
+        why = autopilot.registry(self.tasks)["attention"]["T002"]
+        self.assertIn("RESUME had no pending approval or open decision", why)
+        self.assertEqual(self.status("T002"), "todo")
+        self.settle()
+
+    def test_the_owners_retry_after_a_give_up_goes_on_with_the_card(self):
+        self.serial_t002()
+        self.script_for({"T002": ["doing", "doing", "done"], "T003": ["done"], "T004": ["done"]})
+        self.steps_until(lambda: "T004" in self.launched_cards())
+        self.settle()
+        self.assertEqual(autopilot.act(self.tasks, "retry", {"card": "T002"}), "T002 started")
+        self.settle()
+        self.assertEqual(self.status("T002"), "done")
+        self.assertNotIn("T002", autopilot.registry(self.tasks)["attention"])
+
+
 if __name__ == "__main__":
     unittest.main()
