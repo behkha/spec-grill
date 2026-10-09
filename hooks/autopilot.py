@@ -20,17 +20,21 @@ Every few seconds the dispatcher reads the supervisor's picture of each feature 
   and then hands the card to the owner ("needs you");
 - stops a session that stays silent for `quiet_minutes` or runs longer than `max_run_hours`;
 - pauses on an API error (an expired login, a usage limit), when the next session could take the
-  sessions together past `budget_total_usd`, and when tasks.md has no "Never unattended" list.
+  sessions together past `budget_total_usd`, and when tasks.md has no "Never unattended" list. A usage
+  limit's pause resumes on its own after the reset time its message names (`resume_after`), or after
+  RESUME_DEFAULT_S when it names none; the other pauses wait for the owner's Resume.
 
 The owner's buttons on the dashboard (start, stop, retry, approve, answer, approve a stage) call act()
 and work whether the autopilot is on or paused; starting a session needs the process that dispatches.
 
 One process dispatches a feature: it holds an exclusive lock on state/.autopilot.lock for as long as
-it runs. Every read-modify-write of the state files happens under guard(), a lock across threads and
-processes. It writes state/autopilot.json (settings), state/runs.json (one entry per session it
-started) and state/runs/*.jsonl (each session's stream-json output); the owner's answers go into
-RESUME's Approvals and Decisions tables, and an owner's card the owner marks done is ticked in
-tasks.md. Standard library only; macOS and Linux.
+it runs. Every read-modify-write of its own state files happens under guard(), a lock across threads
+and processes. It writes state/autopilot.json (settings), state/runs.json (one entry per session it
+started; the previous good copy is kept as runs.json.bak) and state/runs/*.jsonl (each session's
+stream-json output); the owner's answers go into RESUME's Approvals and Decisions tables, and an
+owner's card the owner marks done is ticked in tasks.md. Live sessions edit RESUME.md and tasks.md
+without that lock, so those writes are optimistic (edit_text): replaced only when nobody wrote the
+file since it was read, else read again. Standard library only; macOS and Linux.
 
 Sessions start with the dispatcher's environment minus ANTHROPIC_API_KEY (it would bill past the account
 `claude auth status` reports) and what tells a session it runs inside the Claude Code that started the
@@ -50,6 +54,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -72,6 +77,16 @@ BUDGET = re.compile(r"budget", re.I)
 # Claude Code sets for its own children (the provider switches CLAUDE_CODE_USE_* and a setup-token pass)
 UNINHERITED = re.compile(r"ANTHROPIC_API_KEY|CLAUDECODE|CLAUDE_CODE_(?!USE_|OAUTH_TOKEN$)\w*|CLAUDE_AGENT_SDK_\w*"
                          r"|CLAUDE_PID|CLAUDE_EFFORT")
+# API errors only the owner fixes (a login, billing): their pause never resumes on its own
+OWNER_API = re.compile(r"authenticat|oauth|\blog ?in\b|\blogged out\b|credential|\bapi key\b|credit balance|billing",
+                       re.I)
+RESUME_DEFAULT_S = 1800  # a usage limit that names no reset time: try again after this long
+RESUME_MIN_S = 120  # and never sooner than this, so a limit still in force cannot spin pause, resume, fail
+RESET_EPOCH = re.compile(r"(?:\||\breset\w*\s*(?:at\s*)?)(\d{10})(?!\d)", re.I)  # "usage limit reached|1760000000"
+RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?"
+                         r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\b(?:\s*\(([\w/+-]+)\))?", re.I)  # "resets 3:10pm (Europe/London)"
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+CARDS_SEEN: dict = {}  # tasks -> (cards, has a Never unattended list) of the last read, to spot one mid-write
 
 RULES = """You are running unattended: the Spec-Grill autopilot started this session for {what} of
 {tasks}. Nobody reads this conversation while it runs, so never wait for a reply; the files are your
@@ -194,24 +209,91 @@ def guard(tasks: str):
                 LOCAL.handle.close()
 
 
-def save_json(path: str, data) -> None:
+def save_json(path: str, data, backup: bool = False) -> None:
+    """Write a JSON file atomically and durably (fsync before the rename); with backup, the file it
+    replaces becomes <path>.bak first, if that file still parses (a corrupt one never replaces a good .bak)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=1, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if backup:
+        try:
+            read_json_strict(path, None)
+            os.link(path, tmp + ".bak")  # the old file itself, under a second name: no copy
+            os.replace(tmp + ".bak", path + ".bak")
+        except (OSError, ValueError):
+            pass
     os.replace(tmp, path)
+    with contextlib.suppress(OSError):  # make the rename itself survive a crash
+        folder = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
 
 
-def write_text(path: str, text: str) -> None:
-    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, path)
+def read_json_strict(path: str, default):
+    """Like sv.read_json, but only a missing file gives default: one that exists and does not parse
+    raises (OSError or ValueError), for files where starting over from empty would do harm."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+
+
+def signature(path: str):
+    """What changes when anyone writes a file: inode (a rename over it), mtime, size; None when missing."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_size, st.st_mode
+
+
+def edit_text(path: str, change, tries: int = 8) -> None:
+    """Rewrite a file a live session may be editing at the same time (RESUME.md, tasks.md): read it,
+    change(text) -> new text, write beside it, and replace it only when nobody wrote it in between; else
+    read it again (a few tries). The file keeps its mode. change may raise Refused."""
+    for attempt in range(tries):
+        before = signature(path)
+        text = sv.read(path)
+        new = change(text)
+        if new == text:
+            return
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(new)
+        if before:
+            os.chmod(tmp, stat.S_IMODE(before[3]))
+        if signature(path) == before:
+            os.replace(tmp, path)
+            return
+        os.remove(tmp)
+        time.sleep(0.05 * (attempt + 1))
+    raise Refused(f"{os.path.basename(path)} kept changing while it was being saved; try again")
 
 
 def registry(tasks: str) -> dict:
-    found = sv.read_json(os.path.join(state_dir(tasks), "runs.json"), {})
-    found = found if isinstance(found, dict) else {}
+    """runs.json with its defaults. One that does not parse (a crash mid-write) falls back to
+    runs.json.bak ("recovered" says so); with no good .bak, "corrupt" says why, and save_registry
+    never writes it, so the attempts, live sessions and answered approvals are not lost to an empty start."""
+    path = os.path.join(state_dir(tasks), "runs.json")
+    try:
+        found = read_json_strict(path, {})
+        if not isinstance(found, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as error:
+        try:
+            found = read_json_strict(path + ".bak", None)
+            if not isinstance(found, dict):
+                raise ValueError("not a JSON object")
+            found["recovered"] = f"state/runs.json did not parse ({error}); read state/runs.json.bak instead"
+        except (OSError, ValueError):
+            found = {"corrupt": (f"state/runs.json does not parse ({str(error)[:120]}) and there is no good "
+                                 "runs.json.bak; fix or remove it, then press Resume")}
     for key, empty in (("runs", []), ("attention", {}), ("handled", []), ("manual", []), ("notified", []),
                        ("queued", []), ("granted", {}), ("blocked_on", {})):
         found.setdefault(key, empty)
@@ -219,7 +301,10 @@ def registry(tasks: str) -> dict:
 
 
 def save_registry(tasks: str, reg: dict) -> None:
-    save_json(os.path.join(state_dir(tasks), "runs.json"), reg)
+    if reg.get("corrupt"):
+        return  # never replace a registry that could not be read with an empty one
+    save_json(os.path.join(state_dir(tasks), "runs.json"), {k: v for k, v in reg.items() if k != "recovered"},
+              backup=True)
 
 
 def settings(tasks: str) -> dict:
@@ -233,6 +318,8 @@ def change_settings(tasks: str, **changes) -> dict:
         for key, value in changes.items():
             if key in sv.SETTINGS:
                 current[key] = value
+        if "auto" in changes and "resume_after" not in changes:
+            current["resume_after"] = 0  # the owner's Resume or Pause, or another pause, ends a usage limit's wait
         save_json(os.path.join(state_dir(tasks), "autopilot.json"), current)
         return current
 
@@ -636,6 +723,51 @@ def is_api_error(run: dict) -> bool:
     return bool(error) and (error.startswith("api_error") or bool(API_ERROR.search(error)))
 
 
+def reset_time(text: str, now=None):
+    """When the usage limit a message names resets, as a UTC epoch, or None when it names no time: an
+    epoch ("usage limit reached|1760000000"), or a clock time ("resets 3:10pm", "resets Oct 12, 9am
+    (Europe/London)"; a minute later, as the CLI rounds it; local time when no zone is named). A clock
+    time up to 15 minutes past is taken as passed (now); one further past is tomorrow's."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    found = RESET_EPOCH.search(text or "")
+    if found and now.timestamp() - 86400 <= int(found.group(1)) <= now.timestamp() + 8 * 86400:
+        return max(int(found.group(1)), now.timestamp())
+    for found in RESET_CLOCK.finditer(text or ""):
+        month, day, hour, minute, half, zone = found.groups()
+        if not half and minute is None:
+            continue  # a bare number names no time
+        try:
+            from zoneinfo import ZoneInfo
+            local = now.astimezone(ZoneInfo(zone)) if zone else now.astimezone()
+        except Exception:  # no zoneinfo, or a zone it does not know: the machine's own
+            local = now.astimezone()
+        hour = int(hour) % 12 + (12 if half.lower() == "pm" else 0) if half else int(hour)
+        try:
+            at = local.replace(hour=hour, minute=int(minute or 0), second=0, microsecond=0)
+            if month:
+                at = at.replace(month=MONTHS.index(month.lower()) + 1, day=int(day))
+                if at < local - dt.timedelta(days=1):
+                    at = at.replace(year=at.year + 1)
+            elif at < local - dt.timedelta(minutes=15):
+                at += dt.timedelta(days=1)
+        except ValueError:  # an hour, a day or a month that does not exist
+            continue
+        epoch = at.timestamp() + 60
+        if epoch <= now.timestamp() + 8 * 86400:
+            return max(epoch, now.timestamp())
+    return None
+
+
+def resume_after(runs: list, now: float) -> float:
+    """When a pause for these sessions' API errors may end on its own (a UTC epoch): a usage limit's reset
+    time, or RESUME_DEFAULT_S from now when it names none, and at least RESUME_MIN_S from now; 0 when
+    only the owner can fix one (a login)."""
+    if any(OWNER_API.search(r.get("error") or "") for r in runs):
+        return 0
+    texts = [f"{r.get('error') or ''} {r.get('result') or ''}" for r in runs]
+    return max(now + RESUME_MIN_S, *(reset_time(t) or now + RESUME_DEFAULT_S for t in texts))
+
+
 def kill(run: dict) -> bool:
     """Stop a session's process group, only after checking the pid still is that session."""
     if not sv.run_alive(run):
@@ -794,15 +926,38 @@ def step(tasks: str) -> list:
         return events
     with guard(tasks):
         cfg = settings(tasks)
+        if not cfg["auto"] and cfg["resume_after"] and time.time() >= cfg["resume_after"]:
+            cfg = change_settings(tasks, auto=True, paused_reason="")
+            events.append("autopilot resumed: the usage limit's reset time has passed")
         reg = registry(tasks)
+        if reg.get("corrupt"):  # never start over from an empty registry: that re-runs every card
+            if cfg["auto"] or cfg["paused_reason"] != reg["corrupt"]:
+                change_settings(tasks, auto=False, paused_reason=reg["corrupt"])
+                events.append(f"autopilot paused: {reg['corrupt']}")
+            return events
+        if reg.get("recovered"):
+            events.append(reg["recovered"])
+            lost = unrecorded_logs(tasks, reg)
+            if lost and cfg["auto"]:  # the .bak is one save behind: it may lack a session that still runs
+                cfg = change_settings(tasks, auto=False, paused_reason=(
+                    f"{reg['recovered']}, which has no entry for the sessions logged in "
+                    f"{', '.join('state/runs/' + n for n in lost[:3])}; check whether they still run, then press Resume"))
+                events.append("autopilot paused: the registry was recovered without some sessions")
         ended = reap(tasks, reg)
         for run in ended:
             cid = run_unit(run)
+            run["unsettled"] = True  # its blocker is recorded on a pass that reads tasks.md whole
             events.append(f"{cid}: session ended" + (f" with {run['error'][:160]}" if run["error"]
                                                        else f" (${run['cost']:.2f})"))
-            if run.get("api_error") and cfg["auto"]:
-                cfg = change_settings(tasks, auto=False, paused_reason=f"API error in {cid}: {run['error'][:200]}")
-                events.append("autopilot paused: API error")
+        failed = [run for run in ended if run.get("api_error")]
+        if failed and (cfg["auto"] or cfg["resume_after"]):  # paused already by a usage limit: keep the later time
+            after = resume_after(failed, time.time())
+            after = after and max(after, cfg["resume_after"] if not cfg["auto"] else 0)
+            when = dt.datetime.fromtimestamp(after, dt.timezone.utc).strftime("%Y-%m-%d %H:%MZ") if after else ""
+            cfg = change_settings(tasks, auto=False, resume_after=after, paused_reason=(
+                f"API error in {run_unit(failed[0])}: {failed[0]['error'][:200]}"
+                + (f" (resumes on its own after {when})" if after else "")))
+            events.append("autopilot paused: API error" + (f"; resumes on its own after {when}" if after else ""))
 
         # sessions that gave their final result but did not exit hold a slot and hide a pause: stop them
         now = time.time()
@@ -825,11 +980,15 @@ def step(tasks: str) -> list:
                 events.append(f"{run_unit(run)}: stopped its session ({why})")
 
         save_registry(tasks, reg)
+        before = signature(tasks)
         s = sv.build(tasks, 4)
+        if not whole(tasks, s, before, events):
+            return events  # tasks.md was read mid-write: prune, pause and start nothing on what it said
         if cleared := clear_merge_lock(tasks, s, reg):  # its holder's session ended without releasing it
             events.append(cleared)
         reg["queued"] = [c for c in reg["queued"] if is_unit(s, c) and not unit_finished(s, c)]
-        for run in ended:  # a session that stopped on a blocker it recorded waits for the blocker to clear
+        for run in [r for r in reg["runs"] if r.pop("unsettled", False)]:  # a session that stopped on a
+            # blocker it recorded waits for the blocker to clear
             cid = run_unit(run)
             if is_unit(s, cid) and (BLOCKED.search(run.get("result") or "")
                                     or any(s["status"].get(c) == "blocked" for c in members(s, cid))):
@@ -858,11 +1017,42 @@ def step(tasks: str) -> list:
         if cfg["auto"]:
             events += dispatch(tasks, s, reg, cfg)
             save_registry(tasks, reg)
+            before = signature(tasks)
             s = sv.build(tasks, 4)
+            if not whole(tasks, s, before, events):
+                return events
             cfg = settings(tasks)  # dispatch may have paused (the budget, a launcher that cannot start)
         events += alert(tasks, s, reg, cfg)
         save_registry(tasks, reg)
     return events
+
+
+def whole(tasks: str, s: dict, before, events: list) -> bool:
+    """Whether a pass may act on this read of tasks.md. A session rewriting it can be caught half way:
+    the file changed while it was read, or it shows fewer cards than the last pass read, or lost its
+    "Never unattended" list. Acting on that would forget queued Retries and blockers for good, or pause
+    for a missing list, so such a pass waits; the same read on the next pass is the file as it is (the
+    owner removed cards)."""
+    if signature(tasks) != before:
+        return False
+    shape = (len(s["cards"]), bool(s["autopilot"]["deny"]))
+    last = CARDS_SEEN.get(tasks, (1, False))  # the first pass: any read with a card
+    CARDS_SEEN[tasks] = shape
+    if shape[0] >= last[0] and (shape[1] or not last[1]):
+        return True
+    events.append(f"tasks.md read as {shape[0]} cards{'' if shape[1] else ' and no Never unattended list'}, against "
+                  f"{last[0]} on the pass before; waiting a pass before acting on it")
+    return False
+
+
+def unrecorded_logs(tasks: str, reg: dict) -> list:
+    """Session logs in state/runs/ that no registry entry names: sessions a registry read from its .bak lost."""
+    known = {os.path.normpath(r.get("log") or "") for r in reg["runs"]}
+    try:
+        names = os.listdir(os.path.join(state_dir(tasks), "runs"))
+    except OSError:
+        return []
+    return sorted(n for n in names if n.endswith(".jsonl") and os.path.normpath(os.path.join("runs", n)) not in known)
 
 
 def units(s: dict) -> list:
@@ -1096,6 +1286,8 @@ def act(tasks: str, action: str, data: dict) -> str:
             change_settings(tasks, **changes)
             return "settings saved"
         reg = registry(tasks)
+        if reg.get("corrupt") and action in ("start", "retry", "stop", "takeover", "check-chrome", "unblock"):
+            raise Refused(reg["corrupt"])  # what it would record could not be saved
         mem = members(s, cid) if is_unit(s, cid) else []
         mine_live = [r for r in live(reg) if run_unit(r) == cid or r["card"] == cid]
         if action in ("start", "retry"):
@@ -1239,12 +1431,15 @@ def resolve_blocker(s: dict, text: str) -> None:
     path = s["resume"]
     if not path:
         raise Refused("there is no state/RESUME.md yet")
-    lines = sv.read(path).split("\n")
-    for i, line in enumerate(lines):
-        if line.strip().startswith("- ") and line.strip()[2:].strip() == text:
-            indent = line[: len(line) - len(line.lstrip())]
-            lines[i] = f"{indent}- (resolved {stamp()}, owner) {text}"
-    write_text(path, "\n".join(lines))
+
+    def change(old: str) -> str:
+        lines = old.split("\n")
+        for i, line in enumerate(lines):
+            if line.strip().startswith("- ") and line.strip()[2:].strip() == text:
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}- (resolved {stamp()}, owner) {text}"
+        return "\n".join(lines)
+    edit_text(path, change)
 
 
 def one_line(value) -> str:
@@ -1258,7 +1453,12 @@ def set_row(s: dict, name: str, match: dict, values: dict) -> None:
     path = s["resume"]
     if not path:
         raise Refused("there is no state/RESUME.md yet")
-    lines = sv.read(path).split("\n")
+    edit_text(path, lambda text: with_row(text, name, match, values))
+
+
+def with_row(text: str, name: str, match: dict, values: dict) -> str:
+    """set_row's change to RESUME's text."""
+    lines = text.split("\n")
     current, head = None, None
     for i, line in enumerate(lines):
         if m := re.match(r"^##\s+(.+?)\s*$", line):
@@ -1291,16 +1491,12 @@ def set_row(s: dict, name: str, match: dict, values: dict) -> None:
                 cells.append("")
             cells[index] = value
         lines[i] = "| " + " | ".join(cells) + " |"
-        write_text(path, "\n".join(lines))
-        return
+        return "\n".join(lines)
     raise Refused(f"no row {' '.join(match.values())} in RESUME's {name} table")
 
 
 def tick(tasks: str, cid: str) -> None:
-    text = sv.read(tasks)
-    new = re.sub(rf"^- \[ \] {re.escape(cid)}\b", f"- [x] {cid}", text, count=1, flags=re.M)
-    if new != text:
-        write_text(tasks, new)
+    edit_text(tasks, lambda text: re.sub(rf"^- \[ \] {re.escape(cid)}\b", f"- [x] {cid}", text, count=1, flags=re.M))
 
 
 def log_tail(tasks: str, cid: str, lines: int = 60) -> str:
