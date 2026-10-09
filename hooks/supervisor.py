@@ -817,6 +817,8 @@ VERDICTS = {  # a Checks row's verdict, judged by its first word
 NO_EVIDENCE = OPEN_ANSWERS | {"n/a", "na", "none", "tbd", "–", "—", "-"}
 # a session that stopped to wait for the owner; is_try() leaves it out, here and in autopilot.py
 WAITED = re.compile(r"AUTOPILOT: (?:WAITING FOR (?:DECISION|APPROVAL)|BLOCKED)")
+# a session that finished its card with a remainder card (§1's Context budget item): not a failed try
+SPLIT = re.compile(r"AUTOPILOT: SPLIT")
 REVIEWED_RE = re.compile(r"Pins reviewed up to[\s`*:]*([0-9a-f]{7,40})\b", re.I)
 GIT: dict = {}  # cached git answers: the repo root, the pin history (per ref state), ancestry
 GIT_LIMIT = 4096  # a long --serve asks about ever more commits: past this many answers, the older half of
@@ -1854,10 +1856,16 @@ def check_line(c: dict) -> str:
 
 
 def is_try(run: dict) -> bool:
-    """A session that counts against a card's attempts: not one that stopped to wait for the owner,
-    one resumed with the owner's answer, or one that never reached the API."""
-    return (not run.get("api_error") and not str(run.get("reason") or "").startswith("answer")
-            and not WAITED.search(run.get("result") or ""))
+    """A session that counts against a card's attempts: not one that never reached the API, one resumed
+    with the owner's answer that did work, one that split its card, or one that stopped to wait for the
+    owner, unless RESUME had no pending approval or open decision for it when it ended ("unbacked",
+    autopilot.py judges that): a session that only says it waits would otherwise be resumed for ever."""
+    result = run.get("result") or ""
+    if run.get("api_error"):
+        return False
+    if str(run.get("reason") or "").startswith("answer"):
+        return bool(run.get("ended")) and not run.get("worked")
+    return not SPLIT.search(result) and (not WAITED.search(result) or bool(run.get("unbacked")))
 
 
 def lessons(s: dict) -> str:

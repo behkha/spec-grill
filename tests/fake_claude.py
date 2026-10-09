@@ -5,7 +5,9 @@ FAKE_SCRIPT (a JSON file) maps a card to the behaviour of each of its sessions, 
 "done" finishes the card the way §1's Finish item says (RESUME row done, ticked, hand-off written),
 "doing" marks it doing and stops, "work" acts out a realistic session (to-dos, tools, pauses) and finishes, "decision" asks the owner a question and waits, "approval" (or "approval#A1=<step>") asks for the owner's yes and stops, "blocked"
 records a blocker, "apierror" fails the way an expired login does, "budget" hits the dollar
-cap, "sleep" stays alive until killed (a batch too). Every call is appended to FAKE_CALLS as one JSON
+cap, "sleep" stays alive until killed (a batch too); "noconversation" and "noauth" fail before the stream
+starts (stderr only), "claimapproval"/"claimdecision" say they wait without writing the RESUME row,
+"loginfail" fails in its own work, "split"/"splitopen"/"splitbare" end with AUTOPILOT: SPLIT. Every call is appended to FAKE_CALLS as one JSON
 line: the unit, the arguments, the working folder and $SPEC_GRILL_PORT_OFFSET.
 
 A batch session (SPEC_GRILL_CARD is a batch id such as B1) reads its cards from the batch table:
@@ -94,6 +96,13 @@ def batch_cards() -> list:
     return [c for c in cards if not re.search(rf"^\| {c} \|[^|]*\| (?:done|waived) \|", rows, re.M)]
 
 
+if behaviour == "noconversation":  # `--resume` of a session the CLI cannot find: stderr, no stream at all
+    print(f"No conversation found with session ID: {session}", file=sys.stderr)
+    sys.exit(1)
+if behaviour == "noauth":  # the CLI refuses to start: its own words, outside the stream
+    print("Invalid API key · Please run /login", file=sys.stderr)
+    sys.exit(1)
+
 emit({"type": "system", "subtype": "init"})
 if behaviour == "apierror":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Failed"}]}, "is_api_error_message": True})
@@ -173,6 +182,44 @@ elif behaviour == "blocked":
     set_status("blocked")
     text = open(resume).read()
     save(resume, text.replace("## Blockers\n", f"## Blockers\n- {card}: needs a key\n"))
+if behaviour in ("claimapproval", "claimdecision"):  # says it waits for the owner, but writes no RESUME row
+    set_status("doing")
+    emit({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.1,
+          "result": "AUTOPILOT: WAITING FOR " + ("APPROVAL A1" if behaviour == "claimapproval" else "DECISION 7")})
+    sys.exit(0)
+if behaviour == "waitapproval":  # §1's way: a `<card>.1` row in Approvals, then the end line naming it
+    set_status("doing")
+    text = open(resume).read()
+    row = f"| {card}.1 | {card} | deploy to staging | the card's verify step | pending | |\n"
+    save(resume, re.sub(r"(## Approvals\n(?:.*\n)*?\| --- .*\n)", lambda m: m.group(1) + row, text))
+    emit({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.1,
+          "result": f"AUTOPILOT: WAITING FOR APPROVAL {card}.1"})
+    sys.exit(0)
+if behaviour == "loginfail":  # a session that fails in its own work, its prose naming a login page and a budget
+    set_status("doing")
+    emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "total_cost_usd": 0.3,
+          "result": "The login page test still fails (rate limit stub); Context budget is fine."})
+    sys.exit(1)
+if behaviour.startswith("split"):  # "split": §1's way (ticked, hand-off, remainder card); "splitopen": the card
+    # left `doing` with its hand-off written; "splitbare": left `doing`, no hand-off
+    target = batch_cards()[0] if re.fullmatch(r"B\d+", card) else card
+    if behaviour == "split":
+        finish(target)
+    else:
+        set_status("doing", target)
+    if behaviour != "splitbare":
+        os.makedirs(os.path.join(os.path.dirname(resume), "handoff"), exist_ok=True)
+        with open(os.path.join(os.path.dirname(resume), "handoff", f"{target}.md"), "w") as handle:
+            handle.write(f"# {target}\nLeft: the rest, in {target}R.\n")
+    text = open(tasks).read()
+    remainder = (f"- [ ] {target}R Remainder of {target}\n  added by {target} · after: {target} · S · effort medium"
+                 f" · kind backend\n  **Start with:** `Demo · {target}R. Follow {tasks} §1, then card {target}R.`\n\n")
+    save(tasks, text.replace("## 6. Supervisor", ("" if "## 5. Backlog" in text else "## 5. Backlog\n\n")
+                             + remainder + "## 6. Supervisor", 1))
+    save(resume, open(resume).read() + f"| {target}R | x | todo | - | - | - |\n")
+    emit({"type": "result", "subtype": "success", "is_error": False, "result": "AUTOPILOT: SPLIT",
+          "total_cost_usd": 0.4})
+    sys.exit(0)
 if behaviour == "hang":  # gives its final result, then never exits
     emit({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
           "result": "You've hit your session limit · resets 3:10pm", "total_cost_usd": 1.5})
