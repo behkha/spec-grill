@@ -10,7 +10,9 @@ SIGKILL, "linger" gives a result that is no error and then lingers the same way,
 lines that are not stream-json objects (and a TodoWrite after a TaskCreate) before it finishes;
 "noconversation" and "noauth" fail before the stream starts (stderr only), "claimapproval"/"claimdecision"
 say they wait without writing the RESUME row, "loginfail" fails in its own work, "split"/"splitopen"/
-"splitbare" end with AUTOPILOT: SPLIT. Every call is appended to FAKE_CALLS as one JSON
+"splitbare" end with AUTOPILOT: SPLIT; "orphan" (and "orphan-stubborn", whose child ignores SIGTERM) finishes the
+card but leaves a child running in its process group, its pid appended to FAKE_CHILDREN. Every call is
+appended to FAKE_CALLS as one JSON
 line: the unit, the arguments, the working folder and $SPEC_GRILL_PORT_OFFSET.
 
 A batch session (SPEC_GRILL_CARD is a batch id such as B1) reads its cards from the batch table:
@@ -168,6 +170,18 @@ if behaviour == "garbage":  # stderr is merged into the log; a TodoWrite replace
         {"type": "tool_use", "id": "tw1", "name": "TodoWrite", "input": {"todos": []}}]}})
     emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tc1", "content": "Task #1 created"}]}})
     time.sleep(float(os.environ.get("FAKE_STEP", "1.5")))
+    behaviour = "done"
+
+if behaviour.startswith("orphan"):  # leaves a child running in its process group (a dev server it started in
+    # the background), then finishes the card and exits; "orphan-stubborn": a child that ignores SIGTERM
+    child = os.fork()
+    if child == 0:
+        if behaviour == "orphan-stubborn":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(600)
+        os._exit(0)
+    with open(os.environ["FAKE_CHILDREN"], "a", encoding="utf-8") as handle:
+        handle.write(f"{child}\n")
     behaviour = "done"
 
 emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})

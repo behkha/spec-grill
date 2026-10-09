@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import unittest
@@ -176,6 +177,84 @@ class GiveUp(Scratch):
         self.settle()
         self.assertEqual(self.status("T002"), "done")
         self.assertNotIn("T002", autopilot.registry(self.tasks)["attention"])
+
+
+def alive(pid: int) -> bool:
+    """A process that exists and is not a zombie."""
+    if not sv.pid_alive(pid):
+        return False
+    stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
+
+
+class Leftovers(Scratch):
+    """Item 2: what a session leaves running in its process group is stopped once the session is reaped."""
+
+    def setUp(self):
+        base.Feature.setUp(self)
+        environ = mock.patch.dict(os.environ, {"FAKE_CHILDREN": os.path.join(self.root, "children")})
+        environ.start()
+        self.addCleanup(environ.stop)
+
+    def child_of_t001(self) -> int:
+        """Run T001's session to its end (not reaped yet) and return the child it left."""
+        autopilot.step(self.tasks)
+        self.wait_calls(1)
+        run = self.runs()[0]
+        self.assertEqual((run["card"], run["pgid"]), ("T001", run["pid"]), "the session leads its own group")
+        for _ in range(150):
+            if self.children():
+                break
+            time.sleep(0.1)
+        ended(autopilot.PROCS[run["session"]])
+        child = self.children()[0]
+        self.assertTrue(alive(child), "the child outlives its session")
+        self.assertEqual(os.getpgid(child), run["pgid"], "in the session's process group")
+        return child
+
+    def test_a_child_left_in_the_sessions_group_is_stopped_when_the_session_is_reaped(self):
+        self.script_for({"T001": ["orphan"], "T002": ["done"], "T003": ["done"], "T004": ["done"]})
+        child = self.child_of_t001()
+        events = autopilot.step(self.tasks)
+        self.assertIn("T001: stopped what its session left running in its process group", events)
+        for _ in range(100):
+            if not alive(child):
+                break
+            time.sleep(0.05)
+        self.assertFalse(alive(child), "SIGTERM to the group stopped it")
+        self.settle()
+
+    def test_a_child_that_ignores_sigterm_gets_sigkill_on_a_later_pass(self):
+        self.script_for({"T001": ["orphan-stubborn"], "T002": ["done"], "T003": ["done"], "T004": ["done"]})
+        child = self.child_of_t001()
+        with mock.patch.object(autopilot, "GROUP_GRACE", 0.5):
+            first = autopilot.step(self.tasks)
+            self.assertIn("T001: stopped what its session left running in its process group", first)
+            time.sleep(0.2)
+            self.assertTrue(alive(child), "it ignores SIGTERM; the pass did not wait for it")
+            self.assertTrue(self.runs()[0].get("leftovers_ts"))
+            events = self.steps_until(lambda: not alive(child))
+        self.assertIn("T001: what its session left running outlived SIGTERM; sent it SIGKILL", events)
+        self.assertNotIn("leftovers_ts", self.runs()[0], "one SIGKILL, then it is done with the group")
+        self.settle()
+
+    def test_a_group_whose_id_is_in_use_or_out_of_range_is_never_signalled(self):
+        with mock.patch.object(autopilot.os, "killpg") as killpg:
+            for run in ({"pid": os.getpid()},  # a live process holds the id: it is not the ended session's
+                        {"pgid": os.getpgrp(), "pid": 99999999}, {"pid": 0}, {"pid": 1}, {"pid": -5},
+                        {"pid": 2 ** 40}, {"pid": "x"}, {"pid": None}, {}):
+                self.assertFalse(autopilot.signal_leftovers(run, signal.SIGTERM), run)
+            killpg.assert_not_called()
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.assertFalse(autopilot.signal_leftovers({"pid": gone.pid}, signal.SIGTERM), "nothing is left of it")
+
+    def test_a_sigkill_long_overdue_is_dropped(self):
+        reg = {"runs": [{"card": "T001", "ended": "x", "pid": 4242, "leftovers_ts": 1000.0}]}
+        with mock.patch.object(autopilot, "signal_leftovers", return_value=True) as signal_it:
+            self.assertEqual(autopilot.stop_leftovers(reg, 1000.0 + autopilot.GROUP_GRACE + autopilot.GROUP_STALE + 1), [])
+            signal_it.assert_not_called()
+        self.assertNotIn("leftovers_ts", reg["runs"][0])
 
 
 if __name__ == "__main__":

@@ -94,6 +94,10 @@ RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 CARDS_SEEN: dict = {}  # tasks -> (cards, has a Never unattended list) of the last read, to spot one mid-write
 KILL_GRACE = 30  # seconds a stopped session gets to exit on SIGTERM before its process group gets SIGKILL
+# seconds what an ended session left running in its process group (a dev server) gets after SIGTERM before
+# SIGKILL; a SIGKILL still due this much later is dropped (that group id may belong to someone else by then)
+GROUP_GRACE = 10
+GROUP_STALE = 300
 CHECK_STALE = 300  # seconds after which a Chrome check still "running" is taken for one that died
 
 RULES = """You are running unattended: the Spec-Grill autopilot started this session for {what} of
@@ -848,6 +852,7 @@ def spawn(tasks: str, s: dict, reg: dict, cid: str, reason: str, prompt: str, se
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                     env=env, start_new_session=True)
         run["pid"] = proc.pid
+        run["pgid"] = proc.pid  # start_new_session: the session leads a process group of its own, by its pid
         PROCS[session] = proc
     except (OSError, ValueError) as error:  # never reached the API: not a try (api_error, see sv.is_try)
         if isinstance(error, ValueError) or error.errno == errno.E2BIG:  # this unit's own prompt or arguments
@@ -908,6 +913,8 @@ def reap(tasks: str, reg: dict) -> list:
         if code is None:
             continue
         PROCS.pop(run["session"], None)
+        if signal_leftovers(run, signal.SIGTERM):  # what it left running in its group; SIGKILL follows (step)
+            run["leftovers_ts"] = time.time()
         found = result_of(os.path.join(state_dir(tasks), run["log"]))
         result = found["result"] or {}
         text = str(result.get("result") or "")
@@ -1016,6 +1023,48 @@ def kill(run: dict, sig: int = signal.SIGTERM) -> bool:
     if sig == signal.SIGTERM:
         run.setdefault("kill_sent_ts", time.time())
     return True
+
+
+def signal_leftovers(run: dict, sig: int) -> bool:
+    """Signal what an ended session left running in its process group (a dev server, a watcher it started
+    in the background): spawn() made the session lead a group of its own, whose id it recorded (pgid; the
+    pid for runs recorded before). Only once the session is gone and reaped: while a live process holds the
+    group's id, that id is no longer the session's (it was reused), so nothing is sent. Never our own group,
+    nor pid 0 or 1. False when nothing was signalled: nothing is left of the group (ESRCH), or what is left
+    is not ours to stop (EPERM)."""
+    try:
+        pgid = int(run.get("pgid") or run.get("pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not 1 < pgid < 2 ** 31 or pgid == os.getpgrp():
+        return False
+    try:
+        os.kill(pgid, 0)
+        return False  # a process has the leader's id: not the session (it ended), so not its group
+    except ProcessLookupError:
+        pass  # the leader is gone, as it should be
+    except OSError:  # EPERM: a process of another account holds that id
+        return False
+    try:
+        os.killpg(pgid, sig)
+    except OSError:  # ProcessLookupError: nothing left; PermissionError: what is left is not ours
+        return False
+    return True
+
+
+def stop_leftovers(reg: dict, now: float) -> list:
+    """SIGKILL what ended sessions left in their process groups once GROUP_GRACE has passed since reap()
+    sent it SIGTERM; one try, recorded on the run, so the dispatcher never waits on it. A SIGKILL due for
+    longer than GROUP_STALE (a dispatcher that was down) is dropped instead."""
+    events = []
+    for run in reg["runs"]:
+        sent = sv.number(run.get("leftovers_ts"))
+        if not sent or not run.get("ended") or now - sent <= GROUP_GRACE:
+            continue
+        run.pop("leftovers_ts", None)
+        if now - sent <= GROUP_GRACE + GROUP_STALE and signal_leftovers(run, signal.SIGKILL):
+            events.append(f"{run_unit(run)}: what its session left running outlived SIGTERM; sent it SIGKILL")
+    return events
 
 
 def free_worktree(s: dict, units: list) -> None:
@@ -1230,6 +1279,8 @@ def step(tasks: str) -> list:
             run["unsettled"] = True  # its blocker is recorded on a pass that reads tasks.md whole
             events.append(f"{cid}: session ended" + (f" with {run['error'][:160]}" if run["error"]
                                                        else f" (${run['cost']:.2f})"))
+            if run.get("leftovers_ts"):
+                events.append(f"{cid}: stopped what its session left running in its process group")
         failed = [run for run in ended if run.get("api_error")]
         if failed and (cfg["auto"] or cfg["resume_after"]):  # paused already by a usage limit: keep the later time
             after = resume_after(failed, time.time())
@@ -1270,6 +1321,7 @@ def step(tasks: str) -> list:
             if sent and now - sent > KILL_GRACE and kill(run, signal.SIGKILL) and not run.get("killed_ts"):
                 run["killed_ts"] = now
                 events.append(f"{run_unit(run)}: its session outlived the stop by {KILL_GRACE} s; sent it SIGKILL")
+        events += stop_leftovers(reg, now)  # and what ended sessions left behind them
 
         save_registry(tasks, reg)
         s = read_whole(tasks, events)
