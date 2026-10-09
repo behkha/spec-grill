@@ -2,7 +2,7 @@
 
 A Claude Code skill that refuses to let you start coding until your idea survives an interrogation.
 
-You bring a vague feature idea. Spec-Grill interviews you — one question at a time, each with a recommended answer — until it can produce a `constitution.md`, `spec.md`, `plan.md`, and `tasks.md` that actually say something. Nothing gets written to disk until you approve it.
+You bring a vague feature idea. Spec-Grill interviews you — one question at a time, each with a recommended answer — until it can produce a `constitution.md`, `spec.md`, `plan.md`, and `tasks.md` that actually say something. No artifact gets written until you approve it. Until then the interview keeps a draft (`constitution.draft.md`, `spec.draft.md`) with every answer you've confirmed, so an interrupted session picks up where it stopped; the draft is deleted on approval and nothing downstream treats it as approved.
 
 It's Spec-Driven Development (SDD) phase structure married to a decision-tree interview method. The name is the promise: you get grilled.
 
@@ -124,11 +124,17 @@ Every phase ends at an explicit approval gate.
 
 ### Phase 0 — Constitution check
 
-Looks for `specs/constitution.md`.
+Runs when an interview starts; the supervisor, the dashboard and the autopilot skip it.
+
+First it resumes what already exists, in this order: an unfinished `constitution.draft.md`; then the feature's folder, if it has one (its `spec.draft.md` resumes the Spec Grill at the next open question, otherwise it continues with the phase after the latest approved artifact). It says in one line what it found and where it picks up. It never overwrites a `tasks.md` whose cards have started; it offers backlog cards or a template upgrade instead.
+
+Then it looks for `specs/constitution.md`.
 
 Missing? The Constitution Grill runs first. A feature spec with no stated principles has nothing to be checked against.
 
 Present? It gets read, and the feature spec is continuously checked against its Constraints and Quality Standards. On a detected conflict the skill **stops and flags it**, then grills on whether to amend the constitution — it won't quietly proceed past a contradiction, and it won't nag about amendment when nothing conflicts.
+
+No git repository? The cards lean on git (worktrees, branches, `[P]`, the merge lock), so it asks once and recommends `git init`. Say no and it records "No git" as a constitution constraint: the cards then run one at a time in the project folder, with no `[P]` and no worktrees.
 
 ### Phase 1 — Constitution Grill
 
@@ -144,7 +150,7 @@ Grilled toward: **User Scenarios**, **Functional Requirements**, **Experience**,
 
 **Experience** is grilled only when the feature has a user interface: every screen, the flow through them for each scenario, each screen's states (empty, loading, error, success), and what it should feel like. It exists because a spec of requirements alone produces a back end that works behind screens nobody designed.
 
-Walked in dependency order — User Scenarios first because everything downstream derives from who and why; Success Criteria after Requirements so they can map back to them; Out of Scope last, once there's enough context to know what you're excluding. Open Questions accumulate as you go rather than being asked about.
+Walked in dependency order — User Scenarios first because everything downstream derives from who and why; Success Criteria after Requirements so they can map back to them; Out of Scope last, once there's enough context to know what you're excluding. Open Questions accumulate as you go rather than being asked about. Requirements and criteria get ids (`FR-1`, `NFR-1`, `SC-1`, …) that the cards cite.
 
 `Out of Scope` is doing real work here. It's the section that stops scope creep three weeks into implementation.
 
@@ -272,8 +278,10 @@ Commands listed on §6's **Never unattended** line (`git push`, deploys) are den
 ```
 specs/
 ├── constitution.md              # project-wide, created once, reused across features
+├── constitution.draft.md        # only while the constitution grill is unfinished
 ├── lessons.md                   # project-wide, what past features' cards really took (each close appends)
 └── 001-feature-slug/
+    ├── spec.draft.md            # only while the spec grill is unfinished
     ├── spec.md
     ├── plan.md
     ├── ux.md                    # with an interface: screens, states, tokens
